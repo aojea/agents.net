@@ -8,6 +8,8 @@ However, the most successful standards in the AI ecosystem—like the Model Cont
 
 Instead of giving a sandbox a routed IP address, `agents.net` proposes booting agents in a **Zero-Network Environment** (e.g., only the loopback interface). We return to a battle-tested architecture: **ACLs + Proxies**. By mandating that agents route traffic through a standard `HTTP CONNECT` proxy, we completely decouple the agent's application code from the hypervisor's networking complexities.
 
+Furthermore, standardizing on HTTP turns response traffic into an **in-band metadata and instruction channel**. Because AI agents naturally parse and reason over HTTP status codes, headers, and response bodies during tool execution, host proxies can signal policy decisions (e.g., `403 Forbidden` with block reasons), rate limits (`429`), or instructions (`X-Agent-Instruction`, `Retry-After`) directly in-band—guiding agent behavior without requiring out-of-band side channels or custom SDK extensions.
+
 ## The `agents.net` Contract
 
 To guarantee universal compatibility across any programming language or runtime without requiring custom transport code, `agents.net` defines two strict contracts.
