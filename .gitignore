@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Demo -- generated CA/leaf private keys and certs; never commit these.
+demo/certs/

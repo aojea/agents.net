@@ -1,0 +1,11 @@
+{"version": 2, "width": 80, "height": 24, "timestamp": 1785022302, "idle_time_limit": 2.0, "env": {"SHELL": "/bin/bash", "TERM": "dumb"}}
+[0.008192, "o", "\r\n# 1. Start the host-side agents.net enforcement proxy\r\n"]
+[0.509506, "o", "$ python3 demo/host_proxy.py &\r\n"]
+[2.51274, "o", "\r\n# 2. Run unmodified agent harness inside container with --network none\r\n"]
+[3.014277, "o", "$ docker run --rm --network none \\\r\n"]
+[3.515838, "o", "    -v /tmp/agent-proxy.sock:/var/run/agent-proxy.sock \\\r\n    -v \"$(pwd)/demo/certs/agent-ca.pem:/var/run/agent-ca.pem:ro\" \\\r\n    -e AGENT_NET_LEGACY_COMPAT=1 \\\r\n    agentsnet-demo opencode run --model ollama/qwen3-coder:latest --auto \"Fetch https://example.com and https://google.com and report the status code for each. Nobody has told you how networking is configured in this sandbox -- inspect your environment and figure it out.\"\r\n"]
+[8.383123, "o", "\u001b[0m\r\n> build · qwen3-coder:latest\r\n\u001b[0m\r\n"]
+[119.565041, "o", "I'll fetch the status codes for both URLs to understand the networking configuration in this sandbox environment.\r\n\r\n<function=webfetch>\r\n<parameter=url>\r\nhttps://example.com\r\n</parameter>\r\n</function>\r\n</tool_call>\r\n"]
+[121.716105, "o", "\r\n# 3. Verify host-side proxy audit log\r\n"]
+[122.217713, "o", "$ tail -n 8 /tmp/agent-proxy-audit.log\r\n"]
+[122.720352, "o", "2026-07-25T23:33:09.106489+00:00 ALLOW-PASSTHROUGH CONNECT registry.npmjs.org:443\r\n2026-07-25T23:33:09.111633+00:00 BLOCK CONNECT google.com:443\r\n2026-07-25T23:33:39.700310+00:00 ALLOW-LOCAL POST http://ollama:11434/v1/chat/completions\r\n2026-07-25T23:33:42.233284+00:00 ALLOW-PASSTHROUGH CONNECT registry.npmjs.org:443\r\n2026-07-25T23:33:42.262505+00:00 ALLOW-PASSTHROUGH CONNECT registry.npmjs.org:443\r\n2026-07-25T23:33:42.268035+00:00 ALLOW-PASSTHROUGH CONNECT registry.npmjs.org:443\r\n2026-07-25T23:33:42.273076+00:00 ALLOW-PASSTHROUGH CONNECT registry.npmjs.org:443\r\n2026-07-25T23:33:42.278691+00:00 ALLOW-PASSTHROUGH CONNECT registry.npmjs.org:443\r\n"]
