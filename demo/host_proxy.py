@@ -155,8 +155,7 @@ LOCAL_PROVIDER_HOSTS = _load_local_providers()  # symbolic host -> (real host, r
 # CREDENTIAL_HOSTS, no token or env var is involved -- these are just
 # allow-listed for genuine, uninspected egress. Leave this empty
 # (AGENT_PROXY_PASSTHROUGH="") to instead BLOCK and audit these hosts, which
-# is equally valid and demonstrates the ACL catching unexpected egress -- see
-# AGENTS_NET_THE_HARD_WAY.md.
+# is equally valid and demonstrates the ACL catching unexpected egress
 PASSTHROUGH_HOSTS = {
     h.strip()
     for h in os.environ.get(

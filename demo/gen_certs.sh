@@ -3,7 +3,7 @@
 # uses to terminate TLS locally for every host it needs to MITM: the
 # fake-response task target (example.com by default) and, opt-in, any real
 # credential-inject model backend (e.g. api.openai.com) for anyone doing the
-# cloud-migration bonus in AGENTS_NET_THE_HARD_WAY.md. The local-provider
+# cloud-migration bonus in demo/README.md. The local-provider
 # tier (Ollama) needs NO entry here at all -- it's plain HTTP, genuinely
 # relayed with no TLS termination.
 #

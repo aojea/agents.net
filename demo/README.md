@@ -2,9 +2,9 @@
 
 Bootstrap a Zero-Network Sandbox from scratch, one command at a time.
 
-This tutorial walks through the [agents.net](AGENTS_NET.md) reference implementation end to end, in the spirit of [Kelsey Hightower's Kubernetes the Hard Way](https://github.com/kelseyhightower/kubernetes-the-hard-way). By the end you will have run a real, unmodified, off-the-shelf agent CLI inside a container with **`--network none`**, and watched it reach the outside world through nothing but an `HTTP CONNECT` proxy and a mounted CA certificate.
+This tutorial walks through the [agents.net](../README.md) reference implementation end to end. By the end you will have run a real, unmodified, off-the-shelf agent CLI inside a container with **`--network none`**, and watched it reach the outside world through nothing but an `HTTP CONNECT` proxy and a mounted CA certificate.
 
-Read [AGENTS_NET.md](AGENTS_NET.md) first for the *why* (the Proxy Contract and the Trust Contract). This doc is the *how*.
+Read the [agents.net specification](../README.md) first for the *why* (the Proxy Contract and the Trust Contract). This doc is the *how*.
 
 Everything here runs against a free, local model server ([Ollama](https://ollama.com)) by default, so you can work through the whole tutorial without a paid API key or a dependency on any single model provider. A final section shows how to point the exact same image at a real hosted provider instead, using the same credential-injection contract rather than a key baked into the image.
 
@@ -39,7 +39,7 @@ flowchart LR
 
 Four allow-list tiers, enforced entirely on the host side, with the container never holding a routable network interface or a real secret.
 
-![agents.net terminal demo](demo/terminal-demo.gif)
+![agents.net terminal demo](terminal-demo.gif)
 
 ## Prerequisites
 
@@ -64,7 +64,7 @@ docker exec ollama ollama pull qwen3-coder:latest
 
 `-p 127.0.0.1:11434:11434` publishes Ollama to the host's loopback interface only -- not to the LAN, and not on a Docker network shared with the sandbox. The sandboxed container will never be able to reach it directly (it has no network interface at all); only `host_proxy.py`, running with normal host networking, dials `127.0.0.1:11434` on the sandbox's behalf. This is the same "the proxy holds the thing the sandbox isn't trusted with" pattern as `CREDENTIAL_HOSTS`, just with a real address instead of a real secret.
 
-`qwen3-coder:latest` is a reasonably capable coding model; swap in a smaller one (e.g. a `*-coder` model with fewer parameters) if your machine is resource-constrained -- just update the model name in [demo/opencode.json](demo/opencode.json) and [demo/Dockerfile](demo/Dockerfile) to match.
+`qwen3-coder:latest` is a reasonably capable coding model; swap in a smaller one (e.g. a `*-coder` model with fewer parameters) if your machine is resource-constrained -- just update the model name in [opencode.json](opencode.json) and [Dockerfile](Dockerfile) to match.
 
 **Verify:**
 
@@ -74,7 +74,7 @@ curl -s http://127.0.0.1:11434/api/tags | grep qwen3-coder
 
 ## Lab 2: Generate the Demo Certificate Authority
 
-The host proxy terminates TLS locally for its fake-response tier, so it needs its own root CA and a leaf certificate. [demo/gen_certs.sh](demo/gen_certs.sh) generates both:
+The host proxy terminates TLS locally for its fake-response tier, so it needs its own root CA and a leaf certificate. [gen_certs.sh](gen_certs.sh) generates both:
 
 ```bash
 ./demo/gen_certs.sh
@@ -97,7 +97,7 @@ Expected output includes `DNS:example.com`.
 
 ## Lab 3: Understand and Start the Host Proxy
 
-[demo/host_proxy.py](demo/host_proxy.py) is the entire enforcement point. It binds a Unix Domain Socket, speaks `HTTP CONNECT`, and enforces a four-tier allow-list:
+[host_proxy.py](host_proxy.py) is the entire enforcement point. It binds a Unix Domain Socket, speaks `HTTP CONNECT`, and enforces a four-tier allow-list:
 
 | Tier | Example hosts | What happens | Configured via |
 |---|---|---|---|
@@ -129,7 +129,7 @@ An empty `Credential-inject allow-list: {}` is expected and correct here -- that
 
 ## Lab 4: Inspect the Sandbox Bridge
 
-[demo/entrypoint.sh](demo/entrypoint.sh) is what runs *inside* the container. It does three things, in order:
+[entrypoint.sh](entrypoint.sh) is what runs *inside* the container. It does three things, in order:
 
 1. Bridges the mounted Unix Domain Socket back to a local TCP port with `socat`, since most HTTP clients don't speak CONNECT-over-UDS directly.
 2. Exports the canonical `AGENT_HTTP_PROXY` / `AGENT_HTTPS_PROXY` / `AGENT_NO_PROXY` contract variables. It does **not** export the conventional `HTTP_PROXY`/`http_proxy` by default -- the agent has to discover the `AGENT_*` variables itself.
@@ -139,7 +139,7 @@ No changes are needed here for this tutorial -- just read it once so Lab 6's beh
 
 ## Lab 5: Build the Sandbox Image
 
-[demo/Dockerfile](demo/Dockerfile) installs the [OpenCode CLI](https://github.com/anomalyco/opencode) exactly as published (no forking, no patching), copies in the demo's [opencode.json](demo/opencode.json) provider config, and wires `entrypoint.sh` as the container's `ENTRYPOINT`:
+[Dockerfile](Dockerfile) installs the [OpenCode CLI](https://github.com/anomalyco/opencode) exactly as published (no forking, no patching), copies in the demo's [opencode.json](opencode.json) provider config, and wires `entrypoint.sh` as the container's `ENTRYPOINT`:
 
 ```bash
 docker build -t agentsnet-demo demo/
@@ -166,7 +166,7 @@ docker run --rm \
   agentsnet-demo
 ```
 
-Notice there is no `-e` flag carrying any kind of API key. [demo/opencode.json](demo/opencode.json) already configures the `ollama` provider with `apiKey: "ollama"` -- a fixed, non-secret literal (Ollama's OpenAI-compatible API accepts any string as a bearer token), so there is nothing to inject and nothing to keep out of the image. This is strictly simpler than the credential-inject tier, and it's why the local-only path needs no placeholder-swap dance at all.
+Notice there is no `-e` flag carrying any kind of API key. [opencode.json](opencode.json) already configures the `ollama` provider with `apiKey: "ollama"` -- a fixed, non-secret literal (Ollama's OpenAI-compatible API accepts any string as a bearer token), so there is nothing to inject and nothing to keep out of the image. This is strictly simpler than the credential-inject tier, and it's why the local-only path needs no placeholder-swap dance at all.
 
 The container has no `eth0`, no routing table entry beyond loopback, and no DNS resolver configuration pointing anywhere real -- yet OpenCode will complete the task ("fetch `https://example.com` and report its status code") purely through the mounted socket and CA, reasoning with a model running entirely on your own machine.
 
@@ -279,6 +279,25 @@ Only relevant for the cloud-migration section above -- fails closed by design. E
 
 **Container hangs with no output**
 Confirm the UDS bind mount path matches where `host_proxy.py` is actually listening (`/tmp/agent-proxy.sock` by default) and that the proxy process is still running on the host.
+
+## Automated Testing
+
+Run unit tests and the end-to-end sandbox presubmit test locally:
+
+```bash
+./demo/test_demo.sh
+```
+
+This automated suite runs:
+1. Python unit tests for `host_proxy.py` logic.
+2. Certificate generation (`gen_certs.sh`).
+3. Container build (`docker build`).
+4. Harness version check in a `--network none` container.
+5. Proxy execution and verification of `AGENT_HTTP_PROXY` + `AGENT_CA_CERT` TLS termination.
+6. ACL blocking and HTTP 403 response verification.
+7. Host proxy audit trail log verification.
+
+This suite also runs automatically on GitHub Actions presubmit for all pull requests and pushes to `main`.
 
 ## Cleanup
 

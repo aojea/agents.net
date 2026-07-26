@@ -1,6 +1,6 @@
 #!/bin/bash
-# Regenerates the terminal recording embedded in AGENTS_NET.md /
-# AGENTS_NET_THE_HARD_WAY.md. Not part of the sandbox itself.
+# Regenerates the terminal recording embedded in README.md /
+# demo/README.md. Not part of the sandbox itself.
 #
 # Prerequisites:
 #   docker build -t agentsnet-demo demo/
