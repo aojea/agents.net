@@ -12,7 +12,7 @@ Furthermore, standardizing on HTTP turns response traffic into an **in-band meta
 
 ## The `agents.net` Contract
 
-To guarantee universal compatibility across any programming language or runtime without requiring custom transport code, `agents.net` defines two strict contracts.
+To guarantee universal compatibility across any programming language or runtime without requiring custom transport code, `agents.net` defines three strict contracts.
 
 ### I. The Proxy Contract
 
@@ -40,6 +40,30 @@ AGENT_CA_CERT=/var/run/agent-ca.pem
 - `REQUESTS_CA_BUNDLE=$AGENT_CA_CERT`
 - `SSL_CERT_FILE=$AGENT_CA_CERT`
 
+### III. The Ingress Contract (Inbound Traffic)
+
+To allow isolated agents to receive Webhooks, OAuth callbacks, or direct user prompts without exposing open network ports, `agents.net` treats the host harness as an **Ingress API Gateway**. 
+
+The host owns the public IPs, terminates public TLS, and absorbs all internet attacks (DDoS, malformed payloads). The sandbox remains hermetically sealed.
+
+#### Application Contract
+If an agent needs to receive inbound HTTP traffic, it MUST NOT attempt to bind to a public interface (`0.0.0.0`). Instead, it MUST bind its local web server to the loopback interface on the port specified by the environment:
+
+```bash
+AGENT_INGRESS_PORT=8081
+```
+
+When registering webhooks or providing callback URLs to third-party services, the agent MUST use the public URL provided by the host:
+
+```bash
+AGENT_PUBLIC_URL=https://agents.yourdomain.com/callbacks/agent-123
+```
+
+#### Infrastructure Contract
+The sandbox provider MUST bridge external requests from the Host to the Guest using an inbound transport mechanism. 
+
+The Host Harness MUST act as a Web Application Firewall (WAF) and Reverse Proxy. When the host receives a request on the `AGENT_PUBLIC_URL`, it strips malicious headers, enforces payload limits, and securely streams the raw HTTP request down the Unix socket (or vsock) into the sandbox, routing it to `127.0.0.1:$AGENT_INGRESS_PORT`.
+
 ## Reference Implementation: The Zero-Network Sandbox
 
 ![agents.net terminal demo](demo/terminal-demo.gif)
@@ -61,11 +85,6 @@ The full reference implementation lives in [demo/](demo/):
 
 - [demo/README.md](demo/README.md) — step-by-step tutorial for building and running the zero-network sandbox.
 - [demo/gen_certs.sh](demo/gen_certs.sh) — generates the demo root CA and a single multi-SAN leaf certificate covering every MITM'd host.
-- [demo/host_proxy.py](demo/host_proxy.py) — the host-side proxy: enforces the four-tier allow-list, logs every request (allowed, injected, passed through, or blocked) for auditing, answers fake-response hosts itself, relays to local providers, and injects real credentials for credential-inject hosts.
-- [demo/entrypoint.sh](demo/entrypoint.sh) — the sandbox bridge that maps the UDS back to TCP and injects the `agents.net` environment variables.
+- [demo/host_proxy.py](demo/host_proxy.py) — the host-side proxy: enforces the four-tier allow-list, logs every request (allowed, injected, passed through, or blocked) for auditing, answers fake-response hosts itself, relays to local providers, injects real credentials for credential-inject hosts, and routes inbound gateway traffic.
+- [demo/entrypoint.sh](demo/entrypoint.sh) — the sandbox bridge that maps the UDS back to TCP and injects the `agents.net` environment variables (both egress and ingress).
 - [demo/Dockerfile](demo/Dockerfile) — a concrete, worked example wiring up one specific off-the-shelf CLI harness unmodified as the container's entrypoint command; swap in any other harness by editing this one file.
-
-## Future Scope: Ingress Traffic
-
-*Status: Open Discussion*
-While `HTTP CONNECT` solves agent egress, ingress (such as inbound Webhooks or OAuth callbacks) introduces distinct isolation challenges. Future versions of this specification will define a Zero-Trust Gateway pattern, where the host harness holds the public URL and streams validated events down into the sandbox, ensuring the agent never exposes an open port directly to the internet.

@@ -1,22 +1,22 @@
 #!/bin/sh
 set -e
 
-# 1. Bridge local TCP to the host-mounted Unix Socket
-socat TCP-LISTEN:8080,fork,reuseaddr UNIX-CONNECT:/var/run/agent-proxy.sock &
+# Provide a directory for the sockets
+SOCKET_DIR="/var/run/agents.net"
+mkdir -p "$SOCKET_DIR"
+
+# 1. Egress Bridge: Local TCP -> Host-mounted Unix Socket
+# (Agent dialing out)
+socat TCP-LISTEN:8080,fork,reuseaddr UNIX-CONNECT:$SOCKET_DIR/egress-proxy.sock &
+
+# 2. Ingress Bridge: Host-mounted Unix Socket -> Local TCP
+# (Host sending webhooks in. Container creates the socket file and listens)
+rm -f "$SOCKET_DIR/ingress-proxy.sock"
+socat UNIX-LISTEN:"$SOCKET_DIR/ingress-proxy.sock",fork,reuseaddr,unlink-early,mode=777 TCP:127.0.0.1:8081 &
+
 sleep 0.2
 
-# 2. Fulfill the Proxy Contract. This is the ONLY thing the sandbox
-#    guarantees. On purpose we do NOT export the conventional HTTP_PROXY /
-#    http_proxy variables by default: the agent under test isn't told how
-#    networking is wired up, so it has to discover AGENT_HTTP_PROXY /
-#    AGENT_HTTPS_PROXY itself (e.g. by running `env`) and decide how to use
-#    it (curl -x, requests `proxies=`, etc.).
-#
-#    Set AGENT_NET_LEGACY_COMPAT=1 to additionally export the conventional
-#    variables, demonstrating the "zero code changes" compatibility mode
-#    instead of the discovery challenge -- required for this demo, since
-#    OpenCode (like the vast majority of existing tools) honors the
-#    conventional HTTPS_PROXY/HTTP_PROXY names, not the AGENT_* ones.
+# 3. Fulfill the Egress Contract
 export AGENT_HTTP_PROXY="http://127.0.0.1:8080"
 export AGENT_HTTPS_PROXY="http://127.0.0.1:8080"
 export AGENT_NO_PROXY="localhost,127.0.0.1"
@@ -30,7 +30,7 @@ if [ "${AGENT_NET_LEGACY_COMPAT:-0}" = "1" ]; then
     export no_proxy="$AGENT_NO_PROXY"
 fi
 
-# 3. Fulfill the Trust Contract (if a CA is mounted)
+# 4. Fulfill the Trust Contract (if a CA is mounted)
 if [ -f "/var/run/agent-ca.pem" ]; then
     export AGENT_CA_CERT="/var/run/agent-ca.pem"
     export REQUESTS_CA_BUNDLE="$AGENT_CA_CERT"
@@ -38,5 +38,9 @@ if [ -f "/var/run/agent-ca.pem" ]; then
     export SSL_CERT_FILE="$AGENT_CA_CERT"
 fi
 
-# 4. Launch the Agent
+# 5. Fulfill the Ingress Contract
+export AGENT_INGRESS_PORT="${AGENT_INGRESS_PORT:-8081}"
+export AGENT_PUBLIC_URL="${AGENT_PUBLIC_URL:-http://localhost:9000/webhook}"
+
+# 6. Launch the Agent
 exec "$@"

@@ -61,9 +61,15 @@ import os
 import select
 import socket
 import ssl
+import threading
 import urllib.parse
 
-UDS_PATH = "/tmp/agent-proxy.sock"
+SOCKET_DIR = "/tmp/agent-sockets"
+EGRESS_UDS = f"{SOCKET_DIR}/egress-proxy.sock"
+INGRESS_UDS = f"{SOCKET_DIR}/ingress-proxy.sock"
+PUBLIC_INGRESS_PORT = int(os.environ.get("PUBLIC_INGRESS_PORT", 9000))
+
+UDS_PATH = EGRESS_UDS
 AUDIT_LOG_PATH = "/tmp/agent-proxy-audit.log"
 
 CERT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
@@ -74,7 +80,7 @@ MITM_KEY = os.path.join(CERT_DIR, "agent-mitm.key")
 
 
 # Tier 1: the demo's actual task target. Answered locally, never forwarded.
-FAKE_RESPONSE_HOSTS = {"example.com"}
+FAKE_RESPONSE_HOSTS = {"example.com", "httpbin.org"}
 
 
 def _load_credential_hosts() -> dict:
@@ -496,20 +502,84 @@ def handle(client_sock: socket.socket) -> None:
         deny(client_sock, method, target, host)
 
 
+def handle_ingress() -> None:
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        server.bind(("0.0.0.0", PUBLIC_INGRESS_PORT))
+    except OSError as e:
+        print(f"[!] Ingress Gateway bind error on port {PUBLIC_INGRESS_PORT}: {e}")
+        return
+    server.listen(32)
+    print(f"[*] Ingress Gateway listening on public port: {PUBLIC_INGRESS_PORT}")
+
+    while True:
+        try:
+            client_sock, _ = server.accept()
+        except OSError:
+            break
+        threading.Thread(target=_handle_ingress_conn, args=(client_sock,), daemon=True).start()
+
+
+def _handle_ingress_conn(client_sock: socket.socket) -> None:
+    try:
+        data = client_sock.recv(4096)
+        if not data:
+            return
+
+        req_line = data.decode("latin1").split("\r\n")[0]
+        parts = req_line.split(" ")
+        method = parts[0] if len(parts) > 0 else "UNKNOWN"
+        target = parts[1] if len(parts) > 1 else "/"
+
+        print(f"[INGRESS] {req_line}")
+        audit("INGRESS", method, target)
+
+        if not os.path.exists(INGRESS_UDS):
+            raise FileNotFoundError(f"Ingress socket {INGRESS_UDS} does not exist")
+
+        agent_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        agent_sock.connect(INGRESS_UDS)
+        agent_sock.sendall(data)
+
+        while True:
+            chunk = agent_sock.recv(8192)
+            if not chunk:
+                break
+            client_sock.sendall(chunk)
+        agent_sock.close()
+    except Exception as e:
+        print(f"[INGRESS ERROR] Is the agent listening? {e}")
+        try:
+            client_sock.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\nAgent Unreachable")
+        except OSError:
+            pass
+    finally:
+        try:
+            client_sock.close()
+        except OSError:
+            pass
+
+
 def main() -> None:
-    if os.path.exists(UDS_PATH):
-        os.unlink(UDS_PATH)
+    os.makedirs(SOCKET_DIR, exist_ok=True)
+    if os.path.exists(EGRESS_UDS):
+        os.unlink(EGRESS_UDS)
+
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    server.bind(UDS_PATH)
-    os.chmod(UDS_PATH, 0o777)
+    server.bind(EGRESS_UDS)
+    os.chmod(EGRESS_UDS, 0o777)
     server.listen(32)
 
-    print(f"[*] Host Proxy listening on: {UDS_PATH}")
+    print(f"[*] Host Proxy listening on: {EGRESS_UDS}")
+    print(f"[*] Ingress Gateway listening on public port: {PUBLIC_INGRESS_PORT}")
     print(f"[*] Fake-response allow-list: {sorted(FAKE_RESPONSE_HOSTS)}")
     print(f"[*] Local-provider allow-list: {LOCAL_PROVIDER_HOSTS}")
     print(f"[*] Credential-inject allow-list: {CREDENTIAL_FINGERPRINTS}")
     print(f"[*] Passthrough allow-list: {sorted(PASSTHROUGH_HOSTS)}")
     print(f"[*] Audit log: {AUDIT_LOG_PATH}")
+
+    threading.Thread(target=handle_ingress, daemon=True).start()
 
     while True:
         client_sock, _ = server.accept()

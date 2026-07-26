@@ -2,9 +2,9 @@
 
 Bootstrap a Zero-Network Sandbox from scratch, one command at a time.
 
-This tutorial walks through the [agents.net](../README.md) reference implementation end to end. By the end you will have run a real, unmodified, off-the-shelf agent CLI inside a container with **`--network none`**, and watched it reach the outside world through nothing but an `HTTP CONNECT` proxy and a mounted CA certificate.
+This tutorial walks through the [agents.net](../README.md) reference implementation end to end. By the end you will have run a real, unmodified, off-the-shelf agent CLI inside a container with **`--network none`**, and watched it handle bidirectional traffic (egress via an `HTTP CONNECT` proxy + ingress webhooks via an API Gateway) over Unix sockets.
 
-Read the [agents.net specification](../README.md) first for the *why* (the Proxy Contract and the Trust Contract). This doc is the *how*.
+Read the [agents.net specification](../README.md) first for the *why* (the Proxy Contract, the Trust Contract, and the Ingress Contract). This doc is the *how*.
 
 Everything here runs against a free, local model server ([Ollama](https://ollama.com)) by default, so you can work through the whole tutorial without a paid API key or a dependency on any single model provider. A final section shows how to point the exact same image at a real hosted provider instead, using the same credential-injection contract rather than a key baked into the image.
 
@@ -19,22 +19,26 @@ flowchart LR
     subgraph sandbox["Container (--network none)"]
         harness["Agent harness\n(unmodified CLI)"]
         entrypoint["entrypoint.sh"]
-        socat_c["socat\nTCP 127.0.0.1:8080"]
-        harness -- "AGENT_HTTPS_PROXY" --> socat_c
+        socat_e["socat Egress\nTCP 127.0.0.1:8080"]
+        socat_i["socat Ingress\nTCP 127.0.0.1:8081"]
+        harness -- "AGENT_HTTPS_PROXY" --> socat_e
+        socat_i -- "AGENT_INGRESS_PORT" --> harness
     end
     subgraph host["Host"]
-        uds[["/tmp/agent-proxy.sock\n(bind-mounted UDS)"]]
+        sockets[["/tmp/agent-sockets/\n(bind-mounted UDS dir)"]]
         proxy["host_proxy.py"]
         ollama["ollama\n(127.0.0.1:11434)"]
-        uds --> proxy
+        sockets --> proxy
         proxy -.-> ollama
     end
-    socat_c -- "mounted UDS" --> uds
+    socat_e -- "egress-proxy.sock" --> sockets
+    proxy -- "ingress-proxy.sock" --> socat_i
     proxy -- "ALLOW-FAKE\n(example.com)" --> canned["canned response\n(no real network)"]
     proxy -- "ALLOW-LOCAL\n(symbolic host: ollama)" --> ollama
     proxy -- "ALLOW-PASSTHROUGH\n(registry.npmjs.org)" --> real1[("real internet\nno inspection")]
     proxy -- "ALLOW-INJECT, opt-in\n(api.openai.com)" --> real2[("real internet\n+ real Bearer token")]
     proxy -- "BLOCK + 403" --> nowhere["logged, denied"]
+    ext["External Client (curl)"] -- "POST http://localhost:9000/webhook" --> proxy
 ```
 
 Four allow-list tiers, enforced entirely on the host side, with the container never holding a routable network interface or a real secret.

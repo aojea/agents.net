@@ -2,7 +2,7 @@ FROM debian:bookworm-slim
 # curl/dig/nc give a normal recon toolkit; ca-certificates is required for
 # TLS verification of anything the proxy forwards.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        socat curl ca-certificates iproute2 dnsutils netcat-openbsd \
+        socat curl ca-certificates iproute2 dnsutils netcat-openbsd python3 \
     && rm -rf /var/lib/apt/lists/*
 
 # Install the real, unmodified OpenCode CLI as the agent harness -- no
