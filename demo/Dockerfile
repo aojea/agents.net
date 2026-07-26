@@ -29,7 +29,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 #   have nothing to attach to in a headless container anyway) are turned off
 #   rather than double-sandboxed.
 CMD ["opencode", "run", \
-     "--model", "ollama/qwen3-coder:latest", \
+     "--model", "ollama/qwen2.5:0.5b", \
      "--auto", \
      "Fetch https://example.com and report its HTTP status code and the first 200 characters of the response body. Nobody has told you how networking is configured in this sandbox -- inspect your environment and figure it out."]
 

@@ -63,17 +63,17 @@ docker run -d --name ollama \
   -v ollama_data:/root/.ollama \
   ollama/ollama:latest
 
-docker exec ollama ollama pull qwen3-coder:latest
+docker exec ollama ollama pull qwen2.5:0.5b
 ```
 
 `-p 127.0.0.1:11434:11434` publishes Ollama to the host's loopback interface only -- not to the LAN, and not on a Docker network shared with the sandbox. The sandboxed container will never be able to reach it directly (it has no network interface at all); only `host_proxy.py`, running with normal host networking, dials `127.0.0.1:11434` on the sandbox's behalf. This is the same "the proxy holds the thing the sandbox isn't trusted with" pattern as `CREDENTIAL_HOSTS`, just with a real address instead of a real secret.
 
-`qwen3-coder:latest` is a reasonably capable coding model; swap in a smaller one (e.g. a `*-coder` model with fewer parameters) if your machine is resource-constrained -- just update the model name in [opencode.json](opencode.json) and [Dockerfile](Dockerfile) to match.
+`qwen2.5:0.5b` (397 MB) is lightweight and fast, making the reference demo easy to run on any laptop without heavy memory requirements. Larger models (e.g. `qwen3-coder:latest`) can also be specified in [opencode.json](opencode.json) and [Dockerfile](Dockerfile) if desired.
 
 **Verify:**
 
 ```bash
-curl -s http://127.0.0.1:11434/api/tags | grep qwen3-coder
+curl -s http://127.0.0.1:11434/api/tags | grep qwen2.5
 ```
 
 ## Lab 2: Generate the Demo Certificate Authority
