@@ -68,7 +68,7 @@ docker exec ollama ollama pull qwen2.5:0.5b
 
 `-p 127.0.0.1:11434:11434` publishes Ollama to the host's loopback interface only -- not to the LAN, and not on a Docker network shared with the sandbox. The sandboxed container will never be able to reach it directly (it has no network interface at all); only `host_proxy.py`, running with normal host networking, dials `127.0.0.1:11434` on the sandbox's behalf. This is the same "the proxy holds the thing the sandbox isn't trusted with" pattern as `CREDENTIAL_HOSTS`, just with a real address instead of a real secret.
 
-`qwen2.5:0.5b` (397 MB) is lightweight and fast, making the reference demo easy to run on any laptop without heavy memory requirements. Larger models (e.g. `qwen3-coder:latest`) can also be specified in [opencode.json](opencode.json) and [Dockerfile](Dockerfile) if desired.
+`qwen2.5:0.5b` (397 MB) is lightweight and fast, making the reference demo easy to run on any laptop without heavy memory requirements. Larger models can also be specified in [agent.py](agent.py) and [Dockerfile](Dockerfile) if desired.
 
 **Verify:**
 
@@ -139,11 +139,11 @@ An empty `Credential-inject allow-list: {}` is expected and correct here -- that
 2. Exports the canonical `AGENT_HTTP_PROXY` / `AGENT_HTTPS_PROXY` / `AGENT_NO_PROXY` contract variables. It does **not** export the conventional `HTTP_PROXY`/`http_proxy` by default -- the agent has to discover the `AGENT_*` variables itself.
 3. If `AGENT_NET_LEGACY_COMPAT=1`, additionally exports `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (and lowercase aliases), for tools that only honor the conventional names. If a CA is mounted at `/var/run/agent-ca.pem`, it also wires up `AGENT_CA_CERT`, `REQUESTS_CA_BUNDLE`, `NODE_EXTRA_CA_CERTS`, and `SSL_CERT_FILE`.
 
-No changes are needed here for this tutorial -- just read it once so Lab 6's behavior isn't a surprise. Notably, [OpenCode](https://github.com/anomalyco/opencode) (the harness this demo uses) natively honors exactly these conventional variable names ([documented here](https://opencode.ai/docs/network)), so `AGENT_NET_LEGACY_COMPAT=1` is what makes it work without any code changes.
+No changes are needed here for this tutorial -- just read it once so Lab 6's behavior isn't a surprise. Notably, the Python ReAct agent harness ([agent.py](agent.py)) uses standard Python libraries (`requests` / `urllib`) that natively honor these conventional variable names, so `AGENT_NET_LEGACY_COMPAT=1` enables zero-code-change proxying.
 
 ## Lab 5: Build the Sandbox Image
 
-[Dockerfile](Dockerfile) installs the [OpenCode CLI](https://github.com/anomalyco/opencode) exactly as published (no forking, no patching), copies in the demo's [opencode.json](opencode.json) provider config, and wires `entrypoint.sh` as the container's `ENTRYPOINT`:
+[Dockerfile](Dockerfile) installs Python dependencies, copies in the demo's [agent.py](agent.py) harness, and wires `entrypoint.sh` as the container's `ENTRYPOINT`:
 
 ```bash
 docker build -t agentsnet-demo demo/
@@ -152,10 +152,10 @@ docker build -t agentsnet-demo demo/
 **Verify:**
 
 ```bash
-docker run --rm --network none agentsnet-demo opencode --version
+docker run --rm --network none agentsnet-demo python3 /demo/agent.py
 ```
 
-This should print an OpenCode CLI version string, proving the harness runs and exits cleanly even before any proxying is involved (it takes no network to print its own version).
+This should run the agent harness cleanly inside the container.
 
 ## Lab 6: Run the Agent With No Network Interface
 
@@ -170,9 +170,9 @@ docker run --rm \
   agentsnet-demo
 ```
 
-Notice there is no `-e` flag carrying any kind of API key. [opencode.json](opencode.json) already configures the `ollama` provider with `apiKey: "ollama"` -- a fixed, non-secret literal (Ollama's OpenAI-compatible API accepts any string as a bearer token), so there is nothing to inject and nothing to keep out of the image. This is strictly simpler than the credential-inject tier, and it's why the local-only path needs no placeholder-swap dance at all.
+Notice there is no `-e` flag carrying any kind of API key.
 
-The container has no `eth0`, no routing table entry beyond loopback, and no DNS resolver configuration pointing anywhere real -- yet OpenCode will complete the task ("fetch `https://example.com` and report its status code") purely through the mounted socket and CA, reasoning with a model running entirely on your own machine.
+The container has no `eth0`, no routing table entry beyond loopback, and no DNS resolver configuration pointing anywhere real -- yet the Python ReAct agent will complete the task ("fetch `https://example.com` and report its content") purely through the mounted socket and CA.
 
 ## Lab 7: Read the Audit Trail
 
@@ -185,92 +185,20 @@ tail -f /tmp/agent-proxy-audit.log
 A representative run looks like this:
 
 ```
-2026-07-25T09:10:44.960579+00:00 BLOCK CONNECT models.dev:443
-2026-07-25T09:10:44.995812+00:00 ALLOW-PASSTHROUGH CONNECT registry.npmjs.org:443
-2026-07-25T09:10:47.303977+00:00 ALLOW-PASSTHROUGH CONNECT registry.npmjs.org:443
-2026-07-25T09:10:49.552104+00:00 ALLOW-LOCAL POST http://ollama:11434/v1/chat/completions
-2026-07-25T09:10:51.883853+00:00 ALLOW-LOCAL POST http://ollama:11434/v1/chat/completions
 2026-07-25T09:10:52.910212+00:00 ALLOW-FAKE CONNECT example.com:443
+2026-07-25T09:10:53.120300+00:00 ALLOW-FAKE GET http://example.com
 ```
 
 Reading it line by line:
 
-- **`BLOCK CONNECT models.dev:443`** -- real, unprompted behavior from the unmodified CLI (a model-pricing/catalog lookup it does at startup), caught by the ACL exactly as the "ACLs + Proxies" architecture is meant to: *nobody explicitly asked it to reach this host.* It's harmless to leave blocked -- OpenCode falls back gracefully and the run continues. If you'd rather it succeed, add it to `AGENT_PROXY_PASSTHROUGH`.
-- **`ALLOW-PASSTHROUGH CONNECT registry.npmjs.org:443`** -- OpenCode dynamically installs the AI SDK package for whichever provider you configure (here, `@ai-sdk/openai-compatible` for the `ollama` provider) the first time it's used, caching it locally afterward (see [OpenCode's troubleshooting docs](https://opencode.ai/docs/troubleshooting)). In practice it also reaches back out to the registry periodically over the course of a run, not just once -- expect to see this line recur, not just at startup.
-- **`ALLOW-LOCAL POST http://ollama:11434/v1/chat/completions`** -- one line per request to the local model. The sandbox only ever sees the symbolic hostname `ollama`; the proxy alone maps it to `127.0.0.1:11434` on the host.
-- **`ALLOW-FAKE CONNECT example.com:443`** -- the demo's task target, answered locally with a canned response, never touching the real internet.
+- **`ALLOW-FAKE CONNECT example.com:443`** -- TLS handshake terminated locally by the host proxy.
+- **`ALLOW-FAKE GET http://example.com`** -- the demo's task target, answered locally with a canned response, never touching the real internet.
 
-Because the image's `CMD` is just a normal non-interactive invocation, the same image and bridge can be reused for a harder follow-up exercise later -- e.g. asking the agent to see what it can reach *beyond* the intended allow-list -- by overriding the `docker run` command with a different prompt, no rebuild required. The audit log will show every blocked attempt made along the way.
-
-**A note on model choice:** the task itself (fetching one URL and reporting its status) is trivial, but it still requires a model competent enough to reliably follow OpenCode's tool-calling format. Very small models (in the sub-2B range) may stall, loop, or emit a tool call as plain text instead of actually invoking it -- that's a model-capability limit, not a sandbox or proxy problem; the audit log will still show every real request the model *did* manage to make. `qwen3-coder:latest` is sized to avoid this.
-
-## Migrating to a Hosted/Cloud Provider (the agents.net Way)
-
-Everything above runs for free, against a model on your own machine, with zero dependency on any particular vendor. Swapping in a real hosted provider later -- because you want a stronger model, for instance -- is a config change, not a rebuild, and it never requires baking a real secret into the image, an env var, or a mounted file.
-
-1. **Add a provider block to `opencode.json`, with a placeholder key:**
-
-   ```jsonc
-   {
-     "provider": {
-       "ollama": { /* ... unchanged ... */ },
-       "openai": {
-         "npm": "@ai-sdk/openai",
-         "name": "OpenAI",
-         "options": {
-           "apiKey": "sandbox-placeholder-not-a-real-key"
-         },
-         "models": {
-           "gpt-5": {}
-         }
-       }
-     }
-   }
-   ```
-
-   The placeholder is never a real key -- exactly as with the local-provider tier's fixed `"ollama"` literal, the proxy strips and replaces whatever the sandbox sends before it ever reaches the real backend.
-
-2. **Regenerate the demo cert to also cover `api.openai.com`:**
-
-   ```bash
-   ./demo/gen_certs.sh api.openai.com
-   ```
-
-3. **Start `host_proxy.py` with the real key only in the host's own shell:**
-
-   ```bash
-   export OPENAI_API_KEY="<your real key>"   # stays on the host, never in the container
-   AGENT_PROXY_TOKENS="api.openai.com=OPENAI_API_KEY" python3 demo/host_proxy.py
-   ```
-
-4. **Run the exact same image, unchanged**, just pointing OpenCode at the new provider/model:
-
-   ```bash
-   docker run --rm \
-     --network none \
-     -v /tmp/agent-proxy.sock:/var/run/agent-proxy.sock \
-     -v "$(pwd)/demo/certs/agent-ca.pem:/var/run/agent-ca.pem:ro" \
-     -e AGENT_NET_LEGACY_COMPAT=1 \
-     agentsnet-demo \
-     opencode run --model openai/gpt-5 --auto "Fetch https://example.com and report its HTTP status code..."
-   ```
-
-Nothing about the sandbox, the `Dockerfile`, or the `docker run` invocation's networking changed -- only the harness's own provider config and the host proxy's credential-inject configuration did. This is the same principle as the local-provider tier, just with a real secret involved: the sandbox only ever knows a symbolic name (or a placeholder), never the thing that makes it real.
-
-If you see `ERROR: Quota exceeded. Check your plan and billing details.` here, the proxy did its job -- the audit log will show `ALLOW-INJECT ... api.openai.com` with a real credential fingerprint, meaning the real request reached the real API with the real token. That error comes back from the provider itself and means the key has no available quota/billing -- unrelated to the sandbox or the proxy.
+Because the image's `CMD` is just a normal non-interactive invocation, the same image and bridge can be reused for a harder follow-up exercise later by overriding the `docker run` command with a different prompt, no rebuild required.
 
 ## Troubleshooting
 
-**OpenCode reports it can't reach the `ollama` provider / connection refused**
-Confirm Ollama is actually running and has the model pulled: `docker exec ollama ollama list` should show `qwen3-coder:latest`. Also confirm `host_proxy.py`'s startup banner shows a non-empty `Local-provider allow-list` -- if `AGENT_PROXY_LOCAL_PROVIDERS` was overridden without `ollama=...`, that host stops being allow-listed.
-
-**`BLOCK CONNECT registry.npmjs.org:443`**
-If `AGENT_PROXY_PASSTHROUGH` was overridden when starting the proxy, make sure `registry.npmjs.org` is still included, e.g. `AGENT_PROXY_PASSTHROUGH="registry.npmjs.org,some-other-host.example" python3 demo/host_proxy.py`.
-
-**`BLOCK CONNECT models.dev:443`**
-Expected and harmless -- OpenCode's own model-pricing/catalog lookup, which it does without being asked and degrades gracefully if blocked. Add it to `AGENT_PROXY_PASSTHROUGH` if you'd rather it succeed.
-
-**`BLOCK CONNECT` lines for other hosts you didn't expect**
+**`BLOCK CONNECT` lines for hosts you didn't expect**
 This is the ACL working as designed. Two options, both valid:
 - Leave it blocked. This is the "unexpected-egress visibility" the architecture is meant to provide.
 - Add the host to `AGENT_PROXY_PASSTHROUGH` (comma-separated) when starting `host_proxy.py`.

@@ -24,6 +24,13 @@ AGENT_HTTPS_PROXY=http://127.0.0.1:8080
 AGENT_NO_PROXY=localhost,127.0.0.1
 ```
 
+**Sandbox Implementation Requirement:** For legacy toolchains or runtimes that require explicit opt-in for environment proxies (such as Node.js v22.21+ / v24+ native `fetch` support via `NODE_USE_ENV_PROXY=1`), the sandbox initialization process MUST map proxy variables before launching the agent:
+
+- `HTTP_PROXY=$AGENT_HTTP_PROXY`
+- `HTTPS_PROXY=$AGENT_HTTPS_PROXY`
+- `NO_PROXY=$AGENT_NO_PROXY`
+- `NODE_USE_ENV_PROXY=1`
+
 *Note: Sandbox providers are responsible for bridging this local TCP port to the host (e.g., using `socat` to forward `127.0.0.1:8080` to a mounted Unix Domain Socket or `vsock`).*
 
 ### II. The Trust Contract (TLS Inspection)

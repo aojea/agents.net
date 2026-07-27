@@ -28,6 +28,11 @@ if [ "${AGENT_NET_LEGACY_COMPAT:-0}" = "1" ]; then
     export https_proxy="$AGENT_HTTPS_PROXY"
     export NO_PROXY="$AGENT_NO_PROXY"
     export no_proxy="$AGENT_NO_PROXY"
+    export UNDICI_PROXY="$AGENT_HTTP_PROXY"
+    export GLOBAL_AGENT_HTTP_PROXY="$AGENT_HTTP_PROXY"
+    export NODE_USE_ENV_PROXY=1
+    export ALL_PROXY="$AGENT_HTTP_PROXY"
+    export all_proxy="$AGENT_HTTP_PROXY"
 fi
 
 # 4. Fulfill the Trust Contract (if a CA is mounted)

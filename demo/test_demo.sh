@@ -14,8 +14,8 @@ echo "=== 2. Generating Demo CA Certificates ==="
 echo "=== 3. Building Sandbox Container Image ==="
 docker build -t agentsnet-demo demo/
 
-echo "=== 4. Verifying Unmodified CLI inside Zero-Network Container ==="
-docker run --rm --network none agentsnet-demo opencode --version
+echo "=== 4. Verifying Agent Harness inside Zero-Network Container ==="
+docker run --rm --network none agentsnet-demo python3 /demo/agent.py
 
 echo "=== 5. Starting Host Proxy ==="
 rm -rf /tmp/agent-sockets /tmp/agent-proxy-audit.log
