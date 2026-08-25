@@ -219,3 +219,6 @@ __marimo__/
 
 # Demo -- generated CA/leaf private keys and certs; never commit these.
 demo/certs/
+
+# Demo -- the launcher binary is acquired from the SAM repo (Lab 3), not committed.
+demo/nano-init

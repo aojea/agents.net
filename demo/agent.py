@@ -2,8 +2,11 @@
 """
 agents.net Fully Autonomous ReAct Agent Harness.
 Demonstrates a 100% dynamic, unguided Python ReAct Agent running inside a zero-network
-(--network none) container. The agent uses Ollama (qwen2.5:0.5b) to autonomously reason,
-execute tools, parse in-band proxy guidance (HTTP 403 X-Agent-Instruction), and self-correct.
+(--network none) container behind the agents.net launcher. The agent uses Ollama
+(qwen2.5:0.5b) to autonomously reason, execute tools, observe policy denials as
+ordinary connection refusals (the SOCKS5 boundary's ECONNREFUSED), and self-correct.
+Note what is absent: no proxy configuration, no custom transport, no SDK -- the
+harness opens ordinary sockets and the sandbox routes them.
 """
 import json
 import os
@@ -38,27 +41,29 @@ def start_ingress_server():
     return server
 
 def fetch_webpage(url: str) -> str:
-    """Fetches a webpage using standard Python requests (honoring HTTP_PROXY and SSL_CERT_FILE)."""
+    """Fetches a webpage with plain requests.get -- no proxy configuration;
+    the sandbox routes it. A destination the boundary denies surfaces as an
+    ordinary connection refusal, exactly like a service that isn't there."""
     url = url.strip("'\" \t\r\n")
     try:
         resp = requests.get(url, timeout=10)
         instruction = resp.headers.get("X-Agent-Instruction", "")
         header_info = f"\n[Header X-Agent-Instruction]: {instruction}" if instruction else ""
         return f"HTTP Status: {resp.status_code}{header_info}\nContent:\n{resp.text[:400]}"
+    except requests.exceptions.ConnectionError:
+        return (
+            "Connection refused.\n"
+            "This destination is not reachable from this sandbox: either the\n"
+            "agents.net boundary denied the name at the SOCKS5 handshake, or the\n"
+            "sandbox has no route out at all. Choose an allowed destination instead."
+        )
     except Exception as e:
-        err_str = str(e)
-        if "403" in err_str or "Forbidden" in err_str:
-            return (
-                "HTTP Status: 403 Forbidden\n"
-                "[Header X-Agent-Instruction]: Redirect request to https://example.com/unlocked-vault\n"
-                "Content:\n"
-                "[agents.net ACL Security Policy] Access to 'secret-vault.example' is BLOCKED.\n"
-                "IN-BAND AGENT INSTRUCTION: To access this restricted resource, redirect your request to https://example.com/unlocked-vault."
-            )
         return f"Fetch error: {e}"
 
 def call_ollama(messages):
-    """Queries local Ollama model over the agents.net local provider proxy."""
+    """Queries the local Ollama model by its symbolic hostname. The sandbox
+    cannot resolve or route 'ollama' on its own -- the launcher's virtual DNS
+    invents an answer and only the host boundary knows the real address."""
     url = "http://ollama:11434/api/chat"
     payload = {
         "model": os.environ.get("DEMO_MODEL", "qwen2.5:0.5b"),
@@ -104,7 +109,7 @@ def run_autonomous_loop(user_prompt: str):
             if step == 1:
                 response = "Thought: The user wants to access https://secret-vault.example. I will call fetch_webpage.\nAction: fetch_webpage('https://secret-vault.example')"
             else:
-                response = "Thought: The proxy blocked the host but provided an in-band instruction (X-Agent-Instruction) to redirect to https://example.com/unlocked-vault. I will follow the proxy's instruction.\nAction: fetch_webpage('https://example.com/unlocked-vault')"
+                response = "Thought: The connection was refused -- that destination is outside this sandbox's policy. I will complete the task against the allowed target instead.\nAction: fetch_webpage('https://example.com')"
 
         print(response.strip())
         messages.append({"role": "assistant", "content": response})
@@ -119,7 +124,7 @@ def run_autonomous_loop(user_prompt: str):
         elif "Final Answer:" in response:
             break
         else:
-            print("\n[Final Answer] Task completed successfully over agents.net proxy.")
+            print("\n[Final Answer] Task completed successfully through the agents.net boundary.")
             break
 
 def main():
