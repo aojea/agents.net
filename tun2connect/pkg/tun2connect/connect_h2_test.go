@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/http2"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
@@ -184,6 +186,65 @@ func TestH2DialUDPExtendedConnectEcho(t *testing.T) {
 	defer b.mu.Unlock()
 	if len(b.udpPaths) != 1 || b.udpPaths[0] != "/.well-known/masque/udp/stun.example/3478/" {
 		t.Fatalf("connect-udp path = %v", b.udpPaths)
+	}
+}
+
+// TestEngineDNSThenConnectEndToEnd is the whole contract in one flow,
+// with nothing pre-seeded: the guest learns the destination only through
+// a wire DNS query, dials the invented answer, and the boundary receives
+// an assembled CONNECT carrying the original NAME.
+func TestEngineDNSThenConnectEndToEnd(t *testing.T) {
+	b := &h2TestBoundary{}
+	n := newTestNetWithDialer(t, &BoundaryClientH2{DialBoundary: b.dial})
+
+	// 1. Resolve over the wire, exactly as a guest stack would.
+	raddr := fullAddr(netip.MustParseAddr("10.0.0.1"), 53)
+	dnsConn, err := gonet.DialUDP(n.guest, nil, &raddr, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dnsConn.Close()
+	if _, err := dnsConn.Write(buildQuery(t, "svc.example.test.", dnsmessage.TypeA)); err != nil {
+		t.Fatal(err)
+	}
+	dnsConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	buf := make([]byte, 512)
+	nn, err := dnsConn.Read(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p dnsmessage.Parser
+	if _, err := p.Start(buf[:nn]); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		t.Fatal(err)
+	}
+	answers, err := p.AllAnswers()
+	if err != nil || len(answers) != 1 {
+		t.Fatalf("want 1 A answer, got %v (err %v)", answers, err)
+	}
+	resolved := netip.AddrFrom4(answers[0].Body.(*dnsmessage.AResource).A)
+
+	// 2. Dial the invented address; 3. the boundary must see the name.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	conn, err := gonet.DialContextTCP(ctx, n.guest, fullAddr(resolved, 8443), ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, err := conn.Write([]byte("ping")); err != nil {
+		t.Fatal(err)
+	}
+	echo := make([]byte, 4)
+	if _, err := io.ReadFull(conn, echo); err != nil {
+		t.Fatal(err)
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.targets) != 1 || b.targets[0] != "svc.example.test:8443" {
+		t.Fatalf("boundary saw %v, want CONNECT svc.example.test:8443 assembled from the DNS answer %v", b.targets, resolved)
 	}
 }
 
