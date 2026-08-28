@@ -2,7 +2,7 @@
 
 Bootstrap a Zero-Network Sandbox from scratch, one command at a time.
 
-This tutorial walks through the [agents.net](../README.md) reference implementation end to end. By the end you will have run a real, unmodified agent harness inside a container with **`--network none`**, confined by a launcher injected at `docker run` time, and watched every flow it makes cross a single Unix socket as SOCKS5, where it is named, checked against policy, and audited on the host.
+This tutorial walks through the [agents.net](../README.md) reference implementation end to end. By the end you will have run a real, unmodified agent harness inside a container with **`--network none`**, confined by a launcher injected at `docker run` time, and watched every flow it makes cross a single Unix socket as a named tunnel request, where it is checked against policy and audited on the host. (This walkthrough's boundary still speaks the **legacy SOCKS5 encoding** the current launcher ships -- [the spec's wire is HTTP CONNECT](../README.md#the-wire-http-connect-and-tun2connect), and a bonus section at the end runs it hands-on, including an unmodified Envoy as the boundary.)
 
 Read the [agents.net specification](../README.md) first for the *why* (the Boundary Contract, the Trust Convention, the Ingress Contract, and the decision matrix). This doc is the *how*.
 
@@ -116,7 +116,7 @@ file demo/nano-init | grep "statically linked"
 
 ## Lab 4: Understand and Start the Host Boundary
 
-[host_proxy.py](host_proxy.py) is the entire enforcement point: a minimal SOCKS5 server (RFC 1928, `CONNECT` only) on a Unix Domain Socket. Every TCP connection the sandbox makes arrives here as one SOCKS5 flow whose destination is a **name** -- the launcher's virtual DNS never resolves it away -- and gets one policy decision:
+[host_proxy.py](host_proxy.py) is the entire enforcement point: a minimal server speaking the legacy SOCKS5 encoding (RFC 1928, `CONNECT` only -- the [spec's wire is HTTP CONNECT](../README.md#the-wire-http-connect-and-tun2connect), see the bonus labs) on a Unix Domain Socket. Every TCP connection the sandbox makes arrives here as one flow whose destination is a **name** -- the launcher's virtual DNS never resolves it away -- and gets one policy decision:
 
 | Tier | Example hosts | What happens | Configured via |
 |---|---|---|---|
@@ -253,6 +253,62 @@ AGENT_PROXY_TOKENS="api.openai.com=OPENAI_API_KEY" python3 demo/host_proxy.py
 ```
 
 The startup banner now shows the host with a non-secret fingerprint (`sha256:...`), and `ALLOW-INJECT` audit lines carry that fingerprint so an operator can confirm a rotation took effect without the log ever holding a secret. The sandboxed agent can send an empty, placeholder, or garbage `Authorization` header -- the boundary strips it and injects the real one, and the real credential's blast radius shrinks to "whatever this one boundary process was handed."
+
+## Bonus: The Standard Wire -- HTTP CONNECT, tun2connect, and a Mesh Dataplane
+
+Everything above used the legacy SOCKS5 encoding, because that is what `nano-init` ships today. [The spec's wire is HTTP CONNECT](../README.md#the-wire-http-connect-and-tun2connect) -- the tunnel primitive cloud native already converged on -- with [tun2connect/](../tun2connect/) as the Go reference implementation. The payoff is pluggability: the boundary stops being bespoke and becomes a role any CONNECT-terminating dataplane can fill. Three labs, each independently runnable.
+
+### Lab A: the reference boundary, no root required
+
+`connect-proxy` is the CONNECT-speaking sibling of `host_proxy.py`: deny-by-default on names, one audit line per decision. Because curl speaks CONNECT to HTTP proxies, you can watch the ACL work without a sandbox:
+
+```bash
+go -C tun2connect build -o /tmp/connect-proxy ./cmd/connect-proxy
+/tmp/connect-proxy -listen tcp://127.0.0.1:18080 -allow example.com &
+
+curl --proxy http://127.0.0.1:18080 https://example.com -o /dev/null -w '%{http_code}\n'   # 200
+curl --proxy http://127.0.0.1:18080 https://evil.example                                    # CONNECT tunnel failed, response 403
+```
+
+The audit log mirrors Lab 7's, decided on the same policy input -- the name in the CONNECT authority:
+
+```
+ALLOW tcp example.com:443
+BLOCK not-on-allowlist evil.example:443
+```
+
+`-h2` switches to ONE multiplexed HTTP/2 session carrying every flow as a stream (the shape Istio's HBONE uses); `-udp` serves `connect-udp` (RFC 9298) so UDP gets a named, policy-checked path too -- something the legacy encoding simply denies.
+
+### Lab B: an unmodified Envoy as the boundary
+
+The pluggability claim, tested rather than argued -- Envoy is the dataplane inside Istio sidecars and waypoints and under kgateway, and it terminates both stages of the wire natively with [examples/envoy-boundary.yaml](../tun2connect/examples/envoy-boundary.yaml):
+
+```bash
+docker run -d --name envoy-connect --network host \
+  envoyproxy/envoy:v1.32-latest \
+  --config-yaml "$(cat tun2connect/examples/envoy-boundary.yaml)"
+
+# h1 CONNECT through Envoy (an https:// target makes curl use CONNECT):
+curl --proxy http://127.0.0.1:10000 https://example.com -o /dev/null -w '%{http_code}\n'   # 200
+# Envoy's own view of the tunnels it terminated:
+curl -s 127.0.0.1:19901/stats | grep downstream_cx_upgrades_total
+```
+
+Port `10001` serves the same CONNECT semantics over HTTP/2 prior knowledge, which `BoundaryClientH2` (and any HBONE-shaped client) consumes. Swap `connect-proxy` for Envoy and the tun2connect engine cannot tell the difference -- that interchangeability is what the standard buys.
+
+### Lab C: identity on the wire -- where SPIFFE fits
+
+On the mTLS tier the sandbox's identity is its **client certificate**, presented under the same h2 session. Service meshes assert identity as a [SPIFFE](https://spiffe.io) ID -- a URI SAN such as `spiffe://cluster.local/ns/sandbox/sa/agent-123`, minted per-workload by the mesh CA -- and a mesh-joined boundary authenticates sandboxes exactly that way. The tooling is deliberately PKI-agnostic: `connect-proxy -tls-cert ... -tls-key ... -tls-client-ca ca.pem` REQUIRES a verified client certificate and audits whatever it asserts (first URI SAN, else DNS SAN, else CN):
+
+```
+ALLOW tcp/h2 api.example.com:443 peer=spiffe://cluster.local/ns/sandbox/sa/agent-123
+```
+
+The same line works with `peer=sandbox://tenant-a/agent-123` from a homegrown CA -- the unit tests use exactly that non-SPIFFE URI on purpose. Identity rides the session's certificates, not the protocol, so joining a mesh later changes the PKI, never the wire. With mesh-issued certificates this arrangement *is* HBONE.
+
+### Where this is heading
+
+The launcher side of this repo (`nano-init`) still emits SOCKS5; since it embeds tun2socks -- which already ships an HTTP proxy client -- and [tun2connect](../tun2connect/) provides the native engine, converging the launcher on the standard wire is a dialer swap, not a rewrite. Everything host-side in this tutorial (the four tiers, name-based policy, the audit trail) carries over unchanged: those were never SOCKS5 concepts, and that is the point of the contract being the *named tunnel request*, not its encoding.
 
 ## Troubleshooting
 

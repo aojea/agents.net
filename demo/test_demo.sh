@@ -129,7 +129,14 @@ done
 # boundary from inside the container, where root owns the file.
 docker exec "${AGENT_CONTAINER_ID}" chmod 666 /var/run/agents.net/ingress-proxy.sock
 
-WEBHOOK_RESP=$(curl -s -X POST -d "hello from the outside world!" http://localhost:9000/webhook || true)
+# The agent's loopback listener races container startup; retry briefly
+# instead of failing on the first in-flight dial.
+WEBHOOK_RESP=""
+for i in {1..10}; do
+    WEBHOOK_RESP=$(curl -s -X POST -d "hello from the outside world!" http://localhost:9000/webhook || true)
+    echo "${WEBHOOK_RESP}" | grep -q "Webhook processed securely" && break
+    sleep 1
+done
 echo "Webhook Response: ${WEBHOOK_RESP}"
 
 docker stop "${AGENT_CONTAINER_ID}" >/dev/null 2>&1 || true
