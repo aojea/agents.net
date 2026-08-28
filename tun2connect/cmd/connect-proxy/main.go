@@ -1,7 +1,9 @@
-// Command connect-proxy is a minimal reference boundary: an HTTP/1.1
-// server speaking CONNECT for TCP and connect-udp (RFC 9298) for UDP,
-// applying deny-by-default policy on destination NAMES and writing one
-// audit line per decision.
+// Command connect-proxy is a minimal reference boundary: CONNECT for
+// TCP and connect-udp (RFC 9298) for UDP, applying deny-by-default
+// policy on destination NAMES and writing one audit line per decision.
+// -h2 switches from HTTP/1.1 (one connection per flow) to a single
+// multiplexed cleartext HTTP/2 session (prior knowledge, HBONE-shaped):
+// TCP flows are CONNECT streams, UDP sessions extended CONNECT streams.
 //
 // It pairs with cmd/tun2connect for the full demo, and is curl-testable
 // alone (curl uses CONNECT through an HTTP proxy):
@@ -22,7 +24,10 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"syscall"
 	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/aojea/agents.net/tun2connect/pkg/tun2connect"
 )
@@ -83,18 +88,11 @@ func handleConnect(conn net.Conn, br *bufio.Reader, req *http.Request) {
 }
 
 func handleConnectUDP(conn net.Conn, br *bufio.Reader, req *http.Request) {
-	// Default URI template: /.well-known/masque/udp/{host}/{port}/
-	seg := strings.Split(strings.Trim(req.URL.Path, "/"), "/")
-	if len(seg) != 5 || seg[0] != ".well-known" || seg[1] != "masque" || seg[2] != "udp" {
+	host, target, ok := masqueTarget(req.URL.Path)
+	if !ok {
 		refuse(conn, "malformed-template")
 		return
 	}
-	host, err := url.PathUnescape(seg[3])
-	if err != nil {
-		refuse(conn, "malformed-template")
-		return
-	}
-	target := net.JoinHostPort(host, seg[4])
 	if reason, ok := authorize(host); !ok {
 		audit("BLOCK "+reason, target)
 		refuse(conn, reason)
@@ -114,11 +112,27 @@ func handleConnectUDP(conn net.Conn, br *bufio.Reader, req *http.Request) {
 	defer upstream.Close()
 	audit("ALLOW udp", target)
 	io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n")
-
-	cs := tun2connect.NewCapsuleStream(struct {
+	pumpUDP(tun2connect.NewCapsuleStream(struct {
 		io.Reader
 		io.Writer
-	}{br, conn})
+	}{br, conn}), upstream)
+}
+
+// masqueTarget parses the default connect-udp URI template
+// /.well-known/masque/udp/{host}/{port}/.
+func masqueTarget(path string) (host, target string, ok bool) {
+	seg := strings.Split(strings.Trim(path, "/"), "/")
+	if len(seg) != 5 || seg[0] != ".well-known" || seg[1] != "masque" || seg[2] != "udp" {
+		return "", "", false
+	}
+	host, err := url.PathUnescape(seg[3])
+	if err != nil {
+		return "", "", false
+	}
+	return host, net.JoinHostPort(host, seg[4]), true
+}
+
+func pumpUDP(cs *tun2connect.CapsuleStream, upstream net.Conn) {
 	go func() {
 		defer upstream.Close()
 		for {
@@ -160,12 +174,119 @@ func serve(conn net.Conn) {
 	}
 }
 
+// flushWriter flushes each write so tunneled bytes are not buffered
+// behind the h2 frame scheduler.
+type flushWriter struct {
+	w http.ResponseWriter
+	f http.Flusher
+}
+
+func (fw flushWriter) Write(p []byte) (int, error) {
+	n, err := fw.w.Write(p)
+	if err == nil {
+		fw.f.Flush()
+	}
+	return n, err
+}
+
+func refuseH2(w http.ResponseWriter, reason string) {
+	w.Header().Set("Boundary-Reason", reason)
+	w.WriteHeader(http.StatusForbidden)
+}
+
+// serveH2 handles one stream of the multiplexed session: CONNECT is a
+// TCP tunnel, extended CONNECT (:protocol connect-udp) a UDP session.
+func serveH2(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodConnect {
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+	f, _ := w.(http.Flusher)
+	if proto := r.Header.Get(":protocol"); proto != "" {
+		if proto != "connect-udp" {
+			refuseH2(w, "unsupported-protocol")
+			return
+		}
+		host, target, ok := masqueTarget(r.URL.Path)
+		if !ok {
+			refuseH2(w, "malformed-template")
+			return
+		}
+		if reason, ok := authorize(host); !ok {
+			audit("BLOCK "+reason, target)
+			refuseH2(w, reason)
+			return
+		}
+		if !enableUDP {
+			audit("BLOCK udp-disabled", target)
+			refuseH2(w, "udp-disabled")
+			return
+		}
+		upstream, err := net.DialTimeout("udp", target, dialTimeout)
+		if err != nil {
+			audit("DIAL-FAIL", target)
+			w.WriteHeader(http.StatusBadGateway)
+			return
+		}
+		defer upstream.Close()
+		audit("ALLOW udp/h2", target)
+		w.Header().Set("Capsule-Protocol", "?1")
+		w.WriteHeader(http.StatusOK)
+		f.Flush()
+		pumpUDP(tun2connect.NewCapsuleStream(struct {
+			io.Reader
+			io.Writer
+		}{r.Body, flushWriter{w, f}}), upstream)
+		return
+	}
+
+	target := r.Host
+	host, _, err := net.SplitHostPort(target)
+	if err != nil {
+		refuseH2(w, "malformed-target")
+		return
+	}
+	if reason, ok := authorize(host); !ok {
+		audit("BLOCK "+reason, target)
+		refuseH2(w, reason)
+		return
+	}
+	upstream, err := net.DialTimeout("tcp", target, dialTimeout)
+	if err != nil {
+		audit("DIAL-FAIL", target)
+		w.WriteHeader(http.StatusBadGateway)
+		return
+	}
+	defer upstream.Close()
+	audit("ALLOW tcp/h2", target)
+	w.WriteHeader(http.StatusOK)
+	f.Flush()
+	go io.Copy(upstream, r.Body)
+	io.Copy(flushWriter{w, f}, upstream)
+}
+
 func main() {
 	listen := flag.String("listen", "unix:///tmp/boundary.sock", "listen address (unix:///path or tcp://host:port)")
 	allow := flag.String("allow", "", "comma-separated destination names to allow; '*' allows all (default: deny everything)")
 	udp := flag.Bool("udp", false, "serve connect-udp tunnels")
+	h2 := flag.Bool("h2", false, "speak multiplexed cleartext HTTP/2 (prior knowledge) instead of HTTP/1.1")
 	flag.Parse()
 	enableUDP = *udp
+
+	// x/net's h2 server only advertises extended CONNECT (UDP over h2)
+	// under GODEBUG=http2xconnect=1 (golang/go#71128), read at init --
+	// re-exec once with it set.
+	if *h2 && !strings.Contains(os.Getenv("GODEBUG"), "http2xconnect=1") {
+		godebug := os.Getenv("GODEBUG")
+		if godebug != "" {
+			godebug += ","
+		}
+		env := append(os.Environ(), "GODEBUG="+godebug+"http2xconnect=1")
+		if exe, err := os.Executable(); err == nil {
+			syscall.Exec(exe, os.Args, env)
+		}
+		log.Print("[!] re-exec failed; UDP over h2 (extended CONNECT) will be refused")
+	}
 
 	for _, h := range strings.Split(*allow, ",") {
 		if h = strings.ToLower(strings.TrimSpace(h)); h == "*" {
@@ -192,13 +313,18 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("boundary listening on %s (allow=%q udp=%v)", *listen, *allow, *udp)
+	log.Printf("boundary listening on %s (allow=%q udp=%v h2=%v)", *listen, *allow, *udp, *h2)
 
+	h2s := &http2.Server{}
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Fatal(err)
 		}
-		go serve(conn)
+		if *h2 {
+			go h2s.ServeConn(conn, &http2.ServeConnOpts{Handler: http.HandlerFunc(serveH2)})
+		} else {
+			go serve(conn)
+		}
 	}
 }

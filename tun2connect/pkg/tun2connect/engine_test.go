@@ -117,11 +117,20 @@ type testNet struct {
 
 func newTestNet(t *testing.T) *testNet {
 	t.Helper()
+	dialer := &recordingDialer{}
+	n := newTestNetWithDialer(t, dialer)
+	n.dialer = dialer
+	return n
+}
+
+// newTestNetWithDialer wires a guest gVisor stack to the engine through
+// channel endpoints, with any Dialer behind the engine.
+func newTestNetWithDialer(t *testing.T, dialer Dialer) *testNet {
+	t.Helper()
 	engEP := channel.New(512, 1500, "")
 	guestEP := channel.New(512, 1500, "")
 
 	dns := NewVirtualDNS()
-	dialer := &recordingDialer{}
 	eng, err := New(Config{
 		Device:         engEP,
 		Dialer:         dialer,
@@ -160,7 +169,7 @@ func newTestNet(t *testing.T) *testNet {
 		guest.Close()
 		guest.Wait()
 	})
-	return &testNet{eng: eng, dns: dns, dialer: dialer, guest: guest}
+	return &testNet{eng: eng, dns: dns, guest: guest}
 }
 
 func fullAddr(a netip.Addr, port uint16) tcpip.FullAddress {
