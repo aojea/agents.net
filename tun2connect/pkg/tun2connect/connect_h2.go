@@ -2,6 +2,7 @@ package tun2connect
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
@@ -17,15 +18,19 @@ import (
 // BoundaryClientH2 multiplexes every flow over ONE HTTP/2 session to the
 // boundary: each TCP flow is a CONNECT stream, each UDP session an
 // extended CONNECT stream (:protocol connect-udp, RFC 9298 section 3.4)
-// carrying capsules. This is the HBONE-shaped wire: over a Unix socket
-// or vsock the whole sandbox costs one boundary connection, and adding
-// mTLS to the same session is a transport concern, not a protocol one.
+// carrying capsules.
 //
-// The session is cleartext h2 with prior knowledge -- no TLS, no ALPN,
-// no h1 upgrade -- which both x/net and Envoy-family dataplanes accept.
+// Without TLS the session is cleartext h2 with prior knowledge. With TLS
+// set it is h2 CONNECT inside (m)TLS -- the arrangement mesh dataplanes
+// terminate (Istio's HBONE being one deployment of it).
 type BoundaryClientH2 struct {
 	// DialBoundary opens the transport carrying the shared session.
 	DialBoundary func(ctx context.Context) (net.Conn, error)
+	// TLS, when set, wraps the boundary transport in (m)TLS with ALPN
+	// h2 before the session starts. What the certificates assert --
+	// SPIFFE IDs, plain hostnames, anything else -- is between the
+	// deployment's PKI and the boundary; this library never inspects it.
+	TLS *tls.Config
 	// Authority is the :authority for extended CONNECT requests;
 	// defaults to "boundary".
 	Authority string
@@ -61,6 +66,25 @@ func (c *BoundaryClientH2) session(ctx context.Context) (*http2.ClientConn, erro
 	nc, err := c.DialBoundary(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if c.TLS != nil {
+		cfg := c.TLS.Clone()
+		if len(cfg.NextProtos) == 0 {
+			cfg.NextProtos = []string{"h2"}
+		}
+		if cfg.ServerName == "" && !cfg.InsecureSkipVerify {
+			cfg.ServerName = c.authority()
+		}
+		tc := tls.Client(nc, cfg)
+		if err := tc.HandshakeContext(ctx); err != nil {
+			nc.Close()
+			return nil, fmt.Errorf("tun2connect: boundary TLS handshake: %w", err)
+		}
+		if proto := tc.ConnectionState().NegotiatedProtocol; proto != "h2" {
+			tc.Close()
+			return nil, fmt.Errorf("tun2connect: boundary negotiated %q, want h2", proto)
+		}
+		nc = tc
 	}
 	cc, err := c.t.NewClientConn(nc)
 	if err != nil {

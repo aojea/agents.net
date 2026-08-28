@@ -14,6 +14,9 @@ package main
 
 import (
 	"bufio"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"fmt"
 	"io"
@@ -189,6 +192,44 @@ func (fw flushWriter) Write(p []byte) (int, error) {
 	return n, err
 }
 
+// peerIdentity is whatever the client certificate asserts, PKI-agnostic:
+// first URI SAN (SPIFFE in a mesh, but any scheme), else first DNS SAN,
+// else the CN. Empty without mTLS.
+func peerIdentity(cs *tls.ConnectionState) string {
+	if cs == nil || len(cs.PeerCertificates) == 0 {
+		return ""
+	}
+	leaf := cs.PeerCertificates[0]
+	if len(leaf.URIs) > 0 {
+		return leaf.URIs[0].String()
+	}
+	if len(leaf.DNSNames) > 0 {
+		return leaf.DNSNames[0]
+	}
+	return leaf.Subject.CommonName
+}
+
+func withPeer(target, peer string) string {
+	if peer != "" {
+		return target + " peer=" + peer
+	}
+	return target
+}
+
+// sessionPeer extracts the mTLS identity at session level: CONNECT
+// streams carry no :scheme, so x/net never populates r.TLS for them.
+func sessionPeer(conn net.Conn) (string, error) {
+	tc, ok := conn.(*tls.Conn)
+	if !ok {
+		return "", nil
+	}
+	if err := tc.HandshakeContext(context.Background()); err != nil {
+		return "", err
+	}
+	cs := tc.ConnectionState()
+	return peerIdentity(&cs), nil
+}
+
 func refuseH2(w http.ResponseWriter, reason string) {
 	w.Header().Set("Boundary-Reason", reason)
 	w.WriteHeader(http.StatusForbidden)
@@ -196,73 +237,78 @@ func refuseH2(w http.ResponseWriter, reason string) {
 
 // serveH2 handles one stream of the multiplexed session: CONNECT is a
 // TCP tunnel, extended CONNECT (:protocol connect-udp) a UDP session.
-func serveH2(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodConnect {
-		w.WriteHeader(http.StatusMethodNotAllowed)
-		return
-	}
-	f, _ := w.(http.Flusher)
-	if proto := r.Header.Get(":protocol"); proto != "" {
-		if proto != "connect-udp" {
-			refuseH2(w, "unsupported-protocol")
+// peer is the session's mTLS identity, audit-only.
+func serveH2(peer string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect {
+			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
-		host, target, ok := masqueTarget(r.URL.Path)
-		if !ok {
-			refuseH2(w, "malformed-template")
+		f, _ := w.(http.Flusher)
+		if proto := r.Header.Get(":protocol"); proto != "" {
+			if proto != "connect-udp" {
+				refuseH2(w, "unsupported-protocol")
+				return
+			}
+			host, target, ok := masqueTarget(r.URL.Path)
+			if !ok {
+				refuseH2(w, "malformed-template")
+				return
+			}
+			label := withPeer(target, peer)
+			if reason, ok := authorize(host); !ok {
+				audit("BLOCK "+reason, label)
+				refuseH2(w, reason)
+				return
+			}
+			if !enableUDP {
+				audit("BLOCK udp-disabled", label)
+				refuseH2(w, "udp-disabled")
+				return
+			}
+			upstream, err := net.DialTimeout("udp", target, dialTimeout)
+			if err != nil {
+				audit("DIAL-FAIL", label)
+				w.WriteHeader(http.StatusBadGateway)
+				return
+			}
+			defer upstream.Close()
+			audit("ALLOW udp/h2", label)
+			w.Header().Set("Capsule-Protocol", "?1")
+			w.WriteHeader(http.StatusOK)
+			f.Flush()
+			pumpUDP(tun2connect.NewCapsuleStream(struct {
+				io.Reader
+				io.Writer
+			}{r.Body, flushWriter{w, f}}), upstream)
 			return
 		}
+
+		target := r.Host
+		host, _, err := net.SplitHostPort(target)
+		if err != nil {
+			refuseH2(w, "malformed-target")
+			return
+		}
+		label := withPeer(target, peer)
 		if reason, ok := authorize(host); !ok {
-			audit("BLOCK "+reason, target)
+			audit("BLOCK "+reason, label)
 			refuseH2(w, reason)
 			return
 		}
-		if !enableUDP {
-			audit("BLOCK udp-disabled", target)
-			refuseH2(w, "udp-disabled")
-			return
-		}
-		upstream, err := net.DialTimeout("udp", target, dialTimeout)
+		upstream, err := net.DialTimeout("tcp", target, dialTimeout)
 		if err != nil {
-			audit("DIAL-FAIL", target)
+			audit("DIAL-FAIL", label)
 			w.WriteHeader(http.StatusBadGateway)
 			return
 		}
 		defer upstream.Close()
-		audit("ALLOW udp/h2", target)
-		w.Header().Set("Capsule-Protocol", "?1")
+		audit("ALLOW tcp/h2", label)
 		w.WriteHeader(http.StatusOK)
 		f.Flush()
-		pumpUDP(tun2connect.NewCapsuleStream(struct {
-			io.Reader
-			io.Writer
-		}{r.Body, flushWriter{w, f}}), upstream)
-		return
+		go io.Copy(upstream, r.Body)
+		io.Copy(flushWriter{w, f}, upstream)
 	}
-
-	target := r.Host
-	host, _, err := net.SplitHostPort(target)
-	if err != nil {
-		refuseH2(w, "malformed-target")
-		return
-	}
-	if reason, ok := authorize(host); !ok {
-		audit("BLOCK "+reason, target)
-		refuseH2(w, reason)
-		return
-	}
-	upstream, err := net.DialTimeout("tcp", target, dialTimeout)
-	if err != nil {
-		audit("DIAL-FAIL", target)
-		w.WriteHeader(http.StatusBadGateway)
-		return
-	}
-	defer upstream.Close()
-	audit("ALLOW tcp/h2", target)
-	w.WriteHeader(http.StatusOK)
-	f.Flush()
-	go io.Copy(upstream, r.Body)
-	io.Copy(flushWriter{w, f}, upstream)
 }
 
 func main() {
@@ -270,6 +316,9 @@ func main() {
 	allow := flag.String("allow", "", "comma-separated destination names to allow; '*' allows all (default: deny everything)")
 	udp := flag.Bool("udp", false, "serve connect-udp tunnels")
 	h2 := flag.Bool("h2", false, "speak multiplexed cleartext HTTP/2 (prior knowledge) instead of HTTP/1.1")
+	tlsCert := flag.String("tls-cert", "", "PEM server certificate; enables TLS (with -h2: the HBONE-style mTLS+h2 arrangement)")
+	tlsKey := flag.String("tls-key", "", "PEM server key")
+	clientCA := flag.String("tls-client-ca", "", "PEM CA bundle; when set, REQUIRE verified client certificates and audit their identity")
 	flag.Parse()
 	enableUDP = *udp
 
@@ -313,7 +362,30 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	log.Printf("boundary listening on %s (allow=%q udp=%v h2=%v)", *listen, *allow, *udp, *h2)
+	if *tlsCert != "" {
+		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
+		if err != nil {
+			log.Fatal(err)
+		}
+		cfg := &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			NextProtos:   []string{"h2", "http/1.1"},
+		}
+		if *clientCA != "" {
+			pem, err := os.ReadFile(*clientCA)
+			if err != nil {
+				log.Fatal(err)
+			}
+			pool := x509.NewCertPool()
+			if !pool.AppendCertsFromPEM(pem) {
+				log.Fatalf("no CA certificates in %s", *clientCA)
+			}
+			cfg.ClientCAs = pool
+			cfg.ClientAuth = tls.RequireAndVerifyClientCert
+		}
+		ln = tls.NewListener(ln, cfg)
+	}
+	log.Printf("boundary listening on %s (allow=%q udp=%v h2=%v tls=%v mtls=%v)", *listen, *allow, *udp, *h2, *tlsCert != "", *clientCA != "")
 
 	h2s := &http2.Server{}
 	for {
@@ -322,7 +394,15 @@ func main() {
 			log.Fatal(err)
 		}
 		if *h2 {
-			go h2s.ServeConn(conn, &http2.ServeConnOpts{Handler: http.HandlerFunc(serveH2)})
+			go func() {
+				peer, err := sessionPeer(conn)
+				if err != nil {
+					audit("TLS-FAIL", err.Error())
+					conn.Close()
+					return
+				}
+				h2s.ServeConn(conn, &http2.ServeConnOpts{Handler: serveH2(peer)})
+			}()
 		} else {
 			go serve(conn)
 		}
