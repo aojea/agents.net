@@ -27,14 +27,14 @@ Inside the sandbox, the application **MUST NOT be required to cooperate with its
 ```mermaid
 flowchart LR
     subgraph Sandbox ["Sandbox (Zero External Network)"]
-        Agent["Agent Application\n(unmodified, zero config)"]
-        Stack["In-Guest Stack\n(TUN + Virtual DNS + CONNECT Client)"]
+        Agent["Agent Application<br/>(unmodified, zero config)"]
+        Stack["In-Guest Stack<br/>(TUN + Virtual DNS + CONNECT Client)"]
         Agent -- "TCP / UDP / DNS" --> Stack
     end
 
     subgraph Host ["Host / Infrastructure"]
-        Channel["Point-to-Point Channel\n(Unix Domain Socket / vsock)"]
-        Boundary["Boundary Proxy / Mesh Dataplane\n(Envoy, Istio HBONE, connect-proxy)"]
+        Channel["Point-to-Point Channel<br/>(Unix Domain Socket / vsock)"]
+        Boundary["Boundary Proxy / Mesh Dataplane<br/>(Envoy, Istio HBONE, connect-proxy)"]
         External[("Target Service / Upstream")]
 
         Channel --> Boundary
@@ -103,8 +103,8 @@ To allow an isolated sandbox to receive external webhooks, OAuth callbacks, or p
 
 ```mermaid
 flowchart LR
-    Caller["External Webhook / Caller"] -->|"POST :9000/webhook"| Gateway["Host Ingress Gateway\n(WAF, TLS, Auth)"]
-    Gateway -->|"CONNECT 8081\nover ingress-proxy.sock"| IngressSock["Sandbox Ingress Socket"]
+    Caller["External Webhook / Caller"] -->|"POST :9000/webhook"| Gateway["Host Ingress Gateway<br/>(WAF, TLS, Auth)"]
+    Gateway -->|"CONNECT 8081<br/>over ingress-proxy.sock"| IngressSock["Sandbox Ingress Socket"]
     IngressSock -->|"127.0.0.1:8081"| LocalServer["Agent Local Web Server"]
 ```
 

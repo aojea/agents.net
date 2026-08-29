@@ -17,23 +17,23 @@ This tutorial is for engineers building or evaluating sandboxes for autonomous a
 ```mermaid
 flowchart LR
     subgraph sandbox["Container (--network none: lo + tun0 only)"]
-        harness["Agent harness\n(unmodified, ZERO config)"]
-        nano["nano-init (PID 1, injected)\ntun2socks + virtual DNS"]
+        harness["Agent harness<br/>(unmodified, ZERO config)"]
+        nano["nano-init (PID 1, injected)<br/>tun2socks + virtual DNS"]
         harness -- "ordinary sockets + DNS" --> nano
     end
     subgraph host["Host"]
-        sockets[["/tmp/agent-sockets/\n(bind-mounted UDS dir)"]]
-        proxy["host_proxy.py\nSOCKS5 boundary"]
-        ollama["ollama\n(127.0.0.1:11434)"]
+        sockets[["/tmp/agent-sockets/<br/>(bind-mounted UDS dir)"]]
+        proxy["host_proxy.py<br/>SOCKS5 boundary"]
+        ollama["ollama<br/>(127.0.0.1:11434)"]
         sockets --> proxy
     end
-    nano -- "egress-proxy.sock:\none SOCKS5 flow per connection,\ndestination kept as a NAME" --> sockets
-    proxy -- "ingress-proxy.sock:\nCONNECT &lt;port&gt; reverse channel" --> nano
-    proxy -- "ALLOW-FAKE\n(example.com)" --> canned["canned response\n(no real network)"]
-    proxy -- "ALLOW-LOCAL\n(symbolic host: ollama)" --> ollama
-    proxy -- "ALLOW-PASSTHROUGH\n(registry.npmjs.org)" --> real1[("real internet\nno inspection")]
-    proxy -- "ALLOW-INJECT, opt-in\n(api.openai.com)" --> real2[("real internet\n+ real Bearer token")]
-    proxy -- "SOCKS5 reply 0x02\n(everything else)" --> nowhere["refused + logged\n(agent sees ECONNREFUSED)"]
+    nano -- "egress-proxy.sock:<br/>one SOCKS5 flow per connection,<br/>destination kept as a NAME" --> sockets
+    proxy -- "ingress-proxy.sock:<br/>CONNECT &lt;port&gt; reverse channel" --> nano
+    proxy -- "ALLOW-FAKE<br/>(example.com)" --> canned["canned response<br/>(no real network)"]
+    proxy -- "ALLOW-LOCAL<br/>(symbolic host: ollama)" --> ollama
+    proxy -- "ALLOW-PASSTHROUGH<br/>(registry.npmjs.org)" --> real1[("real internet<br/>no inspection")]
+    proxy -- "ALLOW-INJECT, opt-in<br/>(api.openai.com)" --> real2[("real internet<br/>+ real Bearer token")]
+    proxy -- "SOCKS5 reply 0x02<br/>(everything else)" --> nowhere["refused + logged<br/>(agent sees ECONNREFUSED)"]
     ext["External Client (curl)"] -- "POST http://localhost:9000/webhook" --> proxy
 ```
 
