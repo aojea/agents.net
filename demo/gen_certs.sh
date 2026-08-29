@@ -15,7 +15,8 @@
 # simpler and fully general for any host you add.
 #
 # - certs/agent-ca.pem / agent-ca.key -- the demo root CA. Mount agent-ca.pem
-#   into the sandbox as /var/run/agent-ca.pem to fulfill the Trust Contract.
+#   into the sandbox as /var/run/agent-ca.pem so the sandbox can trust the
+#   boundary's locally terminated TLS (the spec's TLS inspection model).
 # - certs/agent-mitm.pem / agent-mitm.key -- the one leaf cert host_proxy.py
 #   loads, covering every host in $HOSTS via SAN.
 #

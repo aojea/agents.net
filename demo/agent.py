@@ -4,7 +4,8 @@ agents.net Fully Autonomous ReAct Agent Harness.
 Demonstrates a 100% dynamic, unguided Python ReAct Agent running inside a zero-network
 (--network none) container behind the agents.net launcher. The agent uses Ollama
 (qwen2.5:0.5b) to autonomously reason, execute tools, observe policy denials as
-ordinary connection refusals (the SOCKS5 boundary's ECONNREFUSED), and self-correct.
+ordinary connection refusals (the boundary's 403 surfaces as ECONNREFUSED), and
+self-correct.
 Note what is absent: no proxy configuration, no custom transport, no SDK -- the
 harness opens ordinary sockets and the sandbox routes them.
 """
@@ -18,7 +19,7 @@ import requests
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 def start_ingress_server():
-    """Background HTTP listener for the agents.net Ingress Gateway Contract."""
+    """Background HTTP listener for the agents.net ingress interface."""
     port = int(os.environ.get("AGENT_INGRESS_PORT", "8081"))
 
     class WebhookHandler(BaseHTTPRequestHandler):
@@ -54,7 +55,7 @@ def fetch_webpage(url: str) -> str:
         return (
             "Connection refused.\n"
             "This destination is not reachable from this sandbox: either the\n"
-            "agents.net boundary denied the name at the SOCKS5 handshake, or the\n"
+            "agents.net boundary denied the name at the CONNECT handshake, or the\n"
             "sandbox has no route out at all. Choose an allowed destination instead."
         )
     except Exception as e:

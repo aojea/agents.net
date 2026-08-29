@@ -2,14 +2,14 @@
 # Regenerates the terminal recording embedded in README.md /
 # demo/README.md. Not part of the sandbox itself.
 #
-# Needs demo/nano-init (see demo/README.md Lab 3) and the agentsnet-demo
+# Needs demo/tun2connect (see demo/README.md Lab 3) and the agentsnet-demo
 # image built (Lab 5). Run under asciinema:
 #   asciinema rec -c ./demo/record-demo.sh demo/terminal-demo.cast
 set -e
 cd "$(dirname "$0")/.."
 
-if [ ! -x demo/nano-init ]; then
-    echo "demo/nano-init missing -- follow demo/README.md Lab 3 first" >&2
+if [ ! -x demo/tun2connect ]; then
+    echo "demo/tun2connect missing -- follow demo/README.md Lab 3 first" >&2
     exit 1
 fi
 
@@ -27,7 +27,7 @@ comment() {
   sleep 0.3
 }
 
-comment "1. Start the host-side agents.net boundary (SOCKS5) & ingress gateway"
+comment "1. Start the host-side agents.net boundary (HTTP CONNECT) & ingress gateway"
 type_out "python3 demo/host_proxy.py &"
 python3 -u demo/host_proxy.py >/dev/null 2>&1 &
 PROXY_PID=$!
@@ -44,8 +44,8 @@ PROMPT="Attempt to access https://secret-vault.example to retrieve the secret. I
 type_out "docker run --rm --network none \\"
 echo '    --cap-add NET_ADMIN --device /dev/net/tun \'
 echo '    -v /tmp/agent-sockets:/var/run/agents.net \'
-echo '    -v "$(pwd)/demo/nano-init:/nano-init:ro" \'
-echo '    --entrypoint /nano-init \'
+echo '    -v "$(pwd)/demo/tun2connect:/tun2connect:ro" \'
+echo '    --entrypoint /tun2connect \'
 echo '    agentsnet-demo \'
 echo '    run /var/run/agents.net/egress-proxy.sock \'
 echo "    python3 /demo/agent.py \"$PROMPT\""
@@ -56,8 +56,8 @@ docker run --rm \
   --network none \
   --cap-add NET_ADMIN --device /dev/net/tun \
   -v /tmp/agent-sockets:/var/run/agents.net \
-  -v "$(pwd)/demo/nano-init:/nano-init:ro" \
-  --entrypoint /nano-init \
+  -v "$(pwd)/demo/tun2connect:/tun2connect:ro" \
+  --entrypoint /tun2connect \
   agentsnet-demo \
   run /var/run/agents.net/egress-proxy.sock \
   python3 /demo/agent.py "$PROMPT" 2>/dev/null
@@ -72,8 +72,8 @@ AGENT_ID=$(docker run -d --rm \
   --network none \
   --cap-add NET_ADMIN --device /dev/net/tun \
   -v /tmp/agent-sockets:/var/run/agents.net \
-  -v "${PWD}/demo/nano-init:/nano-init:ro" \
-  --entrypoint /nano-init \
+  -v "${PWD}/demo/tun2connect:/tun2connect:ro" \
+  --entrypoint /tun2connect \
   agentsnet-demo \
   run --ingress-socket /var/run/agents.net/ingress-proxy.sock \
   /var/run/agents.net/egress-proxy.sock \
@@ -83,8 +83,6 @@ for i in {1..30}; do
     [ -S /tmp/agent-sockets/ingress-proxy.sock ] && break
     sleep 0.2
 done
-# The socket is created by container-root; open it to the unprivileged boundary.
-docker exec "${AGENT_ID}" chmod 666 /var/run/agents.net/ingress-proxy.sock
 sleep 0.5
 
 curl -X POST -d "Incoming Task: Process secret payload" http://localhost:9000/webhook

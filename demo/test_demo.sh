@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
-# End-to-end presubmit for the agents.net reference demo: the SOCKS5
+# End-to-end presubmit for the agents.net reference demo: the HTTP CONNECT
 # boundary (host_proxy.py) judging an unmodified image confined by the
-# injected nano-init launcher.
+# injected tun2connect launcher.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${REPO_ROOT}"
 
-SAM_REPO="${SAM_REPO:-https://github.com/google/sam}"
-SAM_CHECKOUT="${SAM_CHECKOUT:-}"   # set to a local sam checkout to skip cloning
-NANO_INIT="${SCRIPT_DIR}/nano-init"
+LAUNCHER="${SCRIPT_DIR}/tun2connect"
 
 echo "=== 1. Running Unit Tests ==="
 python3 -m unittest discover -s demo
@@ -18,18 +16,17 @@ python3 -m unittest discover -s demo
 echo "=== 2. Generating Demo CA Certificates ==="
 ./demo/gen_certs.sh
 
-echo "=== 3. Acquiring the Launcher (nano-init) ==="
-if [ ! -x "${NANO_INIT}" ]; then
-    if [ -z "${SAM_CHECKOUT}" ]; then
-        SAM_CHECKOUT="$(mktemp -d)/sam"
-        git clone --depth 1 "${SAM_REPO}" "${SAM_CHECKOUT}"
+echo "=== 3. Building the Launcher (tun2connect) ==="
+if [ ! -x "${LAUNCHER}" ]; then
+    if command -v go >/dev/null 2>&1; then
+        CGO_ENABLED=0 go -C tun2connect build -o "${LAUNCHER}" ./cmd/tun2connect
+    else
+        docker run --rm -v "${REPO_ROOT}":/src -w /src/tun2connect \
+          -e CGO_ENABLED=0 golang:1.26 \
+          go build -o /src/demo/tun2connect ./cmd/tun2connect
     fi
-    docker build -t sam-nano-init:local -f "${SAM_CHECKOUT}/Dockerfile.nano-init" "${SAM_CHECKOUT}"
-    cid=$(docker create sam-nano-init:local)
-    docker cp "${cid}:/nano-init" "${NANO_INIT}"
-    docker rm "${cid}" >/dev/null
 fi
-file "${NANO_INIT}" | grep -q "statically linked" || { echo "ERROR: nano-init is not a static binary"; exit 1; }
+file "${LAUNCHER}" | grep -q "statically linked" || { echo "ERROR: tun2connect is not a static binary"; exit 1; }
 
 echo "=== 4. Building Sandbox Container Image ==="
 docker build -t agentsnet-demo demo/
@@ -78,8 +75,8 @@ run_sandboxed() {
       --network none \
       --cap-add NET_ADMIN --device /dev/net/tun \
       -v /tmp/agent-sockets:/var/run/agents.net \
-      -v "${NANO_INIT}:/nano-init:ro" \
-      --entrypoint /nano-init \
+      -v "${LAUNCHER}:/tun2connect:ro" \
+      --entrypoint /tun2connect \
       "$@"
 }
 
@@ -105,9 +102,10 @@ if [ "${BLOCKED_RC}" -eq 0 ]; then
     echo "ERROR: curl to a non-allow-listed host succeeded!"
     exit 1
 fi
-# The SOCKS5 0x02 refusal surfaces in the guest as an immediate connection
-# failure; the exact shape (refused at connect, or reset just after) is a
-# guest-stack detail. Step 10 pins that the refusal came from policy.
+# The boundary's 403 refusal surfaces in the guest as an immediate
+# connection failure; the exact shape (refused at connect, or reset just
+# after) is a guest-stack detail. Step 10 pins that the refusal came from
+# policy.
 if ! echo "${BLOCKED_OUTPUT}" | grep -qiE "connection refused|couldn't connect|reset by peer|SSL_ERROR_SYSCALL"; then
     echo "ERROR: Expected an immediate connection failure for the refused host!"
     exit 1
@@ -119,15 +117,12 @@ AGENT_CONTAINER_ID=$(run_sandboxed -d agentsnet-demo \
   /var/run/agents.net/egress-proxy.sock \
   python3 -c "import os, urllib.request, threading, time; from http.server import BaseHTTPRequestHandler, HTTPServer; p = int(os.environ.get('AGENT_INGRESS_PORT', 8081)); (lambda s: threading.Thread(target=s.serve_forever, daemon=True).start())(HTTPServer(('127.0.0.1', p), type('H', (BaseHTTPRequestHandler,), {'do_POST': lambda self: (self.send_response(200), self.end_headers(), self.wfile.write(b'Webhook processed securely\n'))}))); urllib.request.urlopen('http://example.com'); time.sleep(15)")
 
-# Wait for the launcher to bring up tun0 and bind the ingress socket.
+# Wait for the launcher to bring up tun0 and bind the ingress socket
+# (the launcher chmods it 666 so the unprivileged boundary can dial it).
 for i in {1..30}; do
     [ -S /tmp/agent-sockets/ingress-proxy.sock ] && break
     sleep 0.2
 done
-
-# The socket is created by container-root; open it to the unprivileged
-# boundary from inside the container, where root owns the file.
-docker exec "${AGENT_CONTAINER_ID}" chmod 666 /var/run/agents.net/ingress-proxy.sock
 
 # The agent's loopback listener races container startup; retry briefly
 # instead of failing on the first in-flight dial.

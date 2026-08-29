@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Unit tests for demo/host_proxy.py -- the SOCKS5 boundary.
+"""Unit tests for demo/host_proxy.py -- the HTTP CONNECT boundary.
 
 The codec and dispatch tests drive a real server thread over a real Unix
 socket in a temp dir: the boundary's contract is a wire protocol, so the
@@ -8,7 +8,6 @@ tests speak the wire protocol.
 
 import os
 import socket
-import struct
 import sys
 import tempfile
 import threading
@@ -20,19 +19,30 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import host_proxy
 
 
-def socks5_request(sock: socket.socket, host: str, port: int) -> int:
-    """Greeting + CONNECT for a domain-name destination; returns REP."""
-    sock.sendall(b"\x05\x01\x00")
-    assert sock.recv(2) == b"\x05\x00"
-    req = (
-        b"\x05\x01\x00\x03"
-        + bytes([len(host)])
-        + host.encode()
-        + struct.pack("!H", port)
+def read_response_head(sock: socket.socket):
+    """Read one HTTP response head; returns (status_code, headers dict)."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+    head = buf.partition(b"\r\n\r\n")[0].decode("latin1")
+    lines = head.split("\r\n")
+    status = int(lines[0].split()[1])
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    return status, headers
+
+
+def connect_request(sock: socket.socket, authority: str):
+    """Send `CONNECT <authority>` and read the response head."""
+    sock.sendall(
+        f"CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n\r\n".encode()
     )
-    sock.sendall(req)
-    reply = sock.recv(10)
-    return reply[1]
+    return read_response_head(sock)
 
 
 class BoundaryTestCase(unittest.TestCase):
@@ -71,52 +81,46 @@ class BoundaryTestCase(unittest.TestCase):
         self.addCleanup(client.close)
         return client
 
-    def test_unknown_host_is_refused_with_0x02(self):
+    def test_unknown_host_is_refused_with_403(self):
         client = self.connect()
-        rep = socks5_request(client, "evil.example", 443)
-        self.assertEqual(rep, host_proxy.REP_NOT_ALLOWED)
+        status, headers = connect_request(client, "evil.example:443")
+        self.assertEqual(status, 403)
+        self.assertEqual(headers.get("boundary-reason"), "not-on-allowlist")
 
     def test_ipv4_literal_is_refused(self):
         client = self.connect()
-        client.sendall(b"\x05\x01\x00")
-        self.assertEqual(client.recv(2), b"\x05\x00")
-        client.sendall(
-            b"\x05\x01\x00\x01" + socket.inet_aton("1.2.3.4") + struct.pack("!H", 443)
-        )
-        self.assertEqual(client.recv(10)[1], host_proxy.REP_NOT_ALLOWED)
+        status, headers = connect_request(client, "1.2.3.4:443")
+        self.assertEqual(status, 403)
+        self.assertEqual(headers.get("boundary-reason"), "ip-literal")
 
     def test_ipv6_literal_is_refused(self):
         client = self.connect()
-        client.sendall(b"\x05\x01\x00")
-        self.assertEqual(client.recv(2), b"\x05\x00")
-        client.sendall(
-            b"\x05\x01\x00\x04"
-            + socket.inet_pton(socket.AF_INET6, "2001:db8::1")
-            + struct.pack("!H", 443)
-        )
-        self.assertEqual(client.recv(10)[1], host_proxy.REP_NOT_ALLOWED)
+        status, headers = connect_request(client, "[2001:db8::1]:443")
+        self.assertEqual(status, 403)
+        self.assertEqual(headers.get("boundary-reason"), "ip-literal")
 
-    def test_udp_associate_is_refused_with_0x07(self):
+    def test_non_connect_method_is_refused_with_405(self):
         client = self.connect()
-        client.sendall(b"\x05\x01\x00")
-        self.assertEqual(client.recv(2), b"\x05\x00")
-        client.sendall(b"\x05\x03\x00\x01" + b"\x00" * 6)
-        self.assertEqual(client.recv(10)[1], host_proxy.REP_COMMAND_NOT_SUPPORTED)
+        client.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        status, headers = read_response_head(client)
+        self.assertEqual(status, 405)
+        self.assertEqual(headers.get("boundary-reason"), "connect-only")
 
-    def test_client_refusing_no_auth_is_rejected(self):
+    def test_missing_port_is_refused(self):
         client = self.connect()
-        client.sendall(b"\x05\x01\x02")  # offers only username/password
-        self.assertEqual(client.recv(2), b"\x05\xff")
+        status, headers = connect_request(client, "example.com")
+        self.assertEqual(status, 403)
+        self.assertEqual(headers.get("boundary-reason"), "malformed-target")
 
     def test_host_names_are_case_insensitive(self):
         client = self.connect()
-        rep = socks5_request(client, "EXAMPLE.COM", 80)
-        self.assertEqual(rep, host_proxy.REP_SUCCESS)
+        status, _ = connect_request(client, "EXAMPLE.COM:80")
+        self.assertEqual(status, 200)
 
     def test_fake_host_serves_canned_response_on_port_80(self):
         client = self.connect()
-        rep = socks5_request(client, "example.com", 80)
-        self.assertEqual(rep, host_proxy.REP_SUCCESS)
+        status, _ = connect_request(client, "example.com:80")
+        self.assertEqual(status, 200)
         client.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
         data = b""
         while True:
@@ -145,8 +149,8 @@ class BoundaryTestCase(unittest.TestCase):
         )
 
         client = self.connect()
-        rep = socks5_request(client, "fakeollama", 11434)
-        self.assertEqual(rep, host_proxy.REP_SUCCESS)
+        status, _ = connect_request(client, "fakeollama:11434")
+        self.assertEqual(status, 200)
 
         upstream, _ = backend.accept()
         self.addCleanup(upstream.close)
@@ -155,7 +159,7 @@ class BoundaryTestCase(unittest.TestCase):
         upstream.sendall(b"pong")
         self.assertEqual(client.recv(4), b"pong")
 
-    def test_dead_local_provider_reports_connection_refused(self):
+    def test_dead_local_provider_reports_502(self):
         # Bind and close to get a port that is certainly not listening.
         probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         probe.bind(("127.0.0.1", 0))
@@ -170,8 +174,9 @@ class BoundaryTestCase(unittest.TestCase):
         )
 
         client = self.connect()
-        rep = socks5_request(client, "deadollama", 11434)
-        self.assertEqual(rep, host_proxy.REP_CONNECTION_REFUSED)
+        status, headers = connect_request(client, "deadollama:11434")
+        self.assertEqual(status, 502)
+        self.assertEqual(headers.get("boundary-reason"), "upstream-refused")
 
 
 class ConfigTestCase(unittest.TestCase):

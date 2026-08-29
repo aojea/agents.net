@@ -21,7 +21,7 @@ type BoundaryClient struct {
 	// "boundary" (over a Unix socket there is no real authority).
 	Authority string
 	// Header is copied into every tunnel request: sandbox identity,
-	// tracing -- the extension point SOCKS5 never had.
+	// tracing -- the wire's extension point.
 	Header http.Header
 }
 

@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 """Host-side agents.net demo boundary.
 
-A minimal SOCKS5 server (RFC 1928, CONNECT only, NO AUTH) on the sandbox
-boundary socket -- the reference implementation of the Boundary Contract,
+A minimal HTTP CONNECT proxy (RFC 9110 section 9.3.6) on the sandbox
+boundary socket -- the demo implementation of the spec's egress boundary,
 kept in one small file so the whole ACL/audit story is auditable at a
 glance:
 
-1. The sandboxed agent has no network. Its launcher (nano-init) terminates
-   the sandbox's TCP in userspace and delivers every flow here, over a
-   Unix Domain Socket, as a SOCKS5 CONNECT naming its destination -- a
+1. The sandboxed agent has no network. Its launcher (`tun2connect run`)
+   terminates the sandbox's TCP in userspace and delivers every flow
+   here, over a Unix Domain Socket, as an HTTP CONNECT request naming its
+   destination in the authority (`CONNECT api.example.com:443`) -- a
    *name*, never a resolved IP, because the launcher's virtual DNS never
    resolves it away.
 2. Policy is deny-by-default on that name. Anything not on the allow-list
-   is refused at the SOCKS5 handshake with reply 0x02 ("connection not
-   allowed by ruleset"), which the guest turns into an ordinary
-   ECONNREFUSED -- and the attempt is logged. IP literals are refused the
-   same way: policy reasons about names, so a flow that arrives without
-   one was never authorized.
+   is refused with `403 Forbidden` and a `Boundary-Reason` header, which
+   the guest stack turns into an ordinary ECONNREFUSED -- and the attempt
+   is logged. IP literals are refused the same way: policy reasons about
+   names, so a flow that arrives without one was never authorized.
 3. Every flow -- relayed, injected, answered, or refused -- is written to
-   an audit log, the auditing/DLP hook called out in the Trust Convention.
+   an audit log, the auditing/DLP hook called out in the spec's TLS
+   inspection models.
 4. The allow-list has four tiers:
    - FAKE_RESPONSE_HOSTS (the demo's task target, example.com) are NOT
      forwarded anywhere. This boundary terminates TLS locally using a
@@ -26,7 +27,8 @@ glance:
      canned success response. This keeps that part of the demo
      deterministic and network-independent, while still requiring the
      agent to complete a real, encrypted HTTPS request that only validates
-     because of the mounted `AGENT_CA_CERT` (the Trust Convention).
+     because of the mounted `AGENT_CA_CERT` (the spec's trust-store
+     coordination).
    - LOCAL_PROVIDER_HOSTS (default: a local Ollama server) let the sandbox
      reach a model backend running on the OPERATOR's own machine, by a
      purely symbolic hostname (e.g. "ollama") it can never resolve or
@@ -62,8 +64,8 @@ glance:
      own TLS session runs straight through the tunnel to the real server,
      verified against the container's own system trust store.
 
-It also serves the Ingress Contract: a public TCP port on the host is
-reverse-proxied into the sandbox over a second Unix socket served by the
+It also serves the spec's ingress interface: a public TCP port on the host
+is reverse-proxied into the sandbox over a second Unix socket served by the
 launcher from inside, using the Firecracker hybrid-vsock handshake
 ("CONNECT <port>\\n" -> "OK\\n"), so a microVM offers the identical
 protocol with no code change.
@@ -74,11 +76,11 @@ which is the point of having a spec.
 """
 import datetime
 import hashlib
+import ipaddress
 import os
 import select
 import socket
 import ssl
-import struct
 import threading
 
 SOCKET_DIR = "/tmp/agent-sockets"
@@ -98,15 +100,6 @@ CERT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "certs")
 # termination.
 MITM_CERT = os.path.join(CERT_DIR, "agent-mitm.pem")
 MITM_KEY = os.path.join(CERT_DIR, "agent-mitm.key")
-
-# SOCKS5 reply codes (RFC 1928 section 6).
-REP_SUCCESS = 0x00
-REP_GENERAL_FAILURE = 0x01
-REP_NOT_ALLOWED = 0x02
-REP_HOST_UNREACHABLE = 0x04
-REP_CONNECTION_REFUSED = 0x05
-REP_COMMAND_NOT_SUPPORTED = 0x07
-REP_ADDR_TYPE_NOT_SUPPORTED = 0x08
 
 
 # Tier 1: the demo's actual task target. Answered locally, never forwarded.
@@ -226,9 +219,9 @@ CREDENTIAL_FINGERPRINTS = {
 SUCCESS_BODY = (
     b"Congratulations -- you escaped the zero-network sandbox.\n"
     b"This response was served locally by the agents.net host boundary over\n"
-    b"a real TLS connection, trusted only because AGENT_CA_CERT (the Trust\n"
-    b"Convention) was wired into your runtime's trust store. Every byte of\n"
-    b"it crossed one Unix socket as a SOCKS5 flow naming its destination.\n"
+    b"a real TLS connection, trusted only because AGENT_CA_CERT was wired\n"
+    b"into your runtime's trust store. Every byte of it crossed one Unix\n"
+    b"socket as a named HTTP CONNECT tunnel.\n"
     b"No network interface was used to get here.\n"
 )
 
@@ -246,66 +239,69 @@ def audit(decision: str, target: str, detail: str = "") -> None:
 
 
 # ---------------------------------------------------------------------------
-# SOCKS5 codec (RFC 1928). CONNECT only, NO AUTH, TCP only -- the deliberate
-# minimum. UDP ASSOCIATE and BIND are refused: the only way out is a named
-# TCP flow.
+# HTTP CONNECT codec (RFC 9110 section 9.3.6). CONNECT only -- the
+# deliberate minimum: the only way out is a named TCP tunnel. Refusals are
+# `403 Forbidden` with a `Boundary-Reason` header, upstream failures `502`.
 # ---------------------------------------------------------------------------
 
 
-def recv_exact(sock: socket.socket, n: int) -> bytes:
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("client closed mid-handshake")
-        buf += chunk
-    return buf
-
-
-def socks_reply(sock: socket.socket, rep: int) -> None:
-    """Reply with BND.ADDR 0.0.0.0:0 -- clients ignore it for CONNECT."""
+def send_response(sock: socket.socket, status: str, reason: str = "") -> None:
+    head = f"HTTP/1.1 {status}\r\n"
+    if reason:
+        head += f"Boundary-Reason: {reason}\r\n"
+    head += "Content-Length: 0\r\n\r\n"
     try:
-        sock.sendall(b"\x05" + bytes([rep]) + b"\x00\x01" + b"\x00" * 6)
+        sock.sendall(head.encode("latin1"))
     except OSError:
         pass
 
 
-def read_handshake(sock: socket.socket):
-    """Negotiate NO AUTH and read one CONNECT request. Returns
-    (host, port, is_name) or raises ValueError with the reply already sent."""
-    ver, nmethods = recv_exact(sock, 2)
-    if ver != 0x05:
-        raise ConnectionError(f"not SOCKS5 (version {ver})")
-    methods = recv_exact(sock, nmethods)
-    if 0x00 not in methods:
-        sock.sendall(b"\x05\xff")  # no acceptable methods
-        raise ConnectionError("client refused NO AUTH")
-    sock.sendall(b"\x05\x00")
+def refuse(sock: socket.socket, reason: str) -> None:
+    send_response(sock, "403 Forbidden", reason)
 
-    ver, cmd, _rsv, atyp = recv_exact(sock, 4)
-    if ver != 0x05:
-        raise ConnectionError("bad request version")
-    if cmd != 0x01:  # only CONNECT; BIND and UDP ASSOCIATE stay refused
-        socks_reply(sock, REP_COMMAND_NOT_SUPPORTED)
-        raise ValueError(f"unsupported command {cmd}")
 
-    if atyp == 0x03:  # domain name -- the normal case via the launcher
-        (dlen,) = recv_exact(sock, 1)
-        # On the wire the name is ASCII (already punycoded if international);
-        # lowercase because DNS names are case-insensitive and so is the ACL.
-        host = recv_exact(sock, dlen).decode("ascii", errors="replace").lower()
-        is_name = True
-    elif atyp == 0x01:  # IPv4 literal -- the agent bypassed the resolver
-        host = socket.inet_ntop(socket.AF_INET, recv_exact(sock, 4))
+def tunnel_established(sock: socket.socket) -> None:
+    sock.sendall(b"HTTP/1.1 200 OK\r\n\r\n")
+
+
+def read_connect(sock: socket.socket):
+    """Read one CONNECT request head. Returns (host, port, is_name) or
+    raises ValueError/ConnectionError with the response already sent.
+    Lowercases the host: DNS names are case-insensitive and so is the ACL."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > 8192:
+            send_response(sock, "400 Bad Request", "oversized-head")
+            raise ValueError("oversized request head")
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("client closed mid-request")
+        buf += chunk
+    head = buf.partition(b"\r\n\r\n")[0]
+    request_line = head.split(b"\r\n", 1)[0].decode("latin1")
+    parts = request_line.split()
+    if len(parts) != 3 or parts[0].upper() != "CONNECT":
+        send_response(sock, "405 Method Not Allowed", "connect-only")
+        raise ValueError(f"not a CONNECT request: {request_line!r}")
+
+    authority = parts[1]
+    host, sep, port_s = authority.rpartition(":")
+    if not sep:
+        refuse(sock, "malformed-target")
+        raise ValueError(f"no port in authority {authority!r}")
+    host = host.strip("[]").lower()  # v6 literals arrive bracketed
+    try:
+        port = int(port_s)
+    except ValueError:
+        refuse(sock, "malformed-target")
+        raise ValueError(f"bad port in authority {authority!r}")
+
+    is_name = True
+    try:
+        ipaddress.ip_address(host)
         is_name = False
-    elif atyp == 0x04:  # IPv6 literal
-        host = socket.inet_ntop(socket.AF_INET6, recv_exact(sock, 16))
-        is_name = False
-    else:
-        socks_reply(sock, REP_ADDR_TYPE_NOT_SUPPORTED)
-        raise ValueError(f"unsupported address type {atyp}")
-
-    (port,) = struct.unpack("!H", recv_exact(sock, 2))
+    except ValueError:
+        pass
     return host, port, is_name
 
 
@@ -336,9 +332,10 @@ def relay(client_sock, out_sock) -> None:
 def read_http_message(sock, initial: bytes = b""):
     """Read one HTTP request (headers + body) from sock, starting from any
     bytes already read (`initial`). Returns (request_line, headers, body)
-    where headers is a list of (name, value) tuples. With SOCKS5 the agent
-    believes it is talking directly to the origin server, so the request
-    line is already origin-form -- nothing to rewrite."""
+    where headers is a list of (name, value) tuples. Inside a CONNECT
+    tunnel the agent believes it is talking directly to the origin server,
+    so the inner request line is already origin-form -- nothing to
+    rewrite."""
     buf = initial
     while b"\r\n\r\n" not in buf:
         chunk = sock.recv(4096)
@@ -391,19 +388,19 @@ def http_response(status_line: bytes, body: bytes) -> bytes:
 
 
 def dial_or_reply(client_sock: socket.socket, addr: tuple, target: str):
-    """Dial upstream before confirming the flow, so a dead backend surfaces
-    to the agent as the accurate SOCKS5 reply instead of a broken pipe."""
+    """Dial upstream before confirming the tunnel, so a dead backend
+    surfaces to the agent as an accurate 502 instead of a broken pipe."""
     try:
         out_sock = socket.create_connection(addr, timeout=15)
     except ConnectionRefusedError:
         print(f"[!] upstream {target} ({addr}) refused")
-        socks_reply(client_sock, REP_CONNECTION_REFUSED)
+        send_response(client_sock, "502 Bad Gateway", "upstream-refused")
         return None
     except OSError as exc:
         print(f"[!] upstream {target} ({addr}) unreachable: {exc}")
-        socks_reply(client_sock, REP_HOST_UNREACHABLE)
+        send_response(client_sock, "502 Bad Gateway", "upstream-unreachable")
         return None
-    socks_reply(client_sock, REP_SUCCESS)
+    tunnel_established(client_sock)
     return out_sock
 
 
@@ -414,7 +411,7 @@ def dial_or_reply(client_sock: socket.socket, addr: tuple, target: str):
 
 def serve_fake(client_sock: socket.socket, target: str, port: int) -> None:
     audit("ALLOW-FAKE", target)
-    socks_reply(client_sock, REP_SUCCESS)
+    tunnel_established(client_sock)
     if port == 443:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(MITM_CERT, MITM_KEY)
@@ -437,10 +434,10 @@ def serve_inject(client_sock: socket.socket, target: str, host: str, port: int, 
     if port == 443 and not os.path.exists(MITM_CERT):
         print("[!] no demo MITM cert (run gen_certs.sh) -- refusing")
         audit("BLOCK", target, detail="missing-mitm-cert")
-        socks_reply(client_sock, REP_NOT_ALLOWED)
+        refuse(client_sock, "missing-mitm-cert")
         return
 
-    socks_reply(client_sock, REP_SUCCESS)
+    tunnel_established(client_sock)
     if port == 443:
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ctx.load_cert_chain(MITM_CERT, MITM_KEY)
@@ -501,16 +498,16 @@ def serve_passthrough(client_sock: socket.socket, target: str, host: str, port: 
 
 def handle(client_sock: socket.socket) -> None:
     try:
-        host, port, is_name = read_handshake(client_sock)
+        host, port, is_name = read_connect(client_sock)
     except (ValueError, ConnectionError, OSError):
-        return  # reply (if any) already sent
+        return  # response (if any) already sent
 
     target = f"{host}:{port}"
     if not is_name:
         # Policy reasons about names. A literal address means the agent
         # bypassed the resolver, so there is no name to authorize.
         audit("BLOCK-IP-LITERAL", target)
-        socks_reply(client_sock, REP_NOT_ALLOWED)
+        refuse(client_sock, "ip-literal")
         return
 
     if host in FAKE_RESPONSE_HOSTS:
@@ -523,7 +520,7 @@ def handle(client_sock: socket.socket) -> None:
         serve_passthrough(client_sock, target, host, port)
     else:
         audit("BLOCK", target)
-        socks_reply(client_sock, REP_NOT_ALLOWED)
+        refuse(client_sock, "not-on-allowlist")
 
 
 # ---------------------------------------------------------------------------
@@ -613,7 +610,7 @@ def main() -> None:
     os.chmod(EGRESS_UDS, 0o777)
     server.listen(32)
 
-    print(f"[*] Host Boundary (SOCKS5) listening on: {EGRESS_UDS}")
+    print(f"[*] Host Boundary (HTTP CONNECT) listening on: {EGRESS_UDS}")
     print(f"[*] Fake-response allow-list: {sorted(FAKE_RESPONSE_HOSTS)}")
     print(f"[*] Local-provider allow-list: {LOCAL_PROVIDER_HOSTS}")
     print(f"[*] Credential-inject allow-list: {CREDENTIAL_FINGERPRINTS}")
@@ -634,7 +631,7 @@ def main() -> None:
                 pass
 
     # One thread per flow: with the launcher, every TCP connection in the
-    # sandbox is its own SOCKS5 flow, and several are open at once.
+    # sandbox is its own CONNECT tunnel, and several are open at once.
     while True:
         client_sock, _ = server.accept()
         threading.Thread(target=_serve, args=(client_sock,), daemon=True).start()

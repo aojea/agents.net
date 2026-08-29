@@ -199,7 +199,7 @@ Putting all enforcement in one place is a strength — there is one component to
 While the specification defines the boundary protocol and contracts, implementations can adopt different in-guest architectures depending on the virtualization technology:
 
 ### 5.1 In-Guest Networking with TUN and Virtual DNS
-A common and portable implementation pattern uses a userspace TCP/IP stack (such as gVisor `netstack` or `tun2socks`) attached to a virtual `tun` device:
+A common and portable implementation pattern uses a userspace TCP/IP stack (such as gVisor `netstack`) attached to a virtual `tun` device:
 
 1. **TUN Interface:** A `tun` interface (e.g. `tun0`) is created inside the sandbox and configured as the default gateway.
 2. **Virtual DNS (Name Preservation):** The in-guest stack intercepts local DNS queries on port 53. Instead of resolving them over the network, it returns a synthetic IP address allocated from a private pool (e.g., IPv4 `100.64.0.0/10` and IPv6 `100::/64`).
@@ -209,7 +209,7 @@ A common and portable implementation pattern uses a userspace TCP/IP stack (such
 
 The supervision model for the in-guest networking process depends on the host virtualization environment. Running as **PID 1 is recommended where applicable, but not required**:
 
-- **Container Entrypoint Injection (Recommended for Containers):** The launcher binary (e.g. `nano-init`) is bind-mounted into the container and set as `--entrypoint`. It executes as PID 1, initializes the `tun` device, runs the agent process as a child, reaps orphans, forwards signals, and exits with the agent's return code. This provides tight lifecycle coupling: if the launcher dies, the sandbox terminates.
+- **Container Entrypoint Injection (Recommended for Containers):** The launcher binary (e.g. `tun2connect run`) is bind-mounted into the container and set as `--entrypoint`. It executes as PID 1, initializes the `tun` device, runs the agent process as a child, reaps orphans, forwards signals, and exits with the agent's return code. This provides tight lifecycle coupling: if the launcher dies, the sandbox terminates.
 - **Sidecar Process / Shared Network Namespace:** In environments where the container entrypoint must remain untouched (or in Kubernetes pods), the launcher can run as a sidecar process sharing the sandbox network namespace. If the sidecar terminates, the agent simply loses network access (failing closed).
 - **MicroVM Guest Init / System Daemon (MicroVMs):** In microVMs (Firecracker, Cloud-Hypervisor), the networking daemon (e.g. `tun2connect`) runs as a standard guest init process (`/sbin/init`) or system service communicating over a vsock channel to the host.
 
@@ -243,12 +243,12 @@ A modular Go implementation (`github.com/aojea/agents.net/tun2connect`) of the H
 - [tun2connect/pkg/tun2connect/dns.go](tun2connect/pkg/tun2connect/dns.go) — Virtual DNS implementation with synthetic IP allocation and dial-time name reversal.
 - [tun2connect/pkg/tun2connect/dialer.go](tun2connect/pkg/tun2connect/dialer.go) — `Dialer` interface supporting HTTP/1.1 (`BoundaryClient`) and HTTP/2 (`BoundaryClientH2`).
 - [tun2connect/cmd/connect-proxy/main.go](tun2connect/cmd/connect-proxy/main.go) — Reference host boundary proxy with domain allowlisting, HTTP/1.1 and multiplexed HTTP/2 support, UDP capsule tunneling, and mTLS client certificate verification.
-- [tun2connect/cmd/tun2connect/main.go](tun2connect/cmd/tun2connect/main.go) — Standalone in-guest daemon establishing tunnels over a boundary socket.
+- [tun2connect/cmd/tun2connect/main.go](tun2connect/cmd/tun2connect/main.go) — The in-guest side, in two modes: a standalone daemon, or (`run`) the injectable launcher that becomes PID 1, builds the TUN, and supervises the agent.
 - [tun2connect/examples/envoy-boundary.yaml](tun2connect/examples/envoy-boundary.yaml) — Production Envoy configuration terminating both HTTP/1.1 and HTTP/2 CONNECT tunnels natively.
 - [tun2connect/test_envoy.sh](tun2connect/test_envoy.sh) — Test script validating end-to-end Envoy interoperability.
 
 ### 7.2 Zero-Network Sandbox Demo: [demo/](demo/)
-A hands-on, runnable demonstration of a zero-network autonomous ReAct agent running inside Docker:
+A hands-on, runnable demonstration of a zero-network autonomous ReAct agent running inside Docker, confined by the injected `tun2connect` launcher:
 
 ![agents.net terminal demo](demo/terminal-demo.gif)
 

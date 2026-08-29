@@ -68,6 +68,13 @@ func boundaryDialer(proxy string) (func(ctx context.Context) (net.Conn, error), 
 }
 
 func main() {
+	// Launcher mode: build the TUN, become the agent's supervisor, and
+	// exit with its status. Daemon mode (below) only runs the engine.
+	if len(os.Args) > 1 && os.Args[1] == "run" {
+		runLauncher(os.Args[2:])
+		return
+	}
+
 	device := flag.String("device", "tun2c0", "TUN device name to create")
 	mtu := flag.Uint("mtu", 1500, "TUN MTU")
 	proxy := flag.String("proxy", "unix:///tmp/boundary.sock", "boundary address (unix:///path or tcp://host:port)")

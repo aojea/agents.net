@@ -2,15 +2,15 @@
 #
 # Deliberately, this image knows NOTHING about agents.net: no launcher, no
 # proxy variables, no bridge scripts, no socket paths. It is just a harness
-# and its dependencies. The Boundary Contract is applied entirely from the
-# outside, at `docker run` time, by entrypoint injection (see the README's
-# "Injecting the launcher" section):
+# and its dependencies. The egress boundary is applied entirely from the
+# outside, at `docker run` time, by entrypoint injection (see the spec's
+# "Process Supervision & Lifecycle Models" section):
 #
 #   docker run --rm --network none \
 #     --cap-add NET_ADMIN --device /dev/net/tun \
 #     -v "$SOCKET_DIR":/var/run/agents.net \
-#     -v "$NANO_INIT":/nano-init:ro \
-#     --entrypoint /nano-init \
+#     -v "$LAUNCHER":/tun2connect:ro \
+#     --entrypoint /tun2connect \
 #     agents-net-demo \
 #     run /var/run/agents.net/egress-proxy.sock \
 #     python3 /demo/agent.py "Fetch https://example.com and report its status code."
@@ -20,10 +20,11 @@
 # argument; everything after it belongs to the agent. See the demo README's
 # ingress lab.)
 #
-# The launcher (nano-init, a dependency-free static binary consumed from the
-# SAM project) becomes PID 1, builds the tun that is the sandbox's only route,
-# and delivers every flow to the host boundary as SOCKS5 naming its
-# destination. The harness below runs unmodified behind it.
+# The launcher (`tun2connect run`, a dependency-free static binary built
+# from this repo's tun2connect module) becomes PID 1, builds the tun that
+# is the sandbox's only route, and delivers every flow to the host boundary
+# as a named HTTP CONNECT tunnel. The harness below runs unmodified behind
+# it.
 #
 # Swap in any other harness by editing this one file: the only requirement is
 # that it runs non-interactively and reads its credentials from its own
@@ -44,7 +45,7 @@ RUN pip install --no-cache-dir --break-system-packages \
         langchain-community \
         langchain-ollama
 
-# Trust Convention (opt-in): bake the demo CA into the system trust store so
+# Trust store setup (opt-in): bake the demo CA into the system trust store so
 # TLS-inspected tiers (fake-response, credential-inject) validate. This is
 # coordination, not enforcement -- an image built without it still cannot
 # reach anything the boundary denies; its own requests to inspected domains
