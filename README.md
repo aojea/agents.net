@@ -1,222 +1,262 @@
-# AGENTS.NET: The Agent Networking Specification
+# AGENTS.NET: Standardized Agent Networking Specification
 
-## Introduction: Confinement Is a Route, Not a Convention
+`agents.net` is an open specification for giving sandboxed AI agents controlled network access. The idea is simple: the sandbox has no network at all, every connection the agent makes leaves through a single socket as a named HTTP `CONNECT` tunnel, and a proxy on the host decides — by destination name — what is allowed. The agent doesn't need to cooperate or even know about any of this, and the host side can be an off-the-shelf dataplane like Envoy. No proxy configuration in the guest, no IP management on the host, and everything fails closed.
 
-As AI agents become more autonomous, sandboxing them has evolved into a nightmare of virtual network interfaces, TAP devices, complex NAT rules, and IP routing.
+---
 
-The first revision of this spec answered with conventions, in the spirit of the most successful standards in the AI ecosystem — the Model Context Protocol, `AGENTS.md` — simple, plain-text agreements: boot the sandbox with zero network and tell the agent, through environment variables, where the HTTP proxy is.
+## 1. Motivation & Sandbox Definition
 
-Running real, unmodified harnesses showed the limit of that approach: **every convention needs the agent's cooperation, and an agent that has to cooperate with its own confinement is not confined.** A Python library that opens its client with `trust_env=False` bypasses the proxy. So does a subprocess that clears its environment. Anything that is not HTTP — `git` over SSH, gRPC, Postgres, a raw socket — was never covered in the first place. And an agent driven by a model, acting on text nobody wrote, is exactly the case where cooperation cannot be assumed.
+### What is a Sandbox?
+In this specification, a **Sandbox** is an isolated execution environment containing an AI agent or untrusted workload that has **no direct access to external host networks**. Examples include:
+- A Linux container configured with an unshared, empty network namespace (e.g. `docker run --network none` or isolated Kubernetes Pods).
+- A microVM (such as Firecracker or Cloud-Hypervisor) provisioned without a routed TAP/NIC device.
+- A process-isolated sandbox (such as gVisor or WebAssembly runtime) lacking direct host socket access.
 
-So this revision keeps the zero-network sandbox and replaces the convention with enforcement. The sandbox has no interface except a `tun` device built by a **userspace launcher** running as PID 1; the launcher owns the only route out; every flow leaves through **one Unix socket as an HTTP CONNECT tunnel request, carrying the destination as a name**; and a host-side boundary applies deny-by-default policy on that name. None of this requires the agent's cooperation.
+Inside the sandbox, the application **MUST NOT be required to cooperate with its confinement**:
+- Client libraries that initialize with `trust_env=False` or bypass `HTTP_PROXY` environment variables must still be confined.
+- Subprocesses that clear or override their environment variables must not escape isolation.
+- Non-HTTP protocols (raw TCP sockets, gRPC, database drivers, SSH/Git) must be handled uniformly without bespoke proxies per protocol.
 
-Conventions still exist, but only where they are harmless. The rule this spec follows:
+### The Problem with Traditional Approaches
+1. **Voluntary Proxy Conventions Fail:** Relying on environment variables (`HTTP_PROXY`, `ALL_PROXY`) depends entirely on the agent's voluntary compliance. Any subprocess, static binary, or custom network client can bypass the proxy.
+2. **Host Routing and IPAM are Fragile:** Standard container networks allocate virtual interfaces (veth pairs, TAP devices), assign IP subnets (IPAM), and route traffic through host-side iptables/nftables or eBPF. Because DNS resolution happens inside the guest, host firewalls only see raw destination IP addresses. Enforcing domain-based policies then requires fragile DNS snooping or complex transparent proxying, and misconfigured firewall rules risk failing open.
 
-> **A convention may govern what an agent can reach cooperatively. It must never govern what an agent cannot reach.**
+### The `agents.net` Solution
+`agents.net` standardizes the boundary between the sandbox and the host. Outgoing traffic inside the sandbox is captured (typically via a virtual `tun` device) and translated into standard HTTP `CONNECT` tunnel requests over a point-to-point boundary stream (such as a Unix Domain Socket or vsock).
 
-Access may be coordinated; denial is enforced.
+```mermaid
+flowchart LR
+    subgraph Sandbox ["Sandbox (Zero External Network)"]
+        Agent["Agent Application\n(unmodified, zero config)"]
+        Stack["In-Guest Stack\n(TUN + Virtual DNS + CONNECT Client)"]
+        Agent -- "TCP / UDP / DNS" --> Stack
+    end
 
-## Why This Design: the Decision Matrix
+    subgraph Host ["Host / Infrastructure"]
+        Channel["Point-to-Point Channel\n(Unix Domain Socket / vsock)"]
+        Boundary["Boundary Proxy / Mesh Dataplane\n(Envoy, Istio HBONE, connect-proxy)"]
+        External[("Target Service / Upstream")]
 
-There are six known ways to control the traffic of a sandboxed agent. We considered all of them — two were earlier designs of this project. The first table compares them property by property; the second summarizes the trade-offs.
+        Channel --> Boundary
+        Boundary -- "Allowlist Policy (by Name)" --> External
+    end
 
-| | 1. Routed NIC + redirect<br/>(veth/tap + nftables/eBPF tc) | 2. Proxy env convention<br/>(`HTTP_PROXY` + CA vars) | 3. Host-side userspace stack<br/>([gvisor-tap-vsock](https://github.com/containers/gvisor-tap-vsock)) | 4. Guest-side userspace stack<br/>(tun → HTTP CONNECT, **this spec**) | 5. Socket-layer eBPF<br/>(cgroup connect hooks / sockmap) | 6. In-guest transparent redirect<br/>(NAT → loopback forwarder → vsock) |
-|---|---|---|---|---|---|---|
-| **Confinement** | enforced subtractively: a filter over a working network | cooperation required | enforced: frames only reach a host process | enforced: no interface but the tun | enforced, shared kernel only | enforced: vsock is the only way out; guest rules are only routing |
-| **Failure mode** | fail-open: a missing rule is a working network | fail-open by design | fail-closed | fail-closed: launcher dies → no route; PID 1 dies → sandbox exits | fail-closed if default-deny; programs can detach silently | fail-closed: tampered guest rules lose connectivity, not gain reach |
-| **Policy sees** | IP:port — the name died at DNS time | full URL (HTTP only) | packets; names only by also owning guest DNS | **the destination name, for every flow** | IP:port at `connect()` | IP:port via `SO_ORIGINAL_DST`; names re-derived from SNI/Host or an owned DoH resolver |
-| **Guest cost** | none | env + CA plumbing enumerated per runtime | none — guest sees a standard NIC | a launcher as PID 1; `/dev/net/tun` + `NET_ADMIN` (or a user namespace) | none | NAT rules + loopback forwarder + DoH resolver; kernel TCP retained |
-| **Host cost** | netns/veth/rules per sandbox, IPAM, ordering, cleanup, `CAP_NET_ADMIN` | none | a full netstack + NAT/DHCP/DNS per sandbox, in a host process | one CONNECT listener per boundary socket | eBPF lifecycle, `CAP_BPF`/`CAP_SYS_ADMIN`, kernel-version treadmill | per-sandbox proxy listener + a proxy-config control loop |
-| **Traffic CPU billed to** | host kernel (unattributed) | n/a | **the host component** (noisy neighbor) | **the sandbox itself** (its own cgroup/VM budget) | host kernel (unattributed) | the sandbox (guest kernel) |
-| **Containers ↔ microVMs** | two different dataplanes | same everywhere it works | VM-native; containers awkward | identical byte stream (UDS ↔ vsock) | cannot cross a VM boundary; gVisor hides guest sockets | microVM-native; containers need iptables + `NET_ADMIN` in-guest |
-| **Protocols** | all | HTTP(S) only | all | TCP (UDP explicitly denied) | TCP/UDP | TCP only |
-| **Snapshot / migration** | host kernel state, rebuilt by hand on the new host | n/a | host state per sandbox | dataplane is guest state — travels inside the snapshot | host state, kernel-pinned | guest state travels; vsock connections reset on resume |
-
-In summary:
-
-| Option | Pros | Cons | Bottom line |
-|---|---|---|---|
-| **1. Routed NIC + redirect** | native kernel TCP performance; no extra processes; mature tooling; works with any guest unmodified | fail-open: a missing rule is a working network; policy sees IPs after the name is gone, so domain policy needs fragile DNS interception; per-sandbox kernel state on the host to create in order, clean up on crash, and rebuild on migration | isolation as a filter over a working network: every bug is a hole, not an outage |
-| **2. Proxy env convention** | zero infrastructure; no privileges; useful in-band HTTP signaling | needs the agent's cooperation (`trust_env=False`, cleared env, non-HTTP protocols and static binaries all bypass it); an endless per-runtime list of variables; HTTP(S) only | our own first design: a request, not a boundary; kept below only for coordination |
-| **3. Host-side userspace stack** ([gvisor-tap-vsock](https://github.com/containers/gvisor-tap-vsock)) | guest keeps a standard NIC, any OS works; rootless; proven in podman machine, CRC, Lima | the host pays the CPU for every byte of tenant traffic (noisy neighbor); host side is a full netstack with NAT/DHCP/DNS rather than a policy point; names require owning the guest's DNS too | the right transport with the stack on the wrong side of the boundary |
-| **4. Guest-side userspace stack** (**this spec**) | fail-closed by construction; the name reaches every policy decision in-band; CPU billed to the sandbox itself; the dataplane migrates inside the snapshot; identical for containers and microVMs | an injected PID 1 carrying a userspace TCP stack; more total CPU than kernel networking; TCP only | the only option that is enforced, fail-closed, name-preserving and tenant-accounted at the same time |
-| **5. Socket-layer eBPF** | lowest overhead of all (socket-level splice, no packet processing); invisible to the guest | shared kernel only: cannot cross a microVM boundary, and gVisor hides guest sockets from the host kernel; sees IPs at `connect()`; `CAP_BPF` plus kernel-version maintenance | a good accelerator for option 1, not a boundary for heterogeneous sandboxes |
-| **6. In-guest transparent redirect over vsock** | guest kernel's native TCP; fail-closed (tampered guest rules lose connectivity, not gain reach); enforcement on the host; tenant-accounted; proven pattern (AWS Nitro Enclaves) | the name is lost at the NAT redirect (`SO_ORIGINAL_DST` gives an IP) and must be reconstructed from SNI, Host headers, or an operator-run DoH resolver — flows that are neither TLS nor HTTP have no name; netfilter back in the guest image; a per-sandbox proxy-config control loop on the host | the close second: equal on enforcement, accounting and failure mode; loses only on the policy input |
-
-**Why option 4:** options 4 and 6 are the two serious candidates. Both are enforced, fail-closed, tenant-accounted, decided on the host, and built on the same transport (a Unix socket / vsock byte stream), so switching between them later is cheap. The difference is the policy input. Option 6 has to reconstruct destinations from SNI, Host headers, and a resolver the operator must also run; option 4 delivers **the name, in-band, for every flow**, because the guest stack never resolves it away. Deny-by-default on names is the core of this spec, so option 4 is the design.
-
-## The `agents.net` Contract
-
-`agents.net` defines one enforced contract and two coordination contracts.
-
-### I. The Boundary Contract (Egress) — enforced
-
-The sandbox boots with **no network**: no interface other than loopback. A userspace **launcher** runs as PID 1 inside the sandbox and:
-
-1. creates a `tun` device and makes it the sandbox's only default route;
-2. terminates the sandbox's TCP in userspace and answers DNS lookups with placeholder addresses it invents (virtual DNS), so the destination reaches the boundary as a **name**, never a resolved IP;
-3. opens one **HTTP `CONNECT` tunnel request** per flow over the **boundary socket**, the destination carried as a *name* in the request authority (`CONNECT api.example.com:443`) -- the policy input, in-band, for every flow. UDP crosses the same wire as `connect-udp` (RFC 9298). (Transitional note: the current reference launcher still emits a legacy SOCKS5 encoding of the same named request; converging it is a dialer swap in its embedded stack, not a redesign -- see [The Wire](#the-wire-http-connect-and-tun2connect).);
-4. **refuses to start** if any interface other than loopback and its own tun exists — so a half-configured sandbox fails at startup instead of silently keeping a second route;
-5. does PID 1 duties: reaps orphans, propagates signals, exits with the agent's status.
-
-The boundary socket is a filesystem object, not a network path — which is what lets the sandbox have no network and still be reachable:
-
-| sandbox | boundary socket |
-|---|---|
-| container (`--network none`) | bind-mounted Unix socket |
-| microVM | vsock, surfacing on the host as a Unix socket |
-
-The host-side boundary applies **deny-by-default policy on the name**. A refused destination is answered with HTTP `403` and a structured `Boundary-Reason` header, which the guest stack surfaces as an immediate, ordinary connection failure — `ECONNREFUSED` at `connect()`, or a reset on first use, depending on timing. Every language and library already handles that; nothing hangs. UDP is denied unless a deployment enables the `connect-udp` path -- and even then it is named, policy-checked, and audited per session like any TCP flow.
-
-The agent needs **no configuration at all** to be confined: no proxy variables, no SDK, no patched binaries. The old proxy contract is gone because there is nothing left for the agent to honour.
-
-The reference launcher is [`nano-init`](https://github.com/google/sam/tree/main/cmd/nano-init) from the SAM project, consumed as a prebuilt binary — it carries the userspace TCP stack ([tun2socks](https://github.com/xjasonlyu/tun2socks)) so neither this spec nor your host code has to. The launcher is replaceable: the contract is the socket and the protocol, never the binary.
-
-#### Injecting the launcher (no image ownership required)
-
-The launcher does not need to be baked into the agent's image, because confinement never comes from the image: the *runtime* provides the empty network namespace, the boundary socket and the tun device, and the platform controls the runtime. The launcher is a dependency-free static binary. There are two ways to inject it; **this spec recommends entrypoint injection**, and the reference implementation below uses it exclusively.
-
-**Recommended — as the entrypoint (PID 1).**
-
-| layer | mechanism |
-|---|---|
-| `docker` / `podman` | `-v /opt/agents.net/nano-init:/nano-init:ro --entrypoint /nano-init`, appending the image's original command |
-| OCI bundle | bind-mount the binary and rewrite `process.args` in `config.json` to wrap the image's configured entrypoint |
-| Kubernetes | a mutating webhook in the istio-init mold: an initContainer runs `nano-init copy` into a shared `emptyDir`, and the pod's `command:` is rewritten to wrap the original |
-| microVM | the platform assembles the guest rootfs anyway; the launcher is `/sbin/init`, so nothing needs to be injected |
-
-Wrapping the image's command brings PID 1 duties with it (reaping, signal propagation, the agent's exit status), couples the lifecycle (the launcher's death ends the sandbox), and makes the launcher signal-protected from every process it spawns. The one requirement: the injecting layer must read the image's original `argv` from the image config — the same thing `docker inspect` shows.
-
-It is recommended because the lifecycle coupling removes operational work: no supervisor, no restart policy, no startup-ordering problem. If the launcher runs, the agent runs behind it; if the launcher dies, the sandbox ends. And it is one mechanism that works the same way across docker, OCI and microVMs.
-
-**Alternative — as a side process (same network namespace).** For the cases entrypoint injection cannot serve: an agent container that must remain byte-for-byte untouched (argv included), or a platform that owns the sandbox's network namespace outright and prefers to keep the OCI process spec pristine. The launcher runs beside the agent, attached to the same network namespace, and builds the tun there:
-
-| layer | mechanism |
-|---|---|
-| `docker` / `podman` | run the agent with `--network none`; run the launcher in a second container with `--network container:<agent>` |
-| Kubernetes | a native sidecar (initContainer with `restartPolicy: Always`), with the pod's `dnsConfig` pointing at the launcher's resolver |
-| orchestrator-owned netns | a platform that creates the sandbox's network namespace runs the launcher attached to it, touching neither the image nor the OCI process spec |
-
-What changes: PID 1 stays the image's own; startup ordering must guarantee the launcher comes up before the agent's first connection (native sidecars provide exactly this); and the lifecycle decouples — a dead launcher leaves a running agent with *no network*, still fail-closed, so the platform has to supervise and restart it instead of relying on shared fate. On protection: a side process loses PID 1's signal shield only when it shares a PID namespace with the agent. In the arrangements above it runs in its own PID namespace, where the agent cannot see it at all, which is stronger, not weaker. The launcher's refuse-to-start interface check applies the same way in both modes.
-
-One precondition is easy to miss on Kubernetes: a standard pod's network namespace has a CNI-provided interface, which the launcher's interface check will (correctly) refuse. Sidecar mode therefore needs a pod that genuinely has no network — a runtime class or platform that provisions an interface-free pod netns. Where that isn't available, use entrypoint injection with the launcher's `--create-namespaces` flag, which builds a nested, interface-free namespace inside the container itself.
-
-Two properties hold in both modes:
-
-* **A missing or dead launcher leaves a sandbox with no network, not an open one.** No interface, no resolver, no route — and in entrypoint mode its exit ends the sandbox. It fails closed at every step.
-* **Bypassing the launcher gains nothing.** An agent that skips the tun entirely and speaks CONNECT directly to the boundary socket still reaches only what policy allows, because the decision is made on the host, not in the guest.
-
-### II. The Trust Convention (TLS Inspection) — opt-in coordination
-
-Most flows are byte pipes the boundary never inspects. For the specific domains where the host terminates TLS — credential injection, auditing, Data Loss Prevention — the host mounts a Root CA certificate into the sandbox:
-
-```bash
-AGENT_CA_CERT=/var/run/agent-ca.pem
+    Stack -- "Named HTTP CONNECT Tunnels" --> Channel
 ```
 
-This is a *convention*, and under the rule in the introduction that is acceptable: an agent that ignores it does not escape anything — its requests to inspected domains simply fail TLS verification, and the boundary's policy still holds. This is also where HTTP in-band signaling remains available: on inspected domains the boundary can still answer `403` with a block reason, `429`, or `X-Agent-Instruction` headers that agents naturally parse.
+---
 
-**Sandbox Implementation Requirement:** Because programming languages use different trust stores, the sandbox image build (or launcher environment) SHOULD map `AGENT_CA_CERT` to runtime-specific variables:
+## 2. Specification & Core Interfaces
 
-- `NODE_EXTRA_CA_CERTS=$AGENT_CA_CERT`
-- `REQUESTS_CA_BUNDLE=$AGENT_CA_CERT`
-- `SSL_CERT_FILE=$AGENT_CA_CERT`
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this document are to be interpreted as described in BCP 14 (RFC 2119, RFC 8174).
 
-### III. The Ingress Contract (Inbound Traffic)
+### 2.1 Egress Boundary Interface (Enforced)
 
-To allow isolated agents to receive Webhooks, OAuth callbacks, or direct user prompts without exposing open network ports, `agents.net` treats the host harness as an **Ingress API Gateway**.
+The Egress Boundary Interface defines how traffic leaves the sandbox:
 
-#### Application Contract (coordination)
-If an agent needs to receive inbound HTTP traffic, it MUST NOT attempt to bind to a public interface (`0.0.0.0`) — there is none to bind. It binds its local web server to the loopback interface on the port specified by the environment:
+1. **Named Tunnel Requests:** All outbound TCP connections originating within the sandbox MUST be delivered to the host boundary as HTTP `CONNECT` tunnel requests (RFC 9110 Section 9.3.6), where the request authority (`Host` / `:authority`) contains the target destination hostname and port (e.g. `CONNECT api.openai.com:443`).
+2. **Name Preservation:** The in-guest networking layer MUST preserve the destination domain name. The boundary proxy MUST receive the destination name directly, rather than an arbitrary pre-resolved IP address.
+3. **UDP Support via Extended CONNECT:** When UDP tunneling is supported, sessions MUST be encapsulated using extended CONNECT (`:protocol: connect-udp`, RFC 9298) with HTTP Datagram capsules (RFC 9297).
+4. **Point-to-Point Transport:** Communication between the sandbox and the host boundary MUST use a dedicated point-to-point stream channel, such as a bind-mounted Unix Domain Socket or a virtual socket (vsock).
+5. **Host-Side Enforcement:** The host boundary MUST evaluate destination names against authorization policy before dialing upstream.
+6. **Explicit Refusals:** When a destination is denied, the host boundary MUST return an explicit refusal (HTTP `403 Forbidden` with a `Boundary-Reason` header). The in-guest stack MUST surface this refusal to the agent application as an immediate connection failure (such as `ECONNREFUSED` or a TCP reset), avoiding silent hangs.
+7. **Fail-Closed by Design:** If the boundary proxy or point-to-point channel is unavailable, all sandbox network connections MUST fail immediately.
 
-```bash
-AGENT_INGRESS_PORT=8081
+### 2.2 Extensibility, Identity, and Mesh Pluggability
+
+HTTP `CONNECT` is a standard, extensible wire protocol that existing infrastructure already understands:
+
+- **Request Headers & Metadata:** The in-guest client MAY attach HTTP headers to tunnel requests for telemetry, trace propagation (e.g. W3C Trace Context), and sandbox identification (e.g. `Sandbox-Id`).
+- **Workload Identity via (m)TLS:** The boundary transport MAY be wrapped in TLS or mutual TLS (mTLS). In a service mesh environment, the sandbox presents a client certificate asserting a workload identity (such as a SPIFFE ID: `spiffe://cluster.local/ns/sandbox/sa/agent-123`). The host boundary audits and authenticates this identity directly from the transport session.
+- **Native Mesh Dataplane Support:** Because HTTP CONNECT and HTTP/2 CONNECT are standard proxy primitives, the boundary role can be fulfilled directly by an off-the-shelf [Envoy proxy](tun2connect/examples/envoy-boundary.yaml), an Istio ambient waypoint/sidecar (HBONE), or a standard Kubernetes API gateway.
+
+### 2.3 TLS Inspection & Verification Models
+
+The host boundary proxy can inspect and validate TLS traffic at different levels depending on security requirements:
+
+#### A. Passive TLS Handshake Peeking (No Decryption / Zero-CA)
+Without decrypting the payload or requiring CA certificates inside the guest, the boundary proxy can inspect the initial unencrypted TLS `ClientHello` frame (e.g. using Envoy's `tls_inspector` listener filter or standard socket buffer peeking):
+- **SNI Validation & Anti-Spoofing:** The boundary verifies that the Server Name Indication (SNI) matches the destination host declared in the HTTP `CONNECT` authority, preventing domain-fronting and SNI mismatch attacks.
+- **Protocol & Cipher Inspection:** Inspects ALPN protocol negotiation (e.g., verifying `h2` vs `http/1.1`) and client TLS fingerprints (JA3/JA4) for anomaly detection.
+- **Zero Guest Configuration:** Requires no CA installation or trust store modification inside the sandbox while preserving end-to-end encryption to the upstream destination.
+
+#### B. Full TLS Termination / Forward Proxy MITM (Layer 7 Inspection)
+When an operator requires Layer 7 visibility (e.g. for credential injection, compliance auditing, Data Loss Prevention, or structured agent instructions):
+
+1. **Root CA Mounting:** The host mounts a trusted Root CA certificate into the sandbox:
+   ```bash
+   AGENT_CA_CERT=/var/run/agent-ca.pem
+   ```
+2. **Trust Store Coordination:** The sandbox environment SHOULD map `AGENT_CA_CERT` to standard runtime environment variables:
+   - `REQUESTS_CA_BUNDLE=$AGENT_CA_CERT`
+   - `SSL_CERT_FILE=$AGENT_CA_CERT`
+   - `NODE_EXTRA_CA_CERTS=$AGENT_CA_CERT`
+3. **Capabilities Enabled:**
+   - **Host-Side Credential Injection:** The agent sends requests with empty or placeholder credentials; the host boundary intercepts the request, strips dummy tokens, and injects real provider API keys (`Authorization: Bearer <token>`) managed exclusively on the host.
+   - **Data Loss Prevention (DLP) & Auditing:** Real-time inspection and redaction of prompt payloads, tools, and response bodies.
+   - **In-Band Agent Signaling:** The boundary can return structured HTTP headers (e.g. `X-Agent-Instruction`, rate limit `Retry-After`, or descriptive `403 Forbidden` error bodies) that AI agents can parse and react to.
+4. **Coordination Semantics:** This is an opt-in coordination convention. If an application ignores `AGENT_CA_CERT`, its connections to TLS-inspected domains will fail TLS certificate validation, while uninspected domains and all boundary enforcement rules remain fully intact.
+
+### 2.4 Ingress Interface (Inbound Traffic)
+
+To allow an isolated sandbox to receive external webhooks, OAuth callbacks, or prompts without exposing host network ports:
+
+```mermaid
+flowchart LR
+    Caller["External Webhook / Caller"] -->|"POST :9000/webhook"| Gateway["Host Ingress Gateway\n(WAF, TLS, Auth)"]
+    Gateway -->|"CONNECT 8081\nover ingress-proxy.sock"| IngressSock["Sandbox Ingress Socket"]
+    IngressSock -->|"127.0.0.1:8081"| LocalServer["Agent Local Web Server"]
 ```
 
-When registering webhooks or providing callback URLs to third-party services, the agent MUST use the public URL provided by the host:
+1. **Host Ingress Gateway:** The host listens on an external port, terminates public TLS, enforces payload limits, and acts as a reverse proxy.
+2. **Reverse Stream Channel:** An ingress stream channel (`ingress-proxy.sock` or vsock port) is provided inside the sandbox. When an external request arrives, the host connects to this channel using a stream handshake (`CONNECT <port>\n` -> `OK\n` or standard HTTP CONNECT).
+3. **Loopback Forwarding:** The in-guest listener forwards the incoming stream to the agent's local web server listening on loopback (`127.0.0.1:$AGENT_INGRESS_PORT`).
+4. **Coordination Variables:** The agent specifies its listening port and public callback URL via environment variables:
+   ```bash
+   AGENT_INGRESS_PORT=8081
+   AGENT_PUBLIC_URL=https://agents.example.com/callbacks/agent-123
+   ```
 
-```bash
-AGENT_PUBLIC_URL=https://agents.yourdomain.com/callbacks/agent-123
-```
+---
 
-Both variables are coordination, not enforcement: an agent that ignores them is simply unreachable, which is fail-closed.
+## 3. Architecture Benefits
 
-#### Infrastructure Contract (enforced)
-The host cannot dial the sandbox: an isolated sandbox has no address to dial, and its `127.0.0.1` is not the host's. Ingress therefore uses the same mechanism as egress: a **second Unix socket**, served from *inside* the sandbox by the launcher. Network namespaces do not apply to it, because a socket is a filesystem object.
+| Benefit | Description |
+|---|---|
+| **Zero Host IPAM** | No IP address management, subnet allocations, veth pairing, or NAT tables required on the host. |
+| **Fail-Closed & Safe** | The sandbox has no external network interfaces. If the launcher or boundary stops, network access is completely severed. |
+| **Name-Preserving Policy** | Host boundaries make authorization decisions based on destination domain names rather than ephemeral IP addresses. |
+| **Tenant CPU Accounting** | Network packet processing and TCP/IP stack execution occur inside the guest, billing CPU time to the tenant sandbox instead of host system processes. |
+| **Standard Mesh Integration** | Compatible with standard cloud-native dataplanes (Envoy, Istio HBONE, forward proxies) without bespoke protocol adapters. |
+| **Extensible & Auditable** | Tunnels carry structured headers for audit trails, policy block reasons, and cryptographic workload identities (SPIFFE). |
 
-The handshake is intentionally the same one Firecracker and cloud-hypervisor hybrid-vsock already use — the host connects, writes `CONNECT <port>`, expects `OK`, then streams one inbound request per connection — so a microVM can offer the identical protocol over vsock with no code change. The launcher's accept loop forwards each stream to `127.0.0.1:$AGENT_INGRESS_PORT`.
+---
 
-The Host Harness MUST act as a Web Application Firewall (WAF) and Reverse Proxy: it owns the public IPs, terminates public TLS, absorbs internet attacks (DDoS, malformed payloads), strips malicious headers and enforces payload limits before anything reaches the ingress socket. The sandbox remains hermetically sealed.
+## 4. Security Model & Trust Boundaries
 
-## The Wire: HTTP CONNECT and tun2connect
+The security of this design comes from how the sandbox is built, not from filtering rules. That has a few consequences worth spelling out.
 
-The Boundary Contract needs exactly one thing from its wire: that every flow crosses as a *named tunnel request*. This spec standardizes that wire as **HTTP CONNECT**, because it is the tunnel primitive the entire cloud native ecosystem converged on: Envoy terminates it natively, Istio's ambient dataplane (HBONE) *is* HTTP/2 CONNECT over mTLS, gateways in the [kgateway](https://kgateway.dev) mold program the same semantics, and the IETF standardized UDP tunneling over it (MASQUE: `connect-udp`, RFC 9298, with HTTP Datagrams, RFC 9297). Standardizing on CONNECT does something no bespoke encoding could: **it makes any agentic workload pluggable into existing mesh and proxy infrastructure with zero adaptation layers.** The boundary stops being a custom component and becomes a role an off-the-shelf dataplane can fill.
+### 4.1 There Are No Firewall Rules to Get Wrong
 
-The first implementation used SOCKS5, inherited from the launcher's embedded userspace stack ([tun2socks](https://github.com/xjasonlyu/tun2socks)). It is retired from the spec, kept only as a transitional compatibility note: SOCKS5 has no extension mechanism, no identity, no multiplexing, a one-opaque-byte refusal, a dead-end UDP story -- and, decisively, it is not what the rest of the infrastructure world speaks. What CONNECT provides that it could not:
+Traditional setups enforce network policy through kernel configuration: iptables/nftables rule sets, routing tables, or attached eBPF programs. Every rule is something that can be missing, wrong, or changed at runtime — and a mistake usually means an open network path, not a broken one.
 
-| | SOCKS5 (legacy, retired) | HTTP CONNECT (the wire) |
+In `agents.net` the sandbox simply has no network to begin with. Isolation comes from how the sandbox is created (an empty network namespace, or a microVM without a NIC), so:
+
+- There are no firewall rules, routes, or NAT entries to misconfigure. There is no network to filter.
+- Changing network settings inside the guest — routes, DNS, the tun device — can only break connectivity. It can never open a new path, because the only way out is the boundary socket, and the policy check happens on the other side of it.
+- Everything runs in ordinary userspace processes. Enforcement needs no kernel modules, no `CAP_BPF`, and no `CAP_NET_ADMIN` on the host.
+
+### 4.2 The In-Guest Proxy Is Not Trusted
+
+The launcher, the TUN device, and the virtual DNS exist for compatibility: they give unmodified applications a working socket API. They are not what enforces policy, and nothing depends on trusting them:
+
+- **If the agent kills the launcher**, the sandbox loses its network. It fails closed, never open.
+- **Taking over the TUN gains nothing.** A `tun` interface is just a file descriptor owned by the process that opened it — there is no host dataplane behind it. When the launcher dies, the interface disappears with it, and an agent that opens its own TUN only receives its own packets back.
+- **Bypassing the launcher gains nothing either.** An agent is free to speak HTTP `CONNECT` directly on the boundary socket; it will still only reach what host policy allows.
+- **A fully compromised guest stack** can, at worst, open tunnels to destinations that are already on the allowlist. It can pick among the permitted names; it cannot add new ones. SNI cross-checking (Section 2.3.A) also makes it hard to lie about the name on TLS flows.
+
+#### How is this different from a transparent redirect (TPROXY)?
+
+A reasonable objection: in a transparent-redirect design (guest NAT rules → local forwarder → vsock), the agent can also kill the in-guest pieces — so aren't the risks the same? For guest compromise, yes. Neither design trusts the in-guest process, and as long as the redirect has nothing but a vsock behind it, both fail closed. (With a routed NIC behind the rules it's a different story: tampering with the rules gives direct network access, which is fail-open.)
+
+The real difference is what the policy gets to see:
+
+- With CONNECT, there is no way to express a flow without a name. Whether the request comes from the real launcher or from the agent imitating it, the boundary receives `CONNECT name:port` and rejects IP literals. The name-based policy input is guaranteed by the protocol itself, not by trusting the guest.
+- With a transparent redirect, the wire carries an IP and port (`SO_ORIGINAL_DST`). Names have to be recovered from SNI or Host headers, or from a DoH resolver the operator also has to run — and flows that are neither TLS nor HTTP have no name at all. A compromised agent can dial raw IPs and force the policy to reason about IP reputation instead.
+
+There are smaller practical differences too: no netfilter rules or iptables tooling in the guest image, `CAP_NET_ADMIN` can be dropped once the TUN exists, and the same dataplane works in containers, microVMs, and gVisor (whose guest sockets are invisible to host eBPF/TPROXY hooks).
+
+### 4.3 What Actually Has to Be Trusted
+
+That leaves two components that security really depends on:
+
+1. **The isolation primitive** — the network namespace or hypervisor boundary that guarantees there is no other way out. This is a mature, heavily audited kernel mechanism, the same one every container and VM already relies on.
+2. **The host boundary proxy** — the single place where policy is enforced. Its integrity is the critical dependency, and the design keeps it easy to defend:
+   - It runs as a normal unprivileged process — no root, no `CAP_NET_ADMIN`. Both reference boundaries ([connect-proxy](tun2connect/cmd/connect-proxy/main.go) and [host_proxy.py](demo/host_proxy.py)) run as a regular user.
+   - It can be small enough to audit by hand (the demo boundary is one Python file using only the standard library), or it can be a hardened, widely deployed dataplane like Envoy instead of custom code.
+   - The file permissions on the boundary socket are part of the trust boundary: they decide which processes can connect at all.
+
+### 4.4 Attesting the Guest
+
+Since the guest stack is untrusted, a compromised or imitated launcher doesn't get extra reach. What it does threaten is **identity and audit quality**: if the agent can read the mTLS key, it can present the workload identity itself, and headers like `Sandbox-Id` can be forged. The honest way to state the guarantee is: **a workload identity vouches for the sandbox as a whole, not for the code inside it — unless the key is tied to a measured launch.** Depending on how strong a guarantee a deployment needs, there are well-known techniques at increasing cost, and none of them require changing the wire (certificates are opaque to the protocol):
+
+| Level | Technique | What it buys you |
 |---|---|---|
-| TCP flow | `CONNECT` + `ATYP=0x03` | `CONNECT name:port` (name is the authority, natively) |
-| UDP session | denied, no path | extended CONNECT, `:protocol: connect-udp` (RFC 9298), datagrams in capsules (RFC 9297) |
-| Refusal | one opaque byte (`0x02`) | `403` + `Boundary-Reason` header -- structured, in-band |
-| Extension point | none | headers (identity, tracing, block reasons) |
-| Multiplexing | one connection per flow | one HTTP/2 session for the whole sandbox, one stream per flow |
-| Identity | none | (m)TLS under the session; the client certificate is the workload identity |
-| Mesh interop | adapter required | native -- HBONE is this wire plus mesh mTLS |
+| 0 | **Boundary-side checks** (SNI vs CONNECT authority, ALPN conformance, JA3/JA4 fingerprints) | Catches a guest lying about names on TLS flows. Needs no trust in the guest at all. |
+| 1 | **Privilege separation inside the guest** (different UIDs for launcher and agent, non-root agent with `no_new_privs`/seccomp, separate PID namespaces) | The agent can't read the launcher's key or ptrace it. It can still send traffic *through* the sandbox identity, but it can't steal the key. |
+| 2 | **Workload attestation** (SPIFFE/SPIRE with binary-hash selectors) | The identity is only issued to a process whose binary hash matches the real launcher, so an imitation never gets credentials. |
+| 3 | **Measured boot + read-only rootfs** (vTPM quotes, `dm-verity`, IMA/Keylime; microVMs) | The launcher that booted is provably the expected binary and can't be swapped afterwards. |
+| 4 | **Confidential computing / attested TLS** (AMD SEV-SNP, Intel TDX via cloud-hypervisor/QEMU/Kata) | The hardware signs the launch measurement and ties it to the TLS key, so the boundary knows it is talking to the measured stack before accepting the session. |
 
-### The reference implementation: [tun2connect/](tun2connect/)
+### 4.5 Residual Risks
 
-[tun2connect](tun2connect/) is a standalone Go module (`github.com/aojea/agents.net/tun2connect`), the reference implementation of the wire. It terminates the sandbox's TCP/IP in userspace (gVisor) and emits one CONNECT per flow, staged so a deployment adopts exactly as much as it needs:
+Putting all enforcement in one place is a strength — there is one component to verify — but also a concentration of risk: whoever compromises the boundary process controls policy and any credentials it injects. Deployments SHOULD use narrowly scoped per-sandbox tokens, run separate boundary instances per tenant where isolation demands it, and keep in mind that allowlisted destinations remain a data-exfiltration path: the mechanism controls *where* an agent can talk, but only good policy limits what that is worth.
 
-1. **HTTP/1.1 CONNECT** -- one boundary connection per flow; a text handshake auditable by eye; curl-compatible.
-2. **HTTP/2 CONNECT** -- ONE multiplexed session for the whole sandbox (one Unix socket, one vsock, one fd); each TCP flow a CONNECT stream, each UDP session an extended CONNECT stream carrying capsules.
-3. **(m)TLS under the session** -- the workload presents a client certificate; the boundary requires and verifies it. With mesh-issued certificates this is HBONE; with any other PKI it is the same wire under a different trust domain.
+---
 
-The module is three composable pieces, each usable alone, and every seam is an interface so implementations are pluggable:
+## 5. Implementation Patterns
 
-- **`Engine`** -- the TUN-to-tunnel datapath (gVisor forwarders, per-flow dial, byte relay). Takes any `Dialer`.
-- **`Dialer`** -- `DialTCP(ctx, name, port)` / `DialUDP(ctx, name, port)`: the boundary contract as a Go interface. Ships `BoundaryClient` (h1) and `BoundaryClientH2` (h2 + optional TLS); a deployment can implement it against anything that terminates CONNECT.
-- **`VirtualDNS`** -- the name-preservation contract: `Resolve` invents one stable synthetic address per name (IPv4 from CGNAT `100.64.0.0/10`; IPv6 from `100::/64`, the RFC 6666 discard-only prefix, so a flow that ever escapes through a misconfigured interface is blackholed at the first conforming router); `Reverse` recovers the name at dial time. **A reverse miss is a policy event**: an address the guest never resolved has no name, and a flow without a name is refused before the boundary is ever dialed. Port 53 is always answered locally -- whatever address the guest sends it to -- and never tunneled, so a hardcoded `8.8.8.8` gets the virtual answer instead of a leak.
+While the specification defines the boundary protocol and contracts, implementations can adopt different in-guest architectures depending on the virtualization technology:
 
-The virtual DNS is what keeps every stage of the wire name-preserving: the name is recovered *before* the transport is chosen, so h1 CONNECT and multiplexed h2 CONNECT carry it identically -- and policy never sees anything else.
+### 5.1 In-Guest Networking with TUN and Virtual DNS
+A common and portable implementation pattern uses a userspace TCP/IP stack (such as gVisor `netstack` or `tun2socks`) attached to a virtual `tun` device:
 
-### Mesh integration, validated
+1. **TUN Interface:** A `tun` interface (e.g. `tun0`) is created inside the sandbox and configured as the default gateway.
+2. **Virtual DNS (Name Preservation):** The in-guest stack intercepts local DNS queries on port 53. Instead of resolving them over the network, it returns a synthetic IP address allocated from a private pool (e.g., IPv4 `100.64.0.0/10` and IPv6 `100::/64`).
+3. **Dial-Time Reverse Lookup:** When the agent initiates a connection to a synthetic IP, the userspace stack resolves the IP back to the original domain name, opens the boundary stream, and sends an HTTP `CONNECT` request with the destination name. Any connection to an unrecognized synthetic IP is rejected before dialing the boundary.
 
-The pluggability claim is tested against a real dataplane, not argued: an **unmodified Envoy** ([tun2connect/examples/envoy-boundary.yaml](tun2connect/examples/envoy-boundary.yaml)) terminates both stages of the wire from the same engine -- h1 CONNECT and h2 prior-knowledge CONNECT -- resolving destination names with its dynamic forward proxy. Envoy is the engine inside Istio sidecars and waypoints and under kgateway, so "the boundary can be a mesh dataplane" is demonstrated, not extrapolated. The reference boundary ([tun2connect/cmd/connect-proxy](tun2connect/cmd/connect-proxy/main.go)) and Envoy are interchangeable behind the same `Dialer`.
+### 5.2 Process Supervision & Lifecycle Models
 
-**Identity (and where SPIFFE fits).** On the mTLS tier the workload's identity is its client certificate. Service meshes assert identity as a [SPIFFE](https://spiffe.io) ID -- a URI SAN like `spiffe://cluster.local/ns/sandbox/sa/agent-123`, issued per-workload by the mesh CA -- and a boundary joined to a mesh authenticates sandboxes exactly that way. The spec and the library are deliberately **PKI-agnostic**: tun2connect carries a `*tls.Config` and never parses what the certificates assert; the reference boundary audits the peer's first URI SAN (else DNS SAN, else CN) whatever its scheme. SPIFFE is one deployment's identity convention -- the important property is that identity rides the session's certificates, not the protocol, so rotating PKIs never touches the wire.
+The supervision model for the in-guest networking process depends on the host virtualization environment. Running as **PID 1 is recommended where applicable, but not required**:
 
-### Ingress on the same wire
+- **Container Entrypoint Injection (Recommended for Containers):** The launcher binary (e.g. `nano-init`) is bind-mounted into the container and set as `--entrypoint`. It executes as PID 1, initializes the `tun` device, runs the agent process as a child, reaps orphans, forwards signals, and exits with the agent's return code. This provides tight lifecycle coupling: if the launcher dies, the sandbox terminates.
+- **Sidecar Process / Shared Network Namespace:** In environments where the container entrypoint must remain untouched (or in Kubernetes pods), the launcher can run as a sidecar process sharing the sandbox network namespace. If the sidecar terminates, the agent simply loses network access (failing closed).
+- **MicroVM Guest Init / System Daemon (MicroVMs):** In microVMs (Firecracker, Cloud-Hypervisor), the networking daemon (e.g. `tun2connect`) runs as a standard guest init process (`/sbin/init`) or system service communicating over a vsock channel to the host.
 
-The ingress handshake (`CONNECT <port>` / `OK`) was already CONNECT-shaped by design, for Firecracker hybrid-vsock compatibility. On the standard wire it becomes literal HTTP CONNECT, making the boundary one protocol in both directions.
+---
 
-## Reference Implementation: The Zero-Network Sandbox
+## 6. Decision Matrix: Architectural Comparison
+
+The table below summarizes the trade-offs between `agents.net` and other sandboxing approaches:
+
+| Dimension | 1. Routed NIC + Firewall<br/>(veth/tap + nftables/eBPF) | 2. Proxy Environment Variables<br/>(`HTTP_PROXY` + CA vars) | 3. Host-Side Userspace Stack<br/>([gvisor-tap-vsock](https://github.com/containers/gvisor-tap-vsock)) | 4. Guest Userspace Stack<br/>(tun → HTTP CONNECT, **agents.net**) | 5. Socket-Layer eBPF<br/>(cgroup connect hooks / sockmap) | 6. In-Guest Redirect over vsock<br/>(NAT → forwarder → vsock) |
+|---|---|---|---|---|---|---|
+| **Enforcement** | Filter over a working network | Voluntary client cooperation | Host processes all guest frames | Sandbox has no network interface except tun | Shared host kernel only | vsock is only route; guest rules handle routing |
+| **Failure Mode** | Fail-open (missing rule leaves network open) | Fail-open (client ignores env) | Fail-closed | Fail-closed (launcher exit terminates sandbox) | Fail-closed if default-deny; probes can detach | Fail-closed (tampered guest rules break routing) |
+| **Policy Visibility** | Destination IP and port | Full URL (HTTP/HTTPS only) | Raw packets; names require full guest DNS proxy | **Destination hostname for every flow** | IP:port at socket `connect()` | IP:port via `SO_ORIGINAL_DST`; names inferred from SNI/Host |
+| **Guest Requirements** | None | Runtime-specific env variables | None (guest sees standard NIC) | In-guest stack (tun + userspace dialer) | None | Guest NAT rules + forwarder + local DNS resolver |
+| **Host Overhead** | netns, veth pairs, IPAM, routing rules, `CAP_NET_ADMIN` | None | Full TCP/IP stack + NAT/DHCP/DNS in host process | One proxy listener per boundary socket | eBPF program management, `CAP_BPF` / `CAP_SYS_ADMIN` | Per-sandbox proxy listener + configuration daemon |
+| **CPU Accounting** | Host kernel | N/A | Billed to host process | **Billed to sandbox cgroup / VM** | Host kernel | Sandbox (guest kernel) |
+| **VM / Container Portability** | Different implementations | Consistent where supported | VM-focused | Identical byte stream (Unix socket ↔ vsock) | Container only (cannot cross VM boundary) | MicroVM-focused |
+| **Protocol Support** | All | HTTP(S) only | All | TCP & UDP (via `connect-udp`) | TCP & UDP | TCP only |
+
+---
+
+## 7. Reference Implementations
+
+This repository provides two reference implementations demonstrating the specification:
+
+### 7.1 Standard Wire Implementation: [tun2connect/](tun2connect/)
+A modular Go implementation (`github.com/aojea/agents.net/tun2connect`) of the HTTP CONNECT boundary wire:
+
+- [tun2connect/pkg/tun2connect/engine.go](tun2connect/pkg/tun2connect/engine.go) — Userspace gVisor netstack engine connecting TUN devices to HTTP CONNECT dialers.
+- [tun2connect/pkg/tun2connect/dns.go](tun2connect/pkg/tun2connect/dns.go) — Virtual DNS implementation with synthetic IP allocation and dial-time name reversal.
+- [tun2connect/pkg/tun2connect/dialer.go](tun2connect/pkg/tun2connect/dialer.go) — `Dialer` interface supporting HTTP/1.1 (`BoundaryClient`) and HTTP/2 (`BoundaryClientH2`).
+- [tun2connect/cmd/connect-proxy/main.go](tun2connect/cmd/connect-proxy/main.go) — Reference host boundary proxy with domain allowlisting, HTTP/1.1 and multiplexed HTTP/2 support, UDP capsule tunneling, and mTLS client certificate verification.
+- [tun2connect/cmd/tun2connect/main.go](tun2connect/cmd/tun2connect/main.go) — Standalone in-guest daemon establishing tunnels over a boundary socket.
+- [tun2connect/examples/envoy-boundary.yaml](tun2connect/examples/envoy-boundary.yaml) — Production Envoy configuration terminating both HTTP/1.1 and HTTP/2 CONNECT tunnels natively.
+- [tun2connect/test_envoy.sh](tun2connect/test_envoy.sh) — Test script validating end-to-end Envoy interoperability.
+
+### 7.2 Zero-Network Sandbox Demo: [demo/](demo/)
+A hands-on, runnable demonstration of a zero-network autonomous ReAct agent running inside Docker:
 
 ![agents.net terminal demo](demo/terminal-demo.gif)
 
-This demo proves that a real, unmodified, off-the-shelf agent harness running inside a container with **`--network none`** (no `eth0`, no routing, no DNS) can reach the outside world purely through the `agents.net` boundary -- no custom transport code, no vendor-specific patch, and **no proxy environment variables**. The only additions to the container are the launcher as its entrypoint and the two flags the tun device needs (`--device /dev/net/tun --cap-add NET_ADMIN`); the harness itself is untouched.
+- [demo/README.md](demo/README.md) — Step-by-step tutorial for building and running the sandbox.
+- [demo/host_proxy.py](demo/host_proxy.py) — Python host boundary implementing a 4-tier allowlist (fake responses, local Ollama relay, cloud credential injection, and uninspected passthrough).
+- [demo/agent.py](demo/agent.py) — Sample ReAct agent demonstrating autonomous reasoning, tool execution, and handling connection refusals.
+- [demo/gen_certs.sh](demo/gen_certs.sh) — Script to generate demo root CA and multi-SAN leaf certificates.
+- [demo/Dockerfile](demo/Dockerfile) — Standard Debian-based container image definition for the agent.
+- [demo/test_demo.sh](demo/test_demo.sh) — Presubmit script verifying fail-closed isolation, TLS fake responses, and ingress webhooks.
 
-The pattern is intentionally harness-agnostic: this spec doesn't care whether the agent is a Python script, a Node process, or a packaged CLI from any vendor. The only requirement is that the harness runs non-interactively and reads its credentials from its own environment rather than requiring an interactive sign-in -- an interactive OAuth/browser flow simply can't complete inside a disposable `--network none --rm` container with no human attached. [demo/](demo/) wires up one concrete, real, off-the-shelf CLI harness end-to-end as a worked example; swap in any other harness that meets that one requirement and the same contracts and boundary apply unchanged.
 
-**The boundary enforces a real, four-tier ACL, not just relaying.** To make the "deny-by-default on names" claim concrete rather than theoretical, the host boundary allow-lists exactly four kinds of destination. Everything else the agent tries is refused at the boundary handshake *and logged* for auditing -- the agent sees an ordinary connection error instead of a silent hang, and on the TLS-inspected tiers the boundary can additionally answer in-band HTTP (`403` with a block reason) that agents naturally parse.
-
-1. **Fake-response hosts** (the demo's task target, `example.com`): never forwarded anywhere. The boundary terminates TLS locally with a certificate signed by a demo CA and returns a canned success response, proving the Boundary and Trust contracts together (the response is only trusted because `AGENT_CA_CERT` was mounted and wired into the runtime's trust store).
-2. **Local-provider hosts** (a model server on the operator's own machine, e.g. a local Ollama instance -- the demo's default, requiring no account or paid API key): the sandbox only ever knows a symbolic hostname -- one it could never resolve on its own, since the launcher's virtual DNS invents the answer -- and the boundary alone maps it to a real `host:port`. Genuinely relayed, no TLS termination, no secret involved -- the same principle as credential-inject below, minus the credential.
-3. **Credential-inject hosts**, opt-in (a real hosted model API or other bearer-token backend, for anyone migrating off the local provider): genuinely relayed to the real internet, with the boundary swapping in the real credential -- see [demo/README.md](demo/README.md) for the full mechanism. The sandbox never holds the real secret.
-4. **Passthrough hosts** (housekeeping the harness does on its own -- package installs, update checks, telemetry -- that carry no secret and need no canned response): genuinely relayed byte-for-byte, with no TLS termination at all.
-
-**Follow [demo/README.md](demo/README.md) for the full, step-by-step, hands-on walkthrough** -- generating the demo CA, starting the host boundary, building the sandbox image around the launcher, running it with `--network none`, and reading the resulting audit trail line by line, including how credential injection is proven and how to troubleshoot common failures.
-
-The full reference implementation lives in [demo/](demo/):
-
-- [demo/README.md](demo/README.md) — step-by-step tutorial for building and running the zero-network sandbox.
-- [demo/gen_certs.sh](demo/gen_certs.sh) — generates the demo root CA and a single multi-SAN leaf certificate covering every TLS-inspected host.
-- [demo/host_proxy.py](demo/host_proxy.py) — the host-side boundary of the walkthrough, speaking the legacy SOCKS5 encoding the current launcher ships (RFC 1928, `CONNECT` only, `NO AUTH`) on the boundary socket. It enforces the four-tier allow-list on destination *names*, logs every flow (relayed, injected, answered, or refused) for auditing, answers fake-response hosts itself, relays to local providers, injects real credentials for credential-inject hosts, and dials the sandbox's ingress socket for inbound traffic. It is deliberately independent of any production implementation: this file and the launcher binary interoperate only through the boundary protocol. Two unrelated implementations working together is what the spec exists to make possible.
-- [demo/Dockerfile](demo/Dockerfile) — builds the sandbox image: copies the prebuilt [`nano-init`](https://github.com/google/sam/tree/main/cmd/nano-init) launcher out of its upstream image and wires one specific off-the-shelf CLI harness, unmodified, as the launched command; swap in any other harness by editing this one file.
-
-The standard-wire reference implementation lives in [tun2connect/](tun2connect/):
-
-- [tun2connect/pkg/tun2connect](tun2connect/pkg/tun2connect/doc.go) — the Go library: `Engine` (gVisor datapath), `VirtualDNS` (name preservation), `BoundaryClient`/`BoundaryClientH2` (h1/h2 CONNECT dialers, optional mTLS), and the exported RFC 9297 capsule codec so boundary servers reuse it.
-- [tun2connect/cmd/tun2connect](tun2connect/cmd/tun2connect/main.go) — the guest-side daemon: opens a TUN, runs the engine against any CONNECT boundary.
-- [tun2connect/cmd/connect-proxy](tun2connect/cmd/connect-proxy/main.go) — the reference boundary: deny-by-default on names, one audit line per decision, `-h2` for the multiplexed session, `-tls-client-ca` for mTLS with peer identity auditing. Curl-testable without root.
-- [tun2connect/examples/envoy-boundary.yaml](tun2connect/examples/envoy-boundary.yaml) — an unmodified Envoy filling the boundary role at both wire stages: the mesh-integration proof.
