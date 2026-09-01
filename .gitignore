@@ -222,3 +222,5 @@ demo/certs/
 
 # Demo -- the launcher binary is built from tun2connect (Lab 3), not committed.
 demo/tun2connect
+# Its pre-rename name; stale copies may still exist in working trees.
+demo/nano-init

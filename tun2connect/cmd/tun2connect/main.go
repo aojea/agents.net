@@ -109,19 +109,23 @@ func main() {
 	}
 
 	log.Printf("engine up: device=%s proxy=%s udp=%v", *device, *proxy, *udp)
-	fmt.Printf(`route the synthetic pools and a resolver address through the device:
+	fmt.Printf(`route the synthetic pools through the device:
 
   sudo ip link set %[1]s up
   sudo ip addr add 10.255.255.2/32 dev %[1]s
   sudo ip route add 100.64.0.0/10 dev %[1]s src 10.255.255.2
-  sudo ip route add 169.254.169.253/32 dev %[1]s src 10.255.255.2
   sudo ip -6 route add 100::/64 dev %[1]s
 
-then point DNS at the virtual resolver (any address routed above works):
+then point DNS at the virtual resolver (any pool address works: the
+engine answers port 53 wherever the query is sent):
 
-  echo "nameserver 169.254.169.253" | sudo tee /etc/resolv.conf
+  echo "nameserver %[2]s" | sudo tee /etc/resolv.conf
 
-`, *device)
+No default route here: this mode runs on a normal host that still needs
+its own network. Only the sandbox launcher (run mode) makes the device
+the only way out.
+
+`, *device, resolverAddr)
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)

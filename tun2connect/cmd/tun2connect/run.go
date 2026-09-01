@@ -12,14 +12,13 @@ import (
 	"io"
 	"log"
 	"net"
-	"net/netip"
 	"os"
 	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
-	"unsafe"
 
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
 	"github.com/aojea/agents.net/tun2connect/pkg/tun2connect"
@@ -30,7 +29,8 @@ import (
 // invented answer. The /10 and /64 prefix lengths make the kernel install
 // the connected routes that cover every synthetic address, and the
 // resolver needs no route of its own -- any pool address works, because
-// the engine answers port 53 locally wherever the query is sent.
+// the engine answers port 53 locally wherever the query is sent. The
+// device is also made the default route; see configureTUN for why.
 const (
 	guestAddr4     = "100.127.255.254"
 	pool4PrefixLen = 10
@@ -129,73 +129,50 @@ func runLauncher(args []string) {
 	os.Exit(runChild(argv))
 }
 
-// configureTUN assigns the guest addresses and brings the link up. The
-// prefix lengths give the kernel connected routes over both synthetic
-// pools, so no explicit route entries are needed.
+// configureTUN gives the device the guest addresses, brings it up, and
+// installs default routes through it.
+//
+// The /10 and /64 prefixes already give the kernel connected routes that
+// cover the synthetic pools, so normal traffic does not need the default
+// routes. They exist so that everything else also reaches the engine: an
+// agent that hardcodes its own DNS server (say 8.8.8.8) still gets an
+// answer, because the engine serves port 53 on any address routed to it,
+// and a dial to an unrelated literal IP fails with a clear refusal from
+// the engine instead of a routing error.
 func configureTUN(name string) error {
-	sock, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	link, err := netlink.LinkByName(name)
 	if err != nil {
 		return err
 	}
-	defer unix.Close(sock)
-
-	ifr, err := unix.NewIfreq(name)
-	if err != nil {
-		return err
+	for _, cidr := range []string{
+		fmt.Sprintf("%s/%d", guestAddr4, pool4PrefixLen),
+		fmt.Sprintf("%s/%d", guestAddr6, pool6PrefixLen),
+	} {
+		addr, err := netlink.ParseAddr(cidr)
+		if err != nil {
+			return err
+		}
+		if err := netlink.AddrAdd(link, addr); err != nil {
+			return fmt.Errorf("address %s: %w", cidr, err)
+		}
 	}
-	if err := ifr.SetInet4Addr(netip.MustParseAddr(guestAddr4).AsSlice()); err != nil {
-		return err
-	}
-	if err := unix.IoctlIfreq(sock, unix.SIOCSIFADDR, ifr); err != nil {
-		return fmt.Errorf("set address: %w", err)
-	}
-	if err := ifr.SetInet4Addr(net.CIDRMask(pool4PrefixLen, 32)); err != nil {
-		return err
-	}
-	if err := unix.IoctlIfreq(sock, unix.SIOCSIFNETMASK, ifr); err != nil {
-		return fmt.Errorf("set netmask: %w", err)
-	}
-	if err := unix.IoctlIfreq(sock, unix.SIOCGIFFLAGS, ifr); err != nil {
-		return err
-	}
-	ifr.SetUint16(ifr.Uint16() | unix.IFF_UP | unix.IFF_RUNNING)
-	if err := unix.IoctlIfreq(sock, unix.SIOCSIFFLAGS, ifr); err != nil {
+	if err := netlink.LinkSetUp(link); err != nil {
 		return fmt.Errorf("link up: %w", err)
 	}
-	if err := configureTUN6(name); err != nil {
-		log.Printf("[!] IPv6 pool not routed (%v); AAAA connections fail fast and fall back to IPv4", err)
-	}
-	return nil
-}
-
-// in6Ifreq mirrors the kernel's struct in6_ifreq, which SIOCSIFADDR
-// expects on an AF_INET6 socket.
-type in6Ifreq struct {
-	addr      [16]byte
-	prefixLen uint32
-	ifindex   int32
-}
-
-func configureTUN6(name string) error {
-	sock, err := unix.Socket(unix.AF_INET6, unix.SOCK_DGRAM, 0)
-	if err != nil {
-		return err
-	}
-	defer unix.Close(sock)
-	ifr, err := unix.NewIfreq(name)
-	if err != nil {
-		return err
-	}
-	if err := unix.IoctlIfreq(sock, unix.SIOCGIFINDEX, ifr); err != nil {
-		return err
-	}
-	req := in6Ifreq{
-		addr:      netip.MustParseAddr(guestAddr6).As16(),
-		prefixLen: pool6PrefixLen,
-		ifindex:   int32(ifr.Uint32()),
-	}
-	if _, _, errno := unix.Syscall(unix.SYS_IOCTL, uintptr(sock), unix.SIOCSIFADDR, uintptr(unsafe.Pointer(&req))); errno != 0 {
-		return errno
+	// Device routes with no gateway: there is nothing to name on the other
+	// side of the tun. Dst must be set explicitly because netlink treats a
+	// nil Dst as "no route given".
+	for _, dst := range []*net.IPNet{
+		{IP: net.IPv4zero, Mask: net.CIDRMask(0, 32)},
+		{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
+	} {
+		if err := netlink.RouteAdd(&netlink.Route{
+			LinkIndex: link.Attrs().Index,
+			Scope:     netlink.SCOPE_LINK,
+			Dst:       dst,
+		}); err != nil {
+			return fmt.Errorf("default route for %s: %w", dst, err)
+		}
 	}
 	return nil
 }

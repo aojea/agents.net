@@ -3,8 +3,17 @@ name: Demo CI
 on:
   push:
     branches: [ main ]
+    paths:
+      - 'demo/**'
+      # The demo injects the launcher built from these sources.
+      - 'tun2connect/**'
+      - '.github/workflows/demo.yml'
   pull_request:
     branches: [ main ]
+    paths:
+      - 'demo/**'
+      - 'tun2connect/**'
+      - '.github/workflows/demo.yml'
 
 jobs:
   test-demo:
@@ -19,6 +28,14 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
+      # Pinned from the module's go.mod so the launcher the demo injects is
+      # built with the toolchain the module declares, deterministically.
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tun2connect/go.mod
+          cache-dependency-path: tun2connect/go.sum
 
       - name: Run Demo Presubmit Test
         run: |

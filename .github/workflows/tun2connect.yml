@@ -1,0 +1,63 @@
+name: tun2connect CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'tun2connect/v*' ]
+    paths:
+      - 'tun2connect/**'
+      - '.github/workflows/tun2connect.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'tun2connect/**'
+      - '.github/workflows/tun2connect.yml'
+
+defaults:
+  run:
+    working-directory: tun2connect
+
+jobs:
+  go-test:
+    name: Build, vet & test (race)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tun2connect/go.mod
+          cache-dependency-path: tun2connect/go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      # The Envoy interop test skips itself here (no ENVOY_CONNECT_* set);
+      # the envoy-interop job below is where it runs for real.
+      - name: Test
+        run: go test -race -count=1 ./...
+
+  envoy-interop:
+    name: Envoy boundary e2e
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tun2connect/go.mod
+          cache-dependency-path: tun2connect/go.sum
+
+      # The full presubmit: the Go suite again, then an unmodified Envoy
+      # terminating CONNECT (HTTP/1.1) and multiplexed CONNECT (h2) for the
+      # library's own dialers, asserted from Envoy's own stats. Needs docker
+      # and real egress (example.com), both of which the runner has.
+      - name: Run Envoy interop presubmit
+        run: ./test_envoy.sh
