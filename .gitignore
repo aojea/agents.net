@@ -224,3 +224,7 @@ demo/certs/
 demo/tun2connect
 # Its pre-rename name; stale copies may still exist in working trees.
 demo/nano-init
+
+# Scenarios -- compiled helper binaries
+scenarios/bin/
+

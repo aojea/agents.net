@@ -259,4 +259,14 @@ A hands-on, runnable demonstration of a zero-network autonomous ReAct agent runn
 - [demo/Dockerfile](demo/Dockerfile) — Standard Debian-based container image definition for the agent.
 - [demo/test_demo.sh](demo/test_demo.sh) — Presubmit script verifying fail-closed isolation, TLS fake responses, and ingress webhooks.
 
+---
+
+## 8. Capsule Scenarios & Empirical Benchmarks
+
+Comprehensive benchmarks across isolation technologies and interception horizons (In-Capsule, Boundary, Out-of-Capsule, and MicroVM VSOCK):
+
+- [scenarios/data/results.md](scenarios/data/results.md) — 500-sample percentile benchmark results ($p_{50}$, $p_{90}$, $p_{95}$, $p_{99}$), cross-round statistical stability ($CV < 5\%$), and throughput measurements.
+- [scenarios/README.md](scenarios/README.md) — Scenario testbeds, architecture analysis, and instructions for reproducing all benchmarks and LPE security tests.
+
+
 
