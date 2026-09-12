@@ -5,7 +5,6 @@ This directory contains executable testbeds, network topologies, and reproducibl
 Every scenario executes **real `curl` commands** measuring the complete protocol lifecycle—**DNS lookup, TCP 3-way handshake, TLS 1.3 handshake, and HTTP payload transfer**—against a hermetic, local HTTPS target (`https://test.example.com:9443/ping`). This **eliminates external WAN transit jitter (0ms internet latency)** and isolates the pure architectural cost of the sandboxing primitive.
 
 - **Detailed Empirical Benchmark Data:** [data/results.md](data/results.md)
-- **Architectural RFC & Specification:** [RFC-CAPSULES.md](RFC-CAPSULES.md)
 
 ---
 
