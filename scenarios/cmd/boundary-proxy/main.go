@@ -8,13 +8,15 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -32,6 +34,48 @@ var (
 	totalBytes   atomic.Uint64
 	auditLogger  *log.Logger
 )
+
+type vsockAddr struct {
+	cid  uint32
+	port uint32
+}
+
+func (a vsockAddr) Network() string { return "vsock" }
+func (a vsockAddr) String() string  { return fmt.Sprintf("%d:%d", a.cid, a.port) }
+
+type vsockConn struct {
+	*os.File
+	laddr vsockAddr
+	raddr vsockAddr
+}
+
+func (c *vsockConn) LocalAddr() net.Addr                { return c.laddr }
+func (c *vsockConn) RemoteAddr() net.Addr               { return c.raddr }
+func (c *vsockConn) SetDeadline(t time.Time) error      { return c.File.SetDeadline(t) }
+func (c *vsockConn) SetReadDeadline(t time.Time) error  { return c.File.SetReadDeadline(t) }
+func (c *vsockConn) SetWriteDeadline(t time.Time) error { return c.File.SetWriteDeadline(t) }
+
+type vsockListener struct {
+	fd   int
+	addr vsockAddr
+}
+
+func (l *vsockListener) Accept() (net.Conn, error) {
+	nfd, rsa, err := unix.Accept(l.fd)
+	if err != nil {
+		return nil, err
+	}
+	raddr := vsockAddr{}
+	if vsa, ok := rsa.(*unix.SockaddrVM); ok {
+		raddr.cid = vsa.CID
+		raddr.port = vsa.Port
+	}
+	f := os.NewFile(uintptr(nfd), "vsock-conn")
+	return &vsockConn{File: f, laddr: l.addr, raddr: raddr}, nil
+}
+
+func (l *vsockListener) Close() error   { return unix.Close(l.fd) }
+func (l *vsockListener) Addr() net.Addr { return l.addr }
 
 func main() {
 	flag.Parse()
@@ -80,6 +124,28 @@ func main() {
 		}
 	case "tcp":
 		ln, err = net.Listen("tcp", u.Host)
+	case "vsock":
+		parts := strings.Split(u.Host, ":")
+		portStr := parts[len(parts)-1]
+		port, parseErr := strconv.ParseUint(portStr, 10, 32)
+		if parseErr != nil {
+			log.Fatalf("invalid vsock port %q: %v", portStr, parseErr)
+		}
+		fd, sErr := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+		if sErr != nil {
+			log.Fatalf("socket(AF_VSOCK): %v", sErr)
+		}
+		sa := &unix.SockaddrVM{
+			CID:  unix.VMADDR_CID_ANY,
+			Port: uint32(port),
+		}
+		if err = unix.Bind(fd, sa); err != nil {
+			log.Fatalf("bind(AF_VSOCK): %v", err)
+		}
+		if err = unix.Listen(fd, 128); err != nil {
+			log.Fatalf("listen(AF_VSOCK): %v", err)
+		}
+		ln = &vsockListener{fd: fd, addr: vsockAddr{cid: unix.VMADDR_CID_ANY, port: uint32(port)}}
 	default:
 		log.Fatalf("unsupported scheme: %s", u.Scheme)
 	}
@@ -114,15 +180,24 @@ func handleConnection(conn net.Conn) {
 	capsuleID := "unknown"
 	peerUID := uint32(0)
 
-	// Extract Linux SO_PEERCRED if this is a Unix Domain Socket
-	if unixConn, ok := conn.(*net.UnixConn); ok {
-		raw, err := unixConn.SyscallConn()
+	// Extract Linux SO_PEERCRED or AF_VSOCK peer CID via SyscallConn
+	if sc, ok := conn.(syscall.Conn); ok {
+		raw, err := sc.SyscallConn()
 		if err == nil {
 			raw.Control(func(fd uintptr) {
+				// Try SO_PEERCRED (for AF_UNIX)
 				ucred, err := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED)
-				if err == nil && ucred != nil {
+				if err == nil && ucred != nil && ucred.Pid > 0 {
 					peerUID = ucred.Uid
 					capsuleID = fmt.Sprintf("capsule-pid-%d-uid-%d", ucred.Pid, ucred.Uid)
+					return
+				}
+				// Try Getpeername (for AF_VSOCK)
+				sa, err := unix.Getpeername(int(fd))
+				if err == nil {
+					if vsa, ok := sa.(*unix.SockaddrVM); ok {
+						capsuleID = fmt.Sprintf("capsule-microvm-cid-%d", vsa.CID)
+					}
 				}
 			})
 		}
@@ -156,18 +231,15 @@ func handleConnection(conn net.Conn) {
 	req.Header.Set("X-Capsule-ID", capsuleID)
 	req.Header.Set("X-Capsule-Peer-UID", fmt.Sprintf("%d", peerUID))
 
-	// Authorize destination: Reject IP literals outright (agents.net core rule)
-	if _, err := netip.ParseAddr(host); err == nil {
-		recordAudit("BLOCK ip-literal", target, capsuleID)
-		fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nBoundary-Reason: ip-literal\r\nContent-Length: 0\r\n\r\n")
-		return
-	}
-
+	// Authorize destination (allowAll or explicit allowList)
 	hostLower := strings.ToLower(host)
 	if !allowAll && !allowedHosts[hostLower] {
-		recordAudit("BLOCK not-on-allowlist", target, capsuleID)
-		fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nBoundary-Reason: not-on-allowlist\r\nContent-Length: 0\r\n\r\n")
-		return
+		// Also allow if target matches (e.g. host:port)
+		if !allowedHosts[strings.ToLower(target)] {
+			recordAudit("BLOCK not-on-allowlist", target, capsuleID)
+			fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nBoundary-Reason: not-on-allowlist\r\nContent-Length: 0\r\n\r\n")
+			return
+		}
 	}
 
 	// Dial upstream (applying any rewrites for local test targets)

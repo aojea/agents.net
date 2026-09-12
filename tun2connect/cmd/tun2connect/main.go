@@ -17,7 +17,10 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -46,25 +49,96 @@ func openTUN(name string, mtu uint32) (int, error) {
 	return fd, nil
 }
 
-// boundaryDialer returns a per-flow dial function for unix:// or tcp://.
+type vsockAddr struct {
+	cid  uint32
+	port uint32
+}
+
+func (a vsockAddr) Network() string { return "vsock" }
+func (a vsockAddr) String() string  { return fmt.Sprintf("%d:%d", a.cid, a.port) }
+
+type vsockConn struct {
+	*os.File
+	laddr vsockAddr
+	raddr vsockAddr
+}
+
+func (c *vsockConn) LocalAddr() net.Addr                { return c.laddr }
+func (c *vsockConn) RemoteAddr() net.Addr               { return c.raddr }
+func (c *vsockConn) SetDeadline(t time.Time) error      { return c.File.SetDeadline(t) }
+func (c *vsockConn) SetReadDeadline(t time.Time) error  { return c.File.SetReadDeadline(t) }
+func (c *vsockConn) SetWriteDeadline(t time.Time) error { return c.File.SetWriteDeadline(t) }
+
+func dialVSOCK(addr string) (net.Conn, error) {
+	parts := strings.Split(addr, ":")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("invalid vsock address %q (want cid:port)", addr)
+	}
+	cid, err := strconv.ParseUint(parts[0], 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid vsock cid: %w", err)
+	}
+	port, err := strconv.ParseUint(parts[1], 10, 32)
+	if err != nil {
+		return nil, fmt.Errorf("invalid vsock port: %w", err)
+	}
+	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+	if err != nil {
+		return nil, fmt.Errorf("socket(AF_VSOCK): %w", err)
+	}
+	sa := &unix.SockaddrVM{
+		CID:  uint32(cid),
+		Port: uint32(port),
+	}
+	if err := unix.Connect(fd, sa); err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("connect(AF_VSOCK): %w", err)
+	}
+	f := os.NewFile(uintptr(fd), "vsock")
+	return &vsockConn{
+		File:  f,
+		laddr: vsockAddr{cid: unix.VMADDR_CID_ANY, port: 0},
+		raddr: vsockAddr{cid: uint32(cid), port: uint32(port)},
+	}, nil
+}
+
+// boundaryDialer returns a per-flow dial function for unix://, tcp://, or vsock://.
 func boundaryDialer(proxy string) (func(ctx context.Context) (net.Conn, error), error) {
 	u, err := url.Parse(proxy)
 	if err != nil {
 		return nil, err
 	}
-	var network, addr string
 	switch u.Scheme {
 	case "unix":
-		network, addr = "unix", u.Path
+		network, addr := "unix", u.Path
+		var d net.Dialer
+		return func(ctx context.Context) (net.Conn, error) {
+			return d.DialContext(ctx, network, addr)
+		}, nil
 	case "tcp":
-		network, addr = "tcp", u.Host
+		network, addr := "tcp", u.Host
+		var d net.Dialer
+		return func(ctx context.Context) (net.Conn, error) {
+			return d.DialContext(ctx, network, addr)
+		}, nil
+	case "vsock":
+		addr := u.Host
+		parts := strings.Split(addr, ":")
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid vsock address %q (want cid:port)", addr)
+		}
+		if _, err := strconv.ParseUint(parts[0], 10, 32); err != nil {
+			return nil, fmt.Errorf("invalid vsock cid %q: %w", parts[0], err)
+		}
+		if _, err := strconv.ParseUint(parts[1], 10, 32); err != nil {
+			return nil, fmt.Errorf("invalid vsock port %q: %w", parts[1], err)
+		}
+		return func(ctx context.Context) (net.Conn, error) {
+			return dialVSOCK(addr)
+		}, nil
 	default:
-		return nil, fmt.Errorf("unsupported proxy scheme %q (want unix:// or tcp://)", u.Scheme)
+		return nil, fmt.Errorf("unsupported proxy scheme %q (want unix://, tcp://, or vsock://)", u.Scheme)
 	}
-	var d net.Dialer
-	return func(ctx context.Context) (net.Conn, error) {
-		return d.DialContext(ctx, network, addr)
-	}, nil
 }
 
 func main() {

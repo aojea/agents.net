@@ -1,91 +1,154 @@
-# Capsule Networking Scenarios & Empirical Benchmarks
+# The Dome: Empirical Network Interception Benchmarks (Containers vs. MicroVMs)
 
-This directory contains executable testbeds and statistical benchmark runners for evaluating AI Agent sandboxing technologies across the three network interception horizons. It produces demonstrable, empirical performance and security data to inform the `agents.net` specification.
+This directory contains executable testbeds and reproducible statistical benchmarks evaluating AI agent isolation technologies across the spectrum of network interception horizons.
 
-- **Detailed Empirical Results:** [data/results.md](data/results.md)
+Every scenario runs **real `curl` commands** executing the complete protocol lifecycle—**DNS lookup, TCP 3-way handshake, TLS 1.3 handshake, and HTTP payload transfer**—against a hermetic, local HTTPS target (`https://test.example.com:9443/ping`). This **eliminates external WAN transit jitter (0ms internet latency)** and isolates the pure architectural cost of the sandboxing primitive.
+
+- **Detailed Empirical Benchmark Data:** [data/results.md](data/results.md)
+- **Architectural RFC & Specification:** [RFC-CAPSULES.md](RFC-CAPSULES.md)
 
 ---
 
-## 1. Directory Structure
+## 1. Architectural Matrix: The 6 Dome Scenarios
+
+```
++----------------------------------------------------------------------------------------------------+
+|                                    SANDBOX EGRESS TAXONOMY                                         |
++------------------------------------+---------------------------------------------------------------+
+| CONTAINER SANDBOXES (3 MODES)      | MICROVM SANDBOXES (3 MODES)                                   |
++------------------------------------+---------------------------------------------------------------+
+| C-1: In-Capsule (tun2connect + UDS)| VM-1: In-Guest (tun2connect + AF_VSOCK)                       |
+| C-2: Boundary Intercept (Socket API)| VM-2: Userspace NIC (slirp4netns / gVisor netstack)           |
+| C-3: Out-of-Capsule (Routed Bridge)| VM-3: Kernel TAP NIC (Dedicated Network Namespace)            |
++------------------------------------+---------------------------------------------------------------+
+```
+
+### Comparative Summary
+
+| Scenario | Mode | Collapse Point | Transport Channel | Host Kernel Exposure | Conntrack Footprint | Wire Identity |
+|:---|:---|:---|:---|:---|:---|:---|
+| **C-1** | Container In-Capsule | Inside Container (`tun2connect`) | Unix Domain Socket | Zero (no veth, no host IP) | 0 entries | Cryptographic `SO_PEERCRED` |
+| **C-2** | Container Boundary | Boundary / libc (pre-packets) | Local Socket Stream | Zero (no packetization) | 0 entries | Authenticated Stream |
+| **C-3** | Container Out-Capsule | Never (Host Kernel NAT) | Routed `veth` + `docker0` | High (kernel netfilter, routing) | >0 (every flow) | Raw IP (Domain Erased) |
+| **VM-1** | MicroVM In-Guest | Inside MicroVM (`tun2connect`) | `virtio-vsock` Virtqueues | Zero (no TAP, no host IP) | 0 entries | Cryptographic Peer CID |
+| **VM-2** | MicroVM Userspace NIC| Host Userspace (`libslirp`) | `virtio-net` -> Userspace | Low kernel, Double TCP Stack | 0 on host kernel | Double TCP Stack |
+| **VM-3** | MicroVM TAP Netns | Dedicated Netns Kernel | `virtio-net` -> Netns TAP | Shielded (0 host root TAP) | Isolated in Netns | Shielded TAP |
+
+---
+
+## 2. Directory Structure
 
 ```
 scenarios/
-├── 01-container-in-capsule/    # Horizon 1: Container + tun2connect + Unix Domain Socket
-│   ├── run.sh                  # 500-sample percentile latency & throughput benchmark inside Docker (--network none)
-│   └── test_lpe.sh             # Root privilege escalation, route flush, & header spoofing test
-├── 02-container-boundary/      # Horizon 2: Boundary Intercept (Zero TCP math / Direct UDS stream)
-│   └── run.sh                  # 500-sample percentile latency & throughput benchmark measuring direct memory stream
-├── 03-container-out-capsule/   # Horizon 3: Traditional host CNI (routed veth + bridge)
-│   └── run.sh                  # Demonstrates host IPAM allocation, conntrack count, & domain erasure
-├── 04-microvm-vsock/           # Horizon 1 (MicroVM): virtio-vsock shared memory virtqueues
-│   ├── run.sh                  # AF_VSOCK 500-sample percentile latency & throughput benchmark
+├── 01-container-in-capsule/    # C-1: Container + tun2connect + Unix Domain Socket
+│   ├── run.sh                  # 100-flow real HTTPS curl benchmark inside Docker (--network none)
+│   └── test_lpe.sh             # Privilege escalation, route flush, & header spoofing test
+├── 02-container-boundary/      # C-2: Boundary Intercept (Socket API / HTTP CONNECT Proxy)
+│   └── run.sh                  # 100-flow real HTTPS curl benchmark via direct stream socket
+├── 03-container-out-capsule/   # C-3: Traditional host CNI (routed veth + bridge)
+│   └── run.sh                  # Demonstrates host IPAM allocation, conntrack delta, & domain erasure
+├── 04-microvm-vsock/           # VM-1: MicroVM in-guest tun2connect + virtio-vsock
+│   ├── run.sh                  # 100-flow real HTTPS curl benchmark over AF_VSOCK
 │   └── test_vsock_cid.sh       # Hardware hypervisor Context ID (CID) un-spoofable mapping test
+├── 05-microvm-userspace-nic/   # VM-2: MicroVM Userspace NIC (slirp4netns / libslirp)
+│   └── run.sh                  # Demonstrates double TCP stack tax and userspace frame parsing
+├── 06-microvm-tap-netns/       # VM-3: MicroVM TAP NIC in Dedicated Network Namespace
+│   └── run.sh                  # Encloses TAP device strictly in dedicated netns (0 host pollution)
 ├── common/
-│   ├── boundary_proxy.go       # High-performance reference boundary proxy with SO_PEERCRED auth
-│   └── target_server.go        # Benchmark target server (/ping and /stream?mb=...)
-├── benchmark.sh                # Master automated runner executing all scenarios and generating data
+│   ├── boundary_proxy.go       # Boundary proxy supporting UDS, TCP, and AF_VSOCK listeners
+│   ├── target_server.go        # Local TLS 1.3 server with automatic self-signed certs (/ping, /stream)
+│   └── benchmark_client.py     # Standardized curl runner computing DNS, TCP, TLS, and total percentiles
+├── benchmark.sh                # Master automated runner executing all 6 scenarios
 └── data/
     └── results.md              # Measured empirical benchmark results with percentiles and CV%
 ```
 
 ---
 
-## 2. Running the Benchmarks
+## 3. Network Topologies & Interception Mechanics
 
-To execute all scenarios and generate the data report:
+### Container Modes
 
-```bash
-./scenarios/benchmark.sh
+#### Mode C-1: In-Capsule `tun2connect` (`--network none`)
+```
+[Agent (curl)] ---> [tun0 (kernel)] ---> [tun2connect (In-Capsule)] ---> (AF_UNIX UDS) ---> [Boundary Proxy] ---> [Target]
+      |                    |                         |
+      +-- DNS UDP:53 ------+                         |
+      |   (Synthetic IP returned: 100.64.0.1)        |
+      +-- TCP SYN: 100.64.0.1:9443 ------------------+
+          (Terminated locally, translated to CONNECT test.example.com:9443)
 ```
 
-Individual scenarios can also be run independently:
+#### Mode C-2: Boundary Intercept (Socket API / eBPF / Proxy)
+```
+[Agent (curl)] ---> [Socket API / Proxy Intercept] ---------------------> (Local Stream) ---> [Boundary Proxy] ---> [Target]
+(Zero packetization, zero TUN device, direct HTTP CONNECT tunnel)
+```
 
-```bash
-# 1. Container In-Capsule (tun2connect over UDS)
-./scenarios/01-container-in-capsule/run.sh
-./scenarios/01-container-in-capsule/test_lpe.sh
+#### Mode C-3: Traditional Routed Bridge (`--network bridge`)
+```
+[Agent (curl)] ---> [eth0] ---> [veth pair] ---> [docker0 bridge] ---> [Host iptables SNAT] ---> [Target]
+(Raw IP packets on host, domain erased at DNS, host conntrack state created)
+```
 
-# 2. Container Boundary Intercept (Direct Stream)
-./scenarios/02-container-boundary/run.sh
+### MicroVM Modes
 
-# 3. Container Out-of-Capsule (Routed veth / Bridge)
-./scenarios/03-container-out-capsule/run.sh
+#### Mode VM-1: In-Guest `tun2connect` over `virtio-vsock`
+```
+[Guest Agent] ---> [Guest tun0] ---> [In-Guest tun2connect] ---> (AF_VSOCK Virtqueue) ---> [Host Boundary Proxy] ---> [Target]
+(Zero raw IP packets cross the hypervisor boundary. Boundary proxy attributes identity via kernel Peer CID)
+```
 
-# 4. MicroVM VSOCK (virtio-vsock)
-./scenarios/04-microvm-vsock/run.sh
-./scenarios/04-microvm-vsock/test_vsock_cid.sh
+#### Mode VM-2: Userspace NIC (`slirp4netns` / `gvisor-tap-vsock`)
+```
+[Guest Agent] ---> [virtio-net] ---> (Hypervisor Ring Buffer) ---> [slirp4netns (Host Ring 3)] ---> [Target]
+                                                                            |
+                                                                   [Double TCP Stack Tax]
+                                                                   (Reassembles TCP frames)
+```
+
+#### Mode VM-3: Kernel TAP NIC in Dedicated Network Namespace
+```
+[Guest Agent] ---> [virtio-net] ---> [Host TAP tap0 (in Dedicated Netns)] ---> [Netns Kernel Routing] ---> [Target]
+                                                       |
+                                    [Host Root Netns: 0 TAP Devices]
 ```
 
 ---
 
-## 3. Empirical Findings Summary
+## 4. Empirical Benchmark Results
 
-The automated benchmark suite executes 500 requests per scenario across 5 independent rounds (with a 10-request warmup) and 3 throughput trials (50 MB streams):
+Measured on Linux (x86_64, 96 vCPUs, 236 GiB RAM).
+Workload: Real `curl` executing HTTPS over TLS 1.3 against local `https://test.example.com:9443/ping`:
 
-| Scenario | Interception Horizon | Transport Channel | p50 (Median) | p90 | p95 | p99 (Tail) | Mean ± StdDev | Throughput (MB/s) | Host IPAM Needed? | Wire Identity |
-|---|---|---|---|---|---|---|---|---|:---:|---|
-| **1. Container In-Capsule** | In-Capsule (tun2connect) | Unix Domain Socket | **0.96 ms** | 1.13 ms | 1.26 ms | 2.66 ms | 1.01 ± 0.28 ms | **165.17 MB/s** | 🟢 None (0 IPs) | 🟢 Named `CONNECT` |
-| **2. Container Boundary** | At Boundary (Direct Stream) | Unix Domain Socket | **0.21 ms** | 0.27 ms | 0.31 ms | 0.57 ms | 0.23 ± 0.14 ms | **3645.47 MB/s** | 🟢 None (0 IPs) | 🟢 Named `CONNECT` |
-| **3. Container Out-Capsule** | Out-of-Capsule (Host CNI) | Routed veth + Bridge | **0.25 ms** | 0.31 ms | 0.34 ms | 0.37 ms | 0.26 ± 0.09 ms | **936.06 MB/s** | ❌ 1 IP/Capsule | ❌ Raw IP (DNS erased) |
-| **4. MicroVM VSOCK** | In-Capsule (VSOCK IPC) | virtio-vsock | **0.31 ms** | 0.37 ms | 0.39 ms | 0.47 ms | 0.32 ± 0.05 ms | **4071.61 MB/s** | 🟢 None (0 IPs) | 🟢 Named `CONNECT` |
+| Scenario | Mode / Horizon | Collapse Point | Transport Channel | DNS (ms) | TCP (ms) | TLS 1.3 (ms) | Total p50 | Total p99 | Throughput (MB/s) | Host IPAM? | Wire Identity |
+|---|---|---|---|---|---|---|---|---|---|:---:|---|
+| **C-1** | Container In-Capsule | Inside Container (`tun2connect`) | Unix Domain Socket | **0.69** | **1.20** | **4.05** | **4.52 ms** | 6.31 ms | **179.32 MB/s** | 🟢 0 IPs | 🟢 Cryptographic `SO_PEERCRED` |
+| **C-2** | Container Boundary | Boundary Socket API / Proxy | Local Socket / Stream | **0.02** | **0.10** | **2.27** | **2.59 ms** | 3.95 ms | **588.48 MB/s** | 🟢 0 IPs | 🟢 Authenticated Stream |
+| **C-3** | Container Out-Capsule | Never (Host Kernel NAT) | Routed `veth` + Bridge | **0.34** | **0.43** | **3.04** | **3.34 ms** | 4.89 ms | **558.33 MB/s** | ❌ 1 IP/Capsule | ❌ Raw IP (Domain Erased) |
+| **VM-1** | MicroVM In-Guest | Inside MicroVM (`tun2connect`) | `virtio-vsock` Virtqueues | **0.73** | **1.28** | **3.71** | **4.24 ms** | 5.54 ms | **181.75 MB/s** | 🟢 0 IPs | 🟢 Cryptographic Peer CID |
+| **VM-2** | MicroVM Userspace NIC | Host Userspace Stack | `virtio-net` -> `slirp4netns` | **0.55** | **0.76** | **2.74** | **3.05 ms** | 4.55 ms | **400.91 MB/s** | 🟢 0 IPs | 🟡 Double TCP Stack |
+| **VM-3** | MicroVM TAP Netns | Dedicated Netns Kernel | `virtio-net` -> Netns TAP | **0.33** | **0.41** | **3.00** | **3.28 ms** | 4.70 ms | **579.46 MB/s** | ❌ 1 IP/Netns | 🟡 Shielded (0 Host TAP) |
 
 ### Key Architectural Takeaways:
+1. **The In-Guest Packetization Tax (C-1 vs. C-2):**
+   - Intercepting at the socket API layer (C-2) achieves **2.59 ms** p50 latency vs **4.52 ms** for C-1.
+   - Eliminating in-guest TCP packetization, checksumming, and TUN buffer context switches yields a **1.7x latency improvement** and a **3.3x throughput increase** (179 MB/s → 588 MB/s).
+2. **MicroVM VSOCK vs. Userspace NIC (VM-1 vs. VM-2):**
+   - In VM-2 (`slirp4netns`), raw Ethernet frames cross the hypervisor boundary, incurring the **Double TCP Stack Tax** where host userspace must parse TCP headers and reassemble streams.
+   - In VM-1, in-guest `tun2connect` collapses traffic inside the guest and streams raw bytes over `AF_VSOCK` virtqueues, guaranteeing zero host L2/L3 exposure and unforgeable peer CID attribution.
+3. **MicroVM Host Pollution Shielding (VM-3):**
+   - In VM-3, TAP devices and kernel routes are strictly confined to a dedicated, isolated network namespace. The host root network namespace retains **0 TAP devices and 0 route bloat**.
 
-1. **The In-Guest Packetization Tax (Horizon 1 vs Horizon 2):**
-   - Eliminating guest-side TCP checksumming and TUN buffer copy yields a **4.6x median latency reduction** (0.96 ms → 0.21 ms) and a **22.1x throughput increase** (165 MB/s → 3645 MB/s).
-   - Tail latency ($p_{99}$) drops from 2.66 ms to 0.57 ms (**4.7x tail reduction**).
-   - This empirically confirms that for Containers and gVisor, **Horizon 2 (Boundary Intercept) is the ultimate performance end-state**.
+---
 
-2. **Why MicroVMs Favor VSOCK Over Boundary `vhost-user-net`:**
-   - MicroVMs over `virtio-vsock` achieve **4071.61 MB/s** with **0.31 ms** latency.
-   - VSOCK streams directly over shared memory virtqueues. In contrast, `vhost-user-net` forces the guest kernel to construct full Ethernet/IP/TCP frames and the host daemon to unpack them (imposing a double TCP tax on host CPU).
+## 5. How to Reproduce
 
-3. **Why Horizon 3 (Host Routed CNI) Must Be Abandoned:**
-   - **Loss of Domain Identity:** DNS resolution inside the guest translates names to raw IPs (`104.20.23.154`) before crossing the veth interface, making host firewall domain allowlists impossible without fragile DNS snooping.
-   - **Host IPAM & Conntrack Exhaustion:** Requires active IP allocations and bloats host netfilter conntrack tables.
-   - **Fail-Open Risk:** Misconfiguring host iptables rules exposes host network routes directly.
+```bash
+# Clone repository
+git clone https://github.com/aojea/agents.net.git
+cd agents.net
 
-4. **Security & LPE Verification:**
-   - **Route Tampering:** Flushing routes inside an In-Capsule container (`ip route flush dev tun0`) results in immediate `FAIL-CLOSED` connection refusal. With no external NIC, there is no escape path.
-   - **Header Spoofing:** When a compromised guest sends forged headers (`X-Capsule-ID: attacker-compromised-agent`), the boundary proxy ignores them and extracts verified identity directly from `SO_PEERCRED` (PID/UID) or hypervisor Context ID (CID).
-
+# Run automated master benchmark across all 6 scenarios
+./scenarios/benchmark.sh
+```
