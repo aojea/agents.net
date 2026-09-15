@@ -31,8 +31,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== Horizon 1 (MicroVM Userspace NIC): Measuring Conntrack Delta ==="
-CONNTRACK_BEFORE=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+CONNTRACK_BEFORE=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_BEFORE=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
 
@@ -67,11 +67,14 @@ SLIRP_PID=$!
 
 wait "${UNSHARE_PID}"
 
-CONNTRACK_AFTER=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+CONNTRACK_AFTER=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_AFTER=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
-CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+CONNTRACK_DELTA=unknown
+if [[ "${CONNTRACK_BEFORE}" != unknown && "${CONNTRACK_AFTER}" != unknown ]]; then
+    CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+fi
 echo "CONNTRACK_DELTA=${CONNTRACK_DELTA}"
 echo "HOST_IPAM_ALLOCATED=0"
 echo "=== MicroVM Userspace NIC: Verification Complete ==="

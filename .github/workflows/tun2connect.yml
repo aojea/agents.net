@@ -6,11 +6,17 @@ on:
     tags: [ 'tun2connect/v*' ]
     paths:
       - 'tun2connect/**'
+      - 'scenarios/**'
+      - 'go.work'
+      - 'go.work.sum'
       - '.github/workflows/tun2connect.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'tun2connect/**'
+      - 'scenarios/**'
+      - 'go.work'
+      - 'go.work.sum'
       - '.github/workflows/tun2connect.yml'
 
 defaults:
@@ -18,6 +24,36 @@ defaults:
     working-directory: tun2connect
 
 jobs:
+  scenario-tests:
+    name: Scenario unit and reporting tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: scenarios/go.mod
+          cache-dependency-path: scenarios/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Go tests (race)
+        run: go test -race -count=1 ./scenarios/...
+
+      - name: Reporting tests
+        run: python3 -m unittest discover -s scenarios/common -p 'test_*.py'
+
+      - name: Shell syntax
+        run: find scenarios -name '*.sh' -print0 | xargs -0 -n 1 bash -n
+
   go-test:
     name: Build, vet & test (race)
     runs-on: ubuntu-latest
@@ -41,6 +77,11 @@ jobs:
       # the envoy-interop job below is where it runs for real.
       - name: Test
         run: go test -race -count=1 ./...
+
+      - name: Namespace redirect integration
+        env:
+          NETNS_PROXY_INTEGRATION: '1'
+        run: go test -race -count=1 -v ./pkg/netnsproxy -run '^TestNamespaceIntegration$'
 
   envoy-interop:
     name: Envoy boundary e2e

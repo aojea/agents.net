@@ -49,14 +49,14 @@ print('DOMAIN_PRESERVED_ON_WIRE=FALSE (Host kernel only observes raw destination
 ")
 echo "${DOMAIN_TEST_OUTPUT}"
 
-echo "=== Horizon 3 (Out-of-Capsule): Conntrack Bloat Measurement ==="
-CONNTRACK_BEFORE=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+echo "=== Horizon 3 (Out-of-Capsule): Host-wide Conntrack Snapshot ==="
+CONNTRACK_BEFORE=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_BEFORE=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
 
 echo "=== Horizon 3 (Out-of-Capsule): Real curl HTTPS Benchmark (5 rounds x 20 requests = 100 flows) ==="
-BENCH_OUTPUT=$(docker run --rm --network bridge \
+docker run --rm --network bridge \
   --add-host test.example.com:${HOST_GATEWAY_IP} \
   -v "${RUN_DIR}:/var/run/agents.net" \
   -v "${REPO_ROOT}/scenarios/common/benchmark_client.py:/client.py:ro" \
@@ -66,15 +66,16 @@ BENCH_OUTPUT=$(docker run --rm --network bridge \
     --cacert /var/run/agents.net/cert.pem \
     --rounds 5 --requests 20 --warmup 5 \
     --throughput-url "https://test.example.com:${TARGET_PORT}/stream?mb=50" \
-    --throughput-trials 3)
+    --throughput-trials 3
 
-echo "${BENCH_OUTPUT}"
-
-CONNTRACK_AFTER=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+CONNTRACK_AFTER=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_AFTER=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
-CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+CONNTRACK_DELTA=unknown
+if [[ "${CONNTRACK_BEFORE}" != unknown && "${CONNTRACK_AFTER}" != unknown ]]; then
+    CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+fi
 echo "CONNTRACK_DELTA=${CONNTRACK_DELTA}"
 
 echo "=== Horizon 3: Verification Complete ==="

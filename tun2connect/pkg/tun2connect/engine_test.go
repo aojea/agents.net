@@ -206,20 +206,71 @@ func TestEngineTCPEchoCarriesName(t *testing.T) {
 	}
 }
 
-func TestEngineRefusesUnresolvedDestination(t *testing.T) {
-	n := newTestNet(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	// 100.64.9.9 is in the synthetic range but was never handed out.
-	_, err := gonet.DialContextTCP(ctx, n.guest,
-		fullAddr(netip.MustParseAddr("100.64.9.9"), 443), ipv4.ProtocolNumber)
-	if err == nil {
-		t.Fatal("flow to an address the guest never resolved must be refused")
+func TestEngineIPLiteralUsesBoundary(t *testing.T) {
+	for _, test := range []struct {
+		address string
+		refuse  bool
+	}{
+		{"203.0.113.10", false},
+		{"100.64.9.9", false},
+		{"203.0.113.10", true},
+	} {
+		t.Run(fmt.Sprintf("%s/refuse=%v", test.address, test.refuse), func(t *testing.T) {
+			network := newTestNet(t)
+			network.dialer.refuse = test.refuse
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			conn, err := gonet.DialContextTCP(ctx, network.guest,
+				fullAddr(netip.MustParseAddr(test.address), 443), ipv4.ProtocolNumber)
+			if test.refuse {
+				if err == nil {
+					conn.Close()
+					t.Fatal("boundary denial must fail the guest connection")
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer conn.Close()
+				if _, err := conn.Write([]byte("ping")); err != nil {
+					t.Fatal(err)
+				}
+				response := make([]byte, 4)
+				if _, err := io.ReadFull(conn, response); err != nil || string(response) != "ping" {
+					t.Fatalf("echo = %q, err = %v", response, err)
+				}
+			}
+			network.dialer.mu.Lock()
+			defer network.dialer.mu.Unlock()
+			expected := "tcp/" + test.address + ":443"
+			if len(network.dialer.dials) != 1 || network.dialer.dials[0] != expected {
+				t.Fatalf("boundary saw %v, want %s", network.dialer.dials, expected)
+			}
+		})
 	}
-	n.dialer.mu.Lock()
-	defer n.dialer.mu.Unlock()
-	if len(n.dialer.dials) != 0 {
-		t.Fatalf("boundary must never be dialed without a name, saw %v", n.dialer.dials)
+}
+
+func TestEngineUDPIPLiteralUsesBoundary(t *testing.T) {
+	network := newTestNet(t)
+	destination := fullAddr(netip.MustParseAddr("203.0.113.10"), 3478)
+	conn, err := gonet.DialUDP(network.guest, nil, &destination, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte("probe")); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, 32)
+	count, err := conn.Read(response)
+	if err != nil || string(response[:count]) != "probe" {
+		t.Fatalf("UDP echo = %q, err = %v", response[:count], err)
+	}
+	network.dialer.mu.Lock()
+	defer network.dialer.mu.Unlock()
+	if len(network.dialer.dials) != 1 || network.dialer.dials[0] != "udp/203.0.113.10:3478" {
+		t.Fatalf("boundary saw %v", network.dialer.dials)
 	}
 }
 
@@ -306,5 +357,42 @@ func TestEngineAnswersDNSLocally(t *testing.T) {
 	}
 	if len(n.dialer.dials) != 0 {
 		t.Fatalf("DNS must never reach the boundary, saw %v", n.dialer.dials)
+	}
+}
+
+func TestForwarderTCPRelayCancellation(t *testing.T) {
+	guest, application := net.Pipe()
+	upstream, boundary := net.Pipe()
+	defer application.Close()
+	defer boundary.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		new(Forwarder).RelayTCP(ctx, guest, upstream)
+		close(done)
+	}()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not stop both TCP relay directions")
+	}
+}
+
+func TestForwarderUDPRelayBoundaryClose(t *testing.T) {
+	guest, application := net.Pipe()
+	defer application.Close()
+	session := &echoDatagramConn{ch: make(chan []byte), closed: make(chan struct{})}
+	done := make(chan struct{})
+	go func() {
+		new(Forwarder).RelayUDP(context.Background(), guest, session)
+		close(done)
+	}()
+	session.Close()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("boundary close did not stop the guest UDP read")
 	}
 }

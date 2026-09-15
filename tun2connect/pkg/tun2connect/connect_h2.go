@@ -150,11 +150,7 @@ func (c *BoundaryClientH2) DialTCP(ctx context.Context, name string, port uint16
 func (c *BoundaryClientH2) DialUDP(ctx context.Context, name string, port uint16) (DatagramConn, error) {
 	req := &http.Request{
 		Method: http.MethodConnect,
-		URL: &url.URL{
-			Scheme: "http",
-			Host:   c.authority(),
-			Path:   fmt.Sprintf("/.well-known/masque/udp/%s/%d/", url.PathEscape(name), port),
-		},
+		URL:    udpProxyURL(c.authority(), name, port),
 		Host:   c.authority(),
 		Header: make(http.Header),
 	}

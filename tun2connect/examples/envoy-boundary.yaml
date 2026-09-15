@@ -1,15 +1,12 @@
-# An unmodified Envoy as the agents.net boundary: terminates the wire
-# natively at both stages -- HTTP/1.1 CONNECT on :10000 and HTTP/2
-# prior-knowledge CONNECT on :10001 (the multiplexed, HBONE-shaped
-# stage) -- resolving destination NAMES via its dynamic forward proxy.
+# Envoy TCP CONNECT example: HTTP/1.1 on :10000 and HTTP/2 with prior
+# knowledge on :10001. Destination names use the dynamic forward proxy.
+# Loopback test configuration only; no workload authorization is configured.
 #
 #   docker run -d --name envoy-connect --network host \
 #     envoyproxy/envoy:v1.32-latest \
 #     --config-yaml "$(cat tun2connect/examples/envoy-boundary.yaml)"
 #
-# This is the mesh-integration proof: the same listener semantics are
-# what Istio waypoints and kgateway program. Swap connect-proxy for
-# this and the engine cannot tell the difference.
+# This configuration tests Envoy directly, not a gateway or service mesh.
 static_resources:
   listeners:
   # HTTP/1.1 CONNECT terminator (v1 wire)
@@ -46,7 +43,7 @@ static_resources:
           - name: envoy.filters.http.router
             typed_config:
               "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
-  # HTTP/2 prior-knowledge CONNECT terminator (v2 wire, HBONE-shaped)
+  # HTTP/2 prior-knowledge CONNECT terminator
   - name: connect_h2
     address:
       socket_address: { address: 127.0.0.1, port_value: 10001 }

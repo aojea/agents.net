@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_lpe.sh: Tests Local Privilege Escalation (root) inside the Capsule
+# test_lpe.sh: Route-tampering and CONNECT identity smoke tests, not an LPE test.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -37,7 +37,7 @@ for i in {1..30}; do
     sleep 0.1
 done
 
-echo "=== LPE Test 1: Root flushes routes inside container ==="
+echo "=== Route-tampering smoke test: root flushes routes inside container ==="
 # Inside container, root runs 'ip route flush dev tun0'. Verify fail-closed behavior.
 OUTPUT_FLUSH=$(docker run --rm --network none \
   --cap-add NET_ADMIN --device /dev/net/tun \
@@ -45,7 +45,7 @@ OUTPUT_FLUSH=$(docker run --rm --network none \
   -v "${LAUNCHER}:/tun2connect:ro" \
   --entrypoint /tun2connect \
   "${IMAGE}" run /var/run/agents.net/boundary.sock \
-  sh -c "ip route flush dev tun0 && curl -s --max-time 3 http://target.internal/ping || echo 'FLUSH_FAILED_CLOSED'")
+  sh -c "curl -fsS --max-time 3 http://target.internal/ping >/dev/null || exit 2; ip route flush dev tun0 || exit 2; if curl -fsS --max-time 3 http://target.internal/ping; then exit 1; fi; echo 'FLUSH_FAILED_CLOSED'")
 
 echo "${OUTPUT_FLUSH}"
 if echo "${OUTPUT_FLUSH}" | grep -q "FLUSH_FAILED_CLOSED"; then
@@ -55,14 +55,21 @@ else
     exit 1
 fi
 
-echo "=== LPE Test 2: Compromised agent attempts to spoof X-Capsule-ID header ==="
+echo "=== CONNECT identity smoke test: direct forged boundary request ==="
 docker run --rm --network none \
-  --cap-add NET_ADMIN --device /dev/net/tun \
-  -v "${RUN_DIR}:/var/run/agents.net" \
-  -v "${LAUNCHER}:/tun2connect:ro" \
-  --entrypoint /tun2connect \
-  "${IMAGE}" run /var/run/agents.net/boundary.sock \
-  curl -s -H "X-Capsule-ID: attacker-compromised-agent" -H "Sandbox-Id: fake-id" http://target.internal/ping >/dev/null
+  -v "${RUN_DIR}/boundary.sock:/boundary.sock" \
+  --entrypoint python3 "${IMAGE}" -c '
+import socket
+
+for target, status in [("target.internal:80", b"200"), ("denied.internal:80", b"403")]:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+        client.settimeout(5)
+        client.connect("/boundary.sock")
+        request = f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\nX-Capsule-ID: attacker-compromised-agent\r\nSandbox-Id: fake-id\r\nX-Dome-Tenant: fake-id\r\n\r\n"
+        client.sendall(request.encode())
+        with client.makefile("rb") as response:
+            assert response.readline().split()[1] == status
+'
 
 echo "Audit log entries:"
 cat "${RUN_DIR}/audit.log"
@@ -70,6 +77,9 @@ cat "${RUN_DIR}/audit.log"
 if grep -q "attacker-compromised-agent" "${RUN_DIR}/audit.log"; then
     echo "  [FAIL] Security vulnerability: boundary proxy accepted untrusted guest capsule ID!"
     exit 1
+elif grep -Eq "BLOCK not-on-allowlist target=denied.internal:80 capsule=capsule-pid-[0-9]+-uid-[0-9]+" "${RUN_DIR}/audit.log"; then
+  echo "  [PASS] Forged CONNECT headers did not grant access; denial has kernel-derived identity"
 else
-    echo "  [PASS] Boundary proxy sanitized untrusted guest headers and verified identity from SO_PEERCRED"
+  echo "  [FAIL] Missing kernel-attributed denial"
+  exit 1
 fi

@@ -1,6 +1,6 @@
 // Launcher mode: `tun2connect run <boundary-socket> <cmd> [args...]`
 // builds the sandbox's only route (a TUN terminated in userspace, every
-// flow leaving as a named HTTP CONNECT tunnel on the boundary socket),
+// flow leaving as an HTTP CONNECT tunnel on the boundary socket),
 // then runs the agent as its child with the PID 1 duties: reap orphans,
 // forward signals, exit with the agent's status.
 package main
@@ -45,7 +45,7 @@ func runUsage(fs *flag.FlagSet) func() {
 
 Runs <command> in a sandbox whose only network path is a TUN device
 terminated in userspace; every flow reaches the boundary socket as a
-named HTTP CONNECT tunnel. Flags stop at the first positional argument:
+HTTP CONNECT tunnel with a hostname or IP target. Flags stop at the first positional argument:
 everything after the boundary socket belongs to the command.
 
 The boundary socket is a Unix socket path (or unix:///path, tcp://host:port).
@@ -137,8 +137,7 @@ func runLauncher(args []string) {
 // routes. They exist so that everything else also reaches the engine: an
 // agent that hardcodes its own DNS server (say 8.8.8.8) still gets an
 // answer, because the engine serves port 53 on any address routed to it,
-// and a dial to an unrelated literal IP fails with a clear refusal from
-// the engine instead of a routing error.
+// and a dial to a literal IP reaches the boundary for authorization.
 func configureTUN(name string) error {
 	link, err := netlink.LinkByName(name)
 	if err != nil {

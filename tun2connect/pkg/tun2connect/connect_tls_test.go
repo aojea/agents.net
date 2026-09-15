@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,11 @@ import (
 // client cert asserting a deliberately non-SPIFFE URI: the identity
 // scheme is the deployment's business, never this library's.
 func mintPKI(t *testing.T) (pool *x509.CertPool, server, client tls.Certificate) {
+	t.Helper()
+	return mintPKIWithTemplates(t, nil, nil)
+}
+
+func mintPKIWithTemplates(t *testing.T, changeServer, changeClient func(*x509.Certificate)) (pool *x509.CertPool, server, client tls.Certificate) {
 	t.Helper()
 	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -57,26 +63,34 @@ func mintPKI(t *testing.T) (pool *x509.CertPool, server, client tls.Certificate)
 		}
 		return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}
 	}
-	server = mint(&x509.Certificate{
+	serverTemplate := &x509.Certificate{
 		SerialNumber: big.NewInt(2),
 		DNSNames:     []string{"boundary"},
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
-	})
+	}
+	if changeServer != nil {
+		changeServer(serverTemplate)
+	}
+	server = mint(serverTemplate)
 	sandboxID, err := url.Parse("sandbox://tenant-a/agent-123")
 	if err != nil {
 		t.Fatal(err)
 	}
-	client = mint(&x509.Certificate{
+	clientTemplate := &x509.Certificate{
 		SerialNumber: big.NewInt(3),
 		URIs:         []*url.URL{sandboxID},
 		KeyUsage:     x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     time.Now().Add(time.Hour),
-	})
+	}
+	if changeClient != nil {
+		changeClient(clientTemplate)
+	}
+	client = mint(clientTemplate)
 	pool = x509.NewCertPool()
 	pool.AddCert(caCert)
 	return pool, server, client
@@ -85,9 +99,10 @@ func mintPKI(t *testing.T) (pool *x509.CertPool, server, client tls.Certificate)
 // mtlsBoundary is an in-process mTLS+h2 boundary recording the peer's
 // certificate URI, echoing every CONNECT stream.
 type mtlsBoundary struct {
-	addr string
-	mu   sync.Mutex
-	peer string
+	addr    string
+	mu      sync.Mutex
+	peer    string
+	tunnels int
 }
 
 func startMTLSBoundary(t *testing.T, pool *x509.CertPool, server tls.Certificate) *mtlsBoundary {
@@ -105,6 +120,9 @@ func startMTLSBoundary(t *testing.T, pool *x509.CertPool, server tls.Certificate
 	b := &mtlsBoundary{addr: ln.Addr().String()}
 	h2s := &http2.Server{}
 	handler := func(w http.ResponseWriter, r *http.Request) {
+		b.mu.Lock()
+		b.tunnels++
+		b.mu.Unlock()
 		f := w.(http.Flusher)
 		w.WriteHeader(http.StatusOK)
 		f.Flush()
@@ -150,6 +168,10 @@ func TestH2MutualTLSCarriesDeploymentIdentity(t *testing.T) {
 
 	c := &BoundaryClientH2{
 		DialBoundary: tcpDialer(b.addr),
+		Header: http.Header{
+			"Sandbox-Id":    {"forged-admin"},
+			"X-Dome-Tenant": {"forged-admin"},
+		},
 		TLS: &tls.Config{
 			RootCAs:      pool,
 			Certificates: []tls.Certificate{client},
@@ -188,5 +210,128 @@ func TestH2MutualTLSRejectsAnonymousClient(t *testing.T) {
 	}
 	if _, err := c.DialTCP(context.Background(), "api.example", 443); err == nil {
 		t.Fatal("a client without a certificate must not reach the boundary")
+	}
+}
+
+func TestH2MutualTLSRejectsInvalidPeers(t *testing.T) {
+	expired := func(cert *x509.Certificate) {
+		cert.NotBefore = time.Now().Add(-2 * time.Hour)
+		cert.NotAfter = time.Now().Add(-time.Hour)
+	}
+	future := func(cert *x509.Certificate) {
+		cert.NotBefore = time.Now().Add(time.Hour)
+		cert.NotAfter = time.Now().Add(2 * time.Hour)
+	}
+	for _, test := range []struct {
+		name           string
+		serverTemplate func(*x509.Certificate)
+		clientTemplate func(*x509.Certificate)
+		clientConfig   func(*tls.Config)
+	}{
+		{name: "wrong-server-name", clientConfig: func(config *tls.Config) { config.ServerName = "other-boundary" }},
+		{name: "untrusted-server", clientConfig: func(config *tls.Config) { config.RootCAs = x509.NewCertPool() }},
+		{name: "expired-server", serverTemplate: expired},
+		{name: "future-server", serverTemplate: future},
+		{name: "wrong-server-usage", serverTemplate: func(cert *x509.Certificate) { cert.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth} }},
+		{name: "expired-client", clientTemplate: expired},
+		{name: "future-client", clientTemplate: future},
+		{name: "wrong-client-usage", clientTemplate: func(cert *x509.Certificate) { cert.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth} }},
+		{name: "untrusted-client", clientConfig: func(config *tls.Config) {
+			_, _, rogue := mintPKI(t)
+			config.GetClientCertificate = func(*tls.CertificateRequestInfo) (*tls.Certificate, error) { return &rogue, nil }
+		}},
+		{name: "wrong-client-key", clientConfig: func(config *tls.Config) {
+			_, _, other := mintPKI(t)
+			config.Certificates[0].PrivateKey = other.PrivateKey
+		}},
+		{name: "wrong-alpn", clientConfig: func(config *tls.Config) { config.NextProtos = []string{"http/1.1"} }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			pool, server, client := mintPKIWithTemplates(t, test.serverTemplate, test.clientTemplate)
+			boundary := startMTLSBoundary(t, pool, server)
+			config := &tls.Config{RootCAs: pool, Certificates: []tls.Certificate{client}, ServerName: "boundary"}
+			if test.clientConfig != nil {
+				test.clientConfig(config)
+			}
+			adapter := &BoundaryClientH2{DialBoundary: tcpDialer(boundary.addr), TLS: config}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			conn, err := adapter.DialTCP(ctx, "api.example", 443)
+			if err == nil {
+				conn.Close()
+				t.Fatal("invalid TLS peer established a tunnel")
+			}
+			if ctx.Err() != nil {
+				t.Fatalf("authentication timed out instead of rejecting: %v", err)
+			}
+			boundary.mu.Lock()
+			defer boundary.mu.Unlock()
+			if boundary.tunnels != 0 {
+				t.Fatalf("invalid TLS peer reached %d tunnel handlers", boundary.tunnels)
+			}
+		})
+	}
+}
+
+type corruptingConn struct {
+	net.Conn
+	armed     atomic.Bool
+	corrupted atomic.Bool
+}
+
+func (conn *corruptingConn) Write(packet []byte) (int, error) {
+	if len(packet) > 5 && conn.armed.CompareAndSwap(true, false) {
+		packet = append([]byte(nil), packet...)
+		packet[len(packet)-1] ^= 1
+		conn.corrupted.Store(true)
+	}
+	return conn.Conn.Write(packet)
+}
+
+func TestH2MutualTLSRejectsModifiedRecords(t *testing.T) {
+	pool, server, client := mintPKI(t)
+	boundary := startMTLSBoundary(t, pool, server)
+	var transport *corruptingConn
+	adapter := &BoundaryClientH2{
+		DialBoundary: func(ctx context.Context) (net.Conn, error) {
+			conn, err := tcpDialer(boundary.addr)(ctx)
+			if err != nil {
+				return nil, err
+			}
+			transport = &corruptingConn{Conn: conn}
+			return transport, nil
+		},
+		TLS: &tls.Config{RootCAs: pool, Certificates: []tls.Certificate{client}, ServerName: "boundary"},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := adapter.DialTCP(ctx, "api.example", 443)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	defer transport.Close()
+	transport.armed.Store(true)
+	result := make(chan error, 1)
+	go func() {
+		if _, err := stream.Write([]byte("must-not-be-delivered")); err != nil {
+			result <- err
+			return
+		}
+		buffer := make([]byte, 64)
+		count, err := stream.Read(buffer)
+		if count != 0 {
+			result <- nil
+			return
+		}
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if err == nil || !transport.corrupted.Load() {
+			t.Fatalf("modified TLS record was not rejected: corrupted=%v err=%v", transport.corrupted.Load(), err)
+		}
+	case <-ctx.Done():
+		t.Fatal("modified TLS record did not terminate the tunnel promptly")
 	}
 }

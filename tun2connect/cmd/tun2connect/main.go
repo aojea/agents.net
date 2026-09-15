@@ -1,7 +1,7 @@
 // Command tun2connect runs the guest side of the boundary: it opens a
 // TUN device, terminates TCP/IP in userspace, answers DNS with synthetic
-// addresses, and carries every flow to the boundary as a named HTTP
-// CONNECT (TCP) or connect-udp (UDP) tunnel.
+// addresses, and carries supported flows to the boundary as HTTP CONNECT
+// (TCP) or connect-udp (UDP), using hostnames or literal IP destinations.
 //
 // Demo (as root, with connect-proxy running on the other end):
 //

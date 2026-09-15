@@ -9,14 +9,13 @@ glance:
 1. The sandboxed agent has no network. Its launcher (`tun2connect run`)
    terminates the sandbox's TCP in userspace and delivers every flow
    here, over a Unix Domain Socket, as an HTTP CONNECT request naming its
-   destination in the authority (`CONNECT api.example.com:443`) -- a
-   *name*, never a resolved IP, because the launcher's virtual DNS never
-   resolves it away.
+    destination in the authority (`CONNECT api.example.com:443`). A known
+    DNS mapping preserves the name; otherwise the adapter sends an IP address.
 2. Policy is deny-by-default on that name. Anything not on the allow-list
    is refused with `403 Forbidden` and a `Boundary-Reason` header, which
    the guest stack turns into an ordinary ECONNREFUSED -- and the attempt
-   is logged. IP literals are refused the same way: policy reasons about
-   names, so a flow that arrives without one was never authorized.
+    is logged. This demo's sample policy denies IP literals. The Go reference
+    boundary supports explicit address and CIDR allowlists.
 3. Every flow -- relayed, injected, answered, or refused -- is written to
    an audit log, the auditing/DLP hook called out in the spec's TLS
    inspection models.
@@ -504,8 +503,7 @@ def handle(client_sock: socket.socket) -> None:
 
     target = f"{host}:{port}"
     if not is_name:
-        # Policy reasons about names. A literal address means the agent
-        # bypassed the resolver, so there is no name to authorize.
+        # This demo's sample policy permits hostnames only.
         audit("BLOCK-IP-LITERAL", target)
         refuse(client_sock, "ip-literal")
         return

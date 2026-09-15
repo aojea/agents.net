@@ -8,6 +8,9 @@ import (
 	"net"
 	"net/http"
 	"testing"
+	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // fakeBoundary runs handler as the boundary side of a fresh pipe per dial.
@@ -131,5 +134,39 @@ func TestDialUDPRefusalIsDialError(t *testing.T) {
 	}
 	if de.Reason != "udp-not-allowed" {
 		t.Fatalf("refusal not preserved: %+v", de)
+	}
+}
+
+func TestIPv6UDPWireEncoding(t *testing.T) {
+	for _, protocol := range []string{"h1", "h2"} {
+		t.Run(protocol, func(t *testing.T) {
+			paths := make(chan string, 1)
+			var client Dialer = fakeBoundary(func(request *http.Request, reader *bufio.Reader, conn net.Conn) {
+				paths <- request.URL.EscapedPath()
+				io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n")
+			})
+			if protocol == "h2" {
+				client = &BoundaryClientH2{DialBoundary: func(ctx context.Context) (net.Conn, error) {
+					client, server := net.Pipe()
+					t.Cleanup(func() { client.Close(); server.Close() })
+					go new(http2.Server).ServeConn(server, &http2.ServeConnOpts{Handler: http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+						paths <- request.URL.EscapedPath()
+						writer.Header().Set("Capsule-Protocol", "?1")
+						writer.WriteHeader(http.StatusOK)
+					})})
+					return client, nil
+				}}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			session, err := client.DialUDP(ctx, "2001:db8::10", 443)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer session.Close()
+			if path := <-paths; path != "/.well-known/masque/udp/2001%3Adb8%3A%3A10/443/" {
+				t.Fatalf("IPv6 URI template expansion = %q", path)
+			}
+		})
 	}
 }

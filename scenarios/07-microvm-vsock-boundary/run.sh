@@ -46,18 +46,20 @@ trap cleanup EXIT
 sleep 0.5
 
 echo "=== Horizon 2 (MicroVM VSOCK Boundary): Measuring Conntrack Delta ==="
-CONNTRACK_BEFORE=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+CONNTRACK_BEFORE=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_BEFORE=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
 
 echo "=== Horizon 2 (MicroVM VSOCK Boundary): Real curl HTTPS Benchmark (5 rounds x 20 requests = 100 flows) ==="
 # Inside the guest capsule (isolated namespace), run vsock-forwarder and curl benchmark
-BENCH_OUTPUT=$(unshare -m -n -r bash -c "
+unshare -m -n -r bash -c "
+  set -e
   ip link set lo up
   # Start guest boundary forwarder (listens on 127.0.0.1:18080 and dials host AF_VSOCK)
   ${FWD_BIN} -listen 127.0.0.1:18080 -vsock 1:${VSOCK_PORT} > ${RUN_DIR}/fwd.log 2>&1 &
   FWD_PID=\$!
+  trap 'kill \${FWD_PID} 2>/dev/null || true' EXIT
   sleep 0.3
 
   python3 ${REPO_ROOT}/scenarios/common/benchmark_client.py \
@@ -68,16 +70,16 @@ BENCH_OUTPUT=$(unshare -m -n -r bash -c "
     --throughput-url 'https://test.example.com:${TARGET_PORT}/stream?mb=50' \
     --throughput-trials 3
 
-  kill \${FWD_PID} 2>/dev/null || true
-")
+"
 
-echo "${BENCH_OUTPUT}"
-
-CONNTRACK_AFTER=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+CONNTRACK_AFTER=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_AFTER=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
-CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+CONNTRACK_DELTA=unknown
+if [[ "${CONNTRACK_BEFORE}" != unknown && "${CONNTRACK_AFTER}" != unknown ]]; then
+    CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+fi
 echo "CONNTRACK_DELTA=${CONNTRACK_DELTA}"
 
 echo "HOST_IPAM_ALLOCATED=0"

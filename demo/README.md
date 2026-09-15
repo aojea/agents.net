@@ -120,16 +120,23 @@ file demo/tun2connect | grep "statically linked"
 
 ## Lab 4: Understand and Start the Host Boundary
 
-[host_proxy.py](host_proxy.py) is the entire enforcement point: a minimal HTTP `CONNECT` proxy (RFC 9110 section 9.3.6 -- [the spec's standard wire](../README.md#21-egress-boundary-interface-enforced)) on a Unix Domain Socket. Every TCP connection the sandbox makes arrives here as one tunnel request whose destination is a **name** -- the launcher's virtual DNS never resolves it away -- and gets one policy decision:
+[host_proxy.py](host_proxy.py) is the demo enforcement point: an HTTP CONNECT
+proxy on a Unix Domain Socket. Requests carry a hostname when the adapter has a
+DNS mapping, or an IP address otherwise. This demo allows the hostnames in the
+following tiers:
 
 | Tier | Example hosts | What happens | Configured via |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | **Fake-response** | `example.com` | Never forwarded. TLS terminated locally with the demo CA; a canned success body is returned. | `FAKE_RESPONSE_HOSTS` (hardcoded to the demo's task target) |
 | **Local-provider** | `ollama` (symbolic) | No TLS termination, no credential. A plain byte relay from the sandbox's symbolic hostname to a real `host:port` on the operator's own machine -- the sandbox can never resolve or route to it on its own. | `AGENT_PROXY_LOCAL_PROVIDERS="symbolic=host:port,..."` (default `ollama=127.0.0.1:11434`) |
 | **Passthrough** | `registry.npmjs.org` | No TLS termination, no injection -- a plain byte-for-byte relay straight to the real host. Used for a harness's own housekeeping (package installs, update checks, telemetry) that carries no secret. | `AGENT_PROXY_PASSTHROUGH="host,host,..."` (default `registry.npmjs.org`) |
 | **Credential-inject**, opt-in | `api.openai.com` | TLS terminated locally, the agent's `Authorization` header (empty, placeholder, or garbage) is stripped and replaced with the real `Bearer <token>`, then genuinely relayed upstream with the real system trust store. Empty/unconfigured by default -- see the cloud-migration section at the end of this tutorial. | `AGENT_PROXY_TOKENS="host=ENV_VAR_NAME,..."` |
 
-Anything not on any of the four lists is **refused with `403 Forbidden` and a `Boundary-Reason` header** and logged. In the guest that surfaces as an immediate, ordinary connection failure -- refused at `connect()`, or reset on first use, depending on the guest stack's timing -- instead of a silent hang. IP-literal destinations are refused the same way: policy reasons about names, and a flow that arrives without one was never authorized.
+Anything not on the four lists is refused with `403 Forbidden` and a
+`Boundary-Reason` header and logged. The guest sees a connection failure. This
+demo policy denies IP literals; that is not a protocol or adapter restriction.
+The [Go boundary](../tun2connect/cmd/connect-proxy/main.go) accepts explicitly
+authorized addresses and CIDRs through `-allow-ip`.
 
 Start the boundary on the host. For the local-only demo in this tutorial, no credentials are needed at all:
 
@@ -139,7 +146,7 @@ python3 demo/host_proxy.py
 
 **Verify** -- the startup banner should show all four allow-lists:
 
-```
+```text
 [*] Host Boundary (HTTP CONNECT) listening on: /tmp/agent-sockets/egress-proxy.sock
 [*] Fake-response allow-list: ['example.com', 'httpbin.org']
 [*] Local-provider allow-list: {'ollama': ('127.0.0.1', 11434)}
@@ -196,7 +203,7 @@ tail -f /tmp/agent-proxy-audit.log
 
 A representative run looks like this:
 
-```
+```text
 2026-08-25T14:20:12.301442+00:00 ALLOW-LOCAL ollama:11434
 2026-08-25T14:20:14.887210+00:00 ALLOW-FAKE example.com:443
 2026-08-25T14:20:15.104332+00:00 BLOCK secret-vault.example:443
@@ -252,9 +259,12 @@ AGENT_PROXY_TOKENS="api.openai.com=OPENAI_API_KEY" python3 demo/host_proxy.py
 
 The startup banner now shows the host with a non-secret fingerprint (`sha256:...`), and `ALLOW-INJECT` audit lines carry that fingerprint so an operator can confirm a rotation took effect without the log ever holding a secret. The sandboxed agent can send an empty, placeholder, or garbage `Authorization` header -- the boundary strips it and injects the real one, and the real credential's blast radius shrinks to "whatever this one boundary process was handed."
 
-## Bonus: Other Boundaries on the Same Wire -- connect-proxy and a Mesh Dataplane
+## Implementation Examples
 
-Everything above crossed the boundary as HTTP `CONNECT` -- [the spec's standard wire](../README.md#21-egress-boundary-interface-enforced), the tunnel primitive cloud native already converged on. The payoff is pluggability: `host_proxy.py` is just one boundary; the role can be filled by any CONNECT-terminating dataplane with no change to the sandbox. Three labs, each independently runnable.
+The [specification](../README.md#21-egress-boundary-interface-enforced) uses HTTP
+CONNECT between the guest adapter and the boundary. The following examples use
+different implementations of that interface. Each deployment still needs its
+own channel access controls, workload identity, and destination policy.
 
 ### Lab A: the reference boundary, no root required
 
@@ -270,16 +280,20 @@ curl --proxy http://127.0.0.1:18080 https://evil.example                        
 
 The audit log mirrors Lab 7's, decided on the same policy input -- the name in the CONNECT authority:
 
-```
+```text
 ALLOW tcp example.com:443
 BLOCK not-on-allowlist evil.example:443
 ```
 
-`-h2` switches to ONE multiplexed HTTP/2 session carrying every flow as a stream (the shape Istio's HBONE uses); `-udp` serves `connect-udp` (RFC 9298) so UDP gets a named, policy-checked path too.
+`-h2` enables HTTP/2 CONNECT streams; `-udp` enables UDP proxying using
+`connect-udp` (RFC 9298).
 
-### Lab B: an unmodified Envoy as the boundary
+### Lab B: Envoy CONNECT Example
 
-The pluggability claim, tested rather than argued -- Envoy is the dataplane inside Istio sidecars and waypoints and under kgateway, and it terminates both stages of the wire natively with [examples/envoy-boundary.yaml](../tun2connect/examples/envoy-boundary.yaml):
+The [example configuration](../tun2connect/examples/envoy-boundary.yaml) enables
+HTTP/1.1 and HTTP/2 TCP CONNECT in Envoy. It listens on loopback and has no
+workload authorization policy. This is a transport interoperability example,
+not a production boundary configuration.
 
 ```bash
 docker run -d --name envoy-connect --network host \
@@ -292,22 +306,33 @@ curl --proxy http://127.0.0.1:10000 https://example.com -o /dev/null -w '%{http_
 curl -s 127.0.0.1:19901/stats | grep downstream_cx_upgrades_total
 ```
 
-Port `10001` serves the same CONNECT semantics over HTTP/2 prior knowledge, which `BoundaryClientH2` (and any HBONE-shaped client) consumes. Swap `connect-proxy` for Envoy and the tun2connect engine cannot tell the difference -- that interchangeability is what the standard buys.
+Port `10001` accepts HTTP/2 CONNECT with prior knowledge. The
+[interop test](../tun2connect/test_envoy.sh) exercises both listeners with the
+repository's clients. It does not test UDP, IPC transports, workload identity,
+or gateway controllers that configure Envoy.
 
-### Lab C: identity on the wire -- where SPIFFE fits
+### Lab C: Workload Certificates
 
-On the mTLS tier the sandbox's identity is its **client certificate**, presented under the same h2 session. Service meshes assert identity as a [SPIFFE](https://spiffe.io) ID -- a URI SAN such as `spiffe://cluster.local/ns/sandbox/sa/agent-123`, minted per-workload by the mesh CA -- and a mesh-joined boundary authenticates sandboxes exactly that way. The tooling is deliberately PKI-agnostic: `connect-proxy -tls-cert ... -tls-key ... -tls-client-ca ca.pem` REQUIRES a verified client certificate and audits whatever it asserts (first URI SAN, else DNS SAN, else CN):
+The boundary channel can use mTLS. For example,
+`connect-proxy -h2 -tls-cert ... -tls-key ... -tls-client-ca ca.pem` requires a
+verified client certificate and records its identity in the audit log. A
+[SPIFFE](https://spiffe.io) URI is one possible certificate identity:
 
-```
+```text
 ALLOW tcp/h2 api.example.com:443 peer=spiffe://cluster.local/ns/sandbox/sa/agent-123
 ```
 
-The same line works with `peer=sandbox://tenant-a/agent-123` from a homegrown CA -- the unit tests use exactly that non-SPIFFE URI on purpose. Identity rides the session's certificates, not the protocol, so joining a mesh later changes the PKI, never the wire. With mesh-issued certificates this arrangement *is* HBONE.
+Other certificate identities are supported; the tests use
+`sandbox://tenant-a/agent-123`. The reference proxy records the identity but
+still uses a global destination allowlist. Identity-based authorization is
+separate work. Using HTTP/2 and mTLS alone does not validate interoperability
+with a service mesh.
 
 ## Troubleshooting
 
 **The agent gets `Connection refused` for hosts you didn't expect**
 This is the ACL working as designed -- check the audit log for the matching `BLOCK` line. Two options, both valid:
+
 - Leave it refused. This is the "unexpected-egress visibility" the architecture is meant to provide.
 - Add the host to `AGENT_PROXY_PASSTHROUGH` (comma-separated) when starting `host_proxy.py`.
 
@@ -338,6 +363,7 @@ Run unit tests and the end-to-end sandbox presubmit test locally:
 ```
 
 This automated suite runs:
+
 1. Python unit tests for `host_proxy.py` (CONNECT codec, dispatch, tier behavior, refusals).
 2. Certificate generation (`gen_certs.sh`).
 3. Launcher build (`tun2connect`) and container build.

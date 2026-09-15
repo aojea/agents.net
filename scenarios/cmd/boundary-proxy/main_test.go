@@ -2,14 +2,18 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestVsockAddr(t *testing.T) {
@@ -19,6 +23,75 @@ func TestVsockAddr(t *testing.T) {
 	}
 	if addr.String() != "1:10088" {
 		t.Errorf("expected '1:10088', got %q", addr.String())
+	}
+}
+
+func TestBoundaryProxyIgnoresForgedIdentity(t *testing.T) {
+	originalHosts, originalAll, originalRewrites, originalLogger := allowedHosts, allowAll, rewrites, auditLogger
+	t.Cleanup(func() {
+		allowedHosts, allowAll, rewrites, auditLogger = originalHosts, originalAll, originalRewrites, originalLogger
+	})
+	upstream := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		writer.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+	allowedHosts = map[string]bool{"allowed.test": true}
+	allowAll = false
+	rewrites = map[string]string{"allowed.test": upstream.Listener.Addr().String()}
+	var auditBuffer bytes.Buffer
+	auditLogger = log.New(&auditBuffer, "", 0)
+	listener, err := net.Listen("unix", filepath.Join(t.TempDir(), "boundary.sock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	for _, test := range []struct {
+		target string
+		status int
+		action string
+	}{
+		{"allowed.test:80", http.StatusOK, "ALLOW tcp"},
+		{"denied.test:80", http.StatusForbidden, "BLOCK not-on-allowlist"},
+	} {
+		t.Run(test.target, func(t *testing.T) {
+			auditBuffer.Reset()
+			client, err := net.Dial("unix", listener.Addr().String())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer client.Close()
+			client.SetDeadline(time.Now().Add(3 * time.Second))
+			server, err := listener.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan struct{})
+			go func() {
+				handleConnection(server)
+				close(done)
+			}()
+			fmt.Fprintf(client, "CONNECT %s HTTP/1.1\r\nHost: %s\r\nX-Capsule-ID: forged-admin\r\nSandbox-Id: forged-admin\r\nX-Dome-Tenant: forged-admin\r\n\r\n", test.target, test.target)
+			response, err := http.ReadResponse(bufio.NewReader(client), &http.Request{Method: http.MethodConnect})
+			client.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			response.Body.Close()
+			if response.StatusCode != test.status {
+				t.Fatalf("status = %d, want %d", response.StatusCode, test.status)
+			}
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Fatal("boundary did not close after client disconnect")
+			}
+			identity := fmt.Sprintf("capsule-pid-%d-uid-%d", os.Getpid(), os.Getuid())
+			expected := fmt.Sprintf("%s target=%s capsule=%s", test.action, test.target, identity)
+			if record := auditBuffer.String(); !strings.Contains(record, expected) || strings.Contains(record, "forged-admin") {
+				t.Fatalf("audit = %q, want kernel-derived identity in %q", record, expected)
+			}
+		})
 	}
 }
 

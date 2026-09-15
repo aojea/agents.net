@@ -19,10 +19,8 @@ import (
 )
 
 const (
-	nicID           = 1
-	maxInFlight     = 1024 // pending TCP forwarder requests
-	maxDatagramSize = 65535
-	dnsIdleTimeout  = 3 * time.Second
+	nicID       = 1
+	maxInFlight = 1024 // pending TCP forwarder requests
 )
 
 type Config struct {
@@ -42,12 +40,12 @@ type Config struct {
 	DialTimeout time.Duration
 }
 
-// Engine terminates guest TCP/IP and turns each flow into one named
-// tunnel dial. Flows whose destination has no virtual-DNS mapping are
-// refused: an address the guest never resolved has no name to authorize.
+// Engine terminates guest TCP/IP and tunnels each flow to the boundary,
+// preserving a DNS name when known and otherwise using the destination IP.
 type Engine struct {
-	cfg   Config
-	stack *stack.Stack
+	cfg       Config
+	stack     *stack.Stack
+	forwarder *Forwarder
 }
 
 func New(cfg Config) (*Engine, error) {
@@ -65,7 +63,12 @@ func New(cfg Config) (*Engine, error) {
 		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, ipv6.NewProtocol},
 		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
 	})
-	e := &Engine{cfg: cfg, stack: s}
+	e := &Engine{cfg: cfg, stack: s, forwarder: &Forwarder{
+		Dialer:         cfg.Dialer,
+		DNS:            cfg.DNS,
+		DialTimeout:    cfg.DialTimeout,
+		UDPIdleTimeout: cfg.UDPIdleTimeout,
+	}}
 
 	sack := tcpip.TCPSACKEnabled(true)
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack); err != nil {
@@ -112,17 +115,12 @@ func (e *Engine) handleTCP(r *tcp.ForwarderRequest) {
 		r.Complete(true)
 		return
 	}
-	name, ok := e.cfg.DNS.Reverse(dst)
-	if !ok {
-		r.Complete(true) // no name, never authorized: RST -> ECONNREFUSED
-		return
-	}
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), e.cfg.DialTimeout)
 		defer cancel()
 		// Dial before completing the guest handshake so a boundary
 		// refusal surfaces as a connect() failure, not a later reset.
-		upstream, err := e.cfg.Dialer.DialTCP(ctx, name, id.LocalPort)
+		upstream, err := e.forwarder.DialTCP(ctx, netip.AddrPortFrom(dst, id.LocalPort))
 		if err != nil {
 			r.Complete(true)
 			return
@@ -135,7 +133,7 @@ func (e *Engine) handleTCP(r *tcp.ForwarderRequest) {
 			return
 		}
 		r.Complete(false)
-		relay(gonet.NewTCPConn(&wq, ep), upstream)
+		e.forwarder.RelayTCP(context.Background(), gonet.NewTCPConn(&wq, ep), upstream)
 	}()
 }
 
@@ -147,7 +145,7 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) bool {
 		if err != nil {
 			return false
 		}
-		go e.serveDNS(gonet.NewUDPConn(&wq, ep))
+		go e.forwarder.ServeDNS(context.Background(), gonet.NewUDPConn(&wq, ep))
 		return true
 	}
 	// Unhandled requests get an ICMP port unreachable from the stack:
@@ -159,10 +157,6 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) bool {
 	if !ok {
 		return false
 	}
-	name, ok := e.cfg.DNS.Reverse(dst)
-	if !ok {
-		return false // no name, never authorized
-	}
 	var wq waiter.Queue
 	ep, err := r.CreateEndpoint(&wq)
 	if err != nil {
@@ -172,66 +166,12 @@ func (e *Engine) handleUDP(r *udp.ForwarderRequest) bool {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), e.cfg.DialTimeout)
 		defer cancel()
-		sess, err := e.cfg.Dialer.DialUDP(ctx, name, id.LocalPort)
+		sess, err := e.forwarder.DialUDP(ctx, netip.AddrPortFrom(dst, id.LocalPort))
 		if err != nil {
 			guest.Close()
 			return
 		}
-		e.tunnelUDP(guest, sess)
+		e.forwarder.RelayUDP(context.Background(), guest, sess)
 	}()
 	return true
-}
-
-// tunnelUDP pumps one UDP session until the guest goes idle or either
-// side fails; the session's end is what delimits its audit record.
-func (e *Engine) tunnelUDP(guest *gonet.UDPConn, sess DatagramConn) {
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		buf := make([]byte, maxDatagramSize)
-		for {
-			guest.SetReadDeadline(time.Now().Add(e.cfg.UDPIdleTimeout))
-			n, err := guest.Read(buf)
-			if err != nil {
-				return
-			}
-			if sess.WriteDatagram(buf[:n]) != nil {
-				return
-			}
-		}
-	}()
-	go func() {
-		for {
-			p, err := sess.ReadDatagram()
-			if err != nil {
-				guest.Close()
-				return
-			}
-			if _, err := guest.Write(p); err != nil {
-				return
-			}
-		}
-	}()
-	<-done
-	sess.Close()
-	guest.Close()
-}
-
-func (e *Engine) serveDNS(conn *gonet.UDPConn) {
-	defer conn.Close()
-	buf := make([]byte, 1500)
-	for {
-		conn.SetReadDeadline(time.Now().Add(dnsIdleTimeout))
-		n, err := conn.Read(buf)
-		if err != nil {
-			return
-		}
-		resp, err := e.cfg.DNS.HandleQuery(buf[:n])
-		if err != nil {
-			continue // unparseable query: drop, never forward
-		}
-		if _, err := conn.Write(resp); err != nil {
-			return
-		}
-	}
 }

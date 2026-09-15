@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 )
 
 // BoundaryClient dials tunnels over HTTP/1.1, one boundary connection
@@ -59,7 +60,7 @@ func (c *BoundaryClient) roundTrip(ctx context.Context, req *http.Request) (net.
 	return conn, br, resp, nil
 }
 
-// DialTCP opens `CONNECT name:port` and returns the raw tunnel.
+// DialTCP opens CONNECT to a hostname or IP address and returns the raw tunnel.
 func (c *BoundaryClient) DialTCP(ctx context.Context, name string, port uint16) (net.Conn, error) {
 	hostport := net.JoinHostPort(name, strconv.Itoa(int(port)))
 	req := &http.Request{
@@ -84,12 +85,7 @@ func (c *BoundaryClient) DialTCP(ctx context.Context, name string, port uint16) 
 func (c *BoundaryClient) DialUDP(ctx context.Context, name string, port uint16) (DatagramConn, error) {
 	req := &http.Request{
 		Method: http.MethodGet,
-		URL: &url.URL{
-			Scheme: "http",
-			Host:   c.authority(),
-			// The default connect-udp URI template (RFC 9298 section 2).
-			Path: fmt.Sprintf("/.well-known/masque/udp/%s/%d/", url.PathEscape(name), port),
-		},
+		URL:    udpProxyURL(c.authority(), name, port),
 		Host:   c.authority(),
 		Header: make(http.Header),
 	}
@@ -105,6 +101,16 @@ func (c *BoundaryClient) DialUDP(ctx context.Context, name string, port uint16) 
 		return nil, refusal(resp)
 	}
 	return &capsuleConn{CapsuleStream: NewCapsuleStream(&bufConn{Conn: conn, br: br}), conn: conn}, nil
+}
+
+func udpProxyURL(authority, host string, port uint16) *url.URL {
+	encodedHost := strings.ReplaceAll(url.PathEscape(host), ":", "%3A")
+	return &url.URL{
+		Scheme:  "http",
+		Host:    authority,
+		Path:    fmt.Sprintf("/.well-known/masque/udp/%s/%d/", host, port),
+		RawPath: fmt.Sprintf("/.well-known/masque/udp/%s/%d/", encodedHost, port),
+	}
 }
 
 func refusal(resp *http.Response) error {

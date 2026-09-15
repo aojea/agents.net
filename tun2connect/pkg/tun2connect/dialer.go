@@ -6,11 +6,11 @@ import (
 	"net"
 )
 
-// Dialer opens one tunnel per guest flow. The destination is always a
-// name recovered from the virtual DNS, never an IP literal.
+// Dialer opens one tunnel per guest flow. The destination is a hostname
+// recovered from virtual DNS, or an IP literal when no mapping exists.
 type Dialer interface {
-	DialTCP(ctx context.Context, name string, port uint16) (net.Conn, error)
-	DialUDP(ctx context.Context, name string, port uint16) (DatagramConn, error)
+	DialTCP(ctx context.Context, host string, port uint16) (net.Conn, error)
+	DialUDP(ctx context.Context, host string, port uint16) (DatagramConn, error)
 }
 
 // DatagramConn is one authorized UDP session. Datagram boundaries are

@@ -1,7 +1,7 @@
 import argparse
+import json
 import subprocess
 import sys
-import time
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -13,16 +13,17 @@ def parse_args():
     p.add_argument("--warmup", type=int, default=3)
     p.add_argument("--throughput-url", default="")
     p.add_argument("--throughput-trials", type=int, default=2)
-    return p.parse_args()
+    args = p.parse_args()
+    if args.rounds < 1 or args.requests < 1 or args.warmup < 0 or args.throughput_trials < 1:
+        p.error("rounds, requests, and throughput-trials must be positive; warmup must be nonnegative")
+    return args
 
 def run_curl(url, cacert="", proxy=""):
-    cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{time_namelookup} %{time_connect} %{time_appconnect} %{time_total} %{http_code}\n"]
+    cmd = ["curl", "-q", "-sS", "--fail", "--connect-timeout", "10", "--max-time", "60", "--noproxy", "", "--proxy", proxy, "-o", "/dev/null", "-w", "%{time_namelookup} %{time_connect} %{time_appconnect} %{time_total} %{http_code}\n"]
     if cacert:
         cmd.extend(["--cacert", cacert])
-    if proxy:
-        cmd.extend(["-x", proxy])
     cmd.append(url)
-    res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=65)
     parts = res.stdout.strip().split()
     if len(parts) < 5:
         raise ValueError(f"unexpected curl output: {res.stdout}")
@@ -32,6 +33,8 @@ def run_curl(url, cacert="", proxy=""):
     return dns, tcp, tls, total
 
 def calc_stats(arr):
+    if not arr:
+        raise ValueError("at least one sample is required")
     arr = sorted(arr)
     n = len(arr)
     def p(pct):
@@ -57,19 +60,30 @@ def calc_stats(arr):
 
 def main():
     args = parse_args()
+    print("CLIENT_CONFIG=" + json.dumps(vars(args), sort_keys=True), flush=True)
+    version = subprocess.run(["curl", "--version"], capture_output=True, text=True, check=True, timeout=10)
+    print("CURL_VERSION=" + version.stdout.splitlines()[0], flush=True)
     for _ in range(args.warmup):
         try:
             run_curl(args.url, args.cacert, args.proxy)
-        except Exception:
-            pass
+        except (subprocess.SubprocessError, ValueError) as error:
+            print(f"WARMUP_FAILURE={error}", file=sys.stderr, flush=True)
 
     all_dns, all_tcp, all_tls, all_total = [], [], [], []
     rounds_p50 = []
 
     for r in range(args.rounds):
         r_totals = []
-        for _ in range(args.requests):
+        for request_index in range(args.requests):
             dns, tcp, tls, total = run_curl(args.url, args.cacert, args.proxy)
+            print("SAMPLE=" + json.dumps({
+                "round": r + 1,
+                "request": request_index + 1,
+                "namelookup_ms": dns,
+                "connect_ms": tcp,
+                "appconnect_ms": tls,
+                "total_ms": total,
+            }, sort_keys=True), flush=True)
             all_dns.append(dns)
             all_tcp.append(tcp)
             all_tls.append(tls)
@@ -110,14 +124,16 @@ def main():
     if args.throughput_url:
         tp_trials = []
         for i in range(args.throughput_trials):
-            cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{speed_download}\n"]
+            cmd = ["curl", "-q", "-sS", "--fail", "--connect-timeout", "10", "--max-time", "120", "--noproxy", "", "--proxy", args.proxy, "-o", "/dev/null", "-w", "%{speed_download} %{http_code} %{size_download}\n"]
             if args.cacert:
                 cmd.extend(["--cacert", args.cacert])
-            if args.proxy:
-                cmd.extend(["-x", args.proxy])
             cmd.append(args.throughput_url)
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-            bytes_sec = float(res.stdout.strip())
+            res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=125)
+            speed, status, size = res.stdout.split()
+            if int(status) != 200 or float(size) <= 0:
+                raise ValueError(f"invalid download: status={status}, bytes={size}")
+            bytes_sec = float(speed)
+            print("DOWNLOAD=" + json.dumps({"trial": i + 1, "bytes": float(size), "bytes_per_second": bytes_sec}), flush=True)
             mb_s = bytes_sec / (1024.0 * 1024.0)
             tp_trials.append(mb_s)
             print(f"TRIAL_{i+1}_THROUGHPUT_MB_S={mb_s:.2f}")

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test_vsock_cid.sh: Validates hardware-attested hypervisor Context ID (CID) mapping
+# test_vsock_cid.sh: Local VSOCK peer-address smoke test, not VM attestation.
 set -euo pipefail
 
 python3 -c "
@@ -57,5 +57,5 @@ print(f'Kernel Peer CID: {resolved_identity[\"kernel_peer_cid\"]}')
 print(f'Trusted Host Capsule ID: {resolved_identity[\"trusted_capsule_id\"]}')
 assert resolved_identity['trusted_capsule_id'] == 'capsule-microvm-cid-1'
 assert 'forged-guest-id' not in resp
-print('  [PASS] Hypervisor Context ID (CID) is cryptographically stamped by kernel; guest header spoofing neutralized')
+print('  [PASS] Local VSOCK peer CID is independent of request headers; no VM or attestation tested')
 "

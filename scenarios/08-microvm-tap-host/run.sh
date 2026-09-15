@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# 08-microvm-tap-host: Audit and analysis of Legacy MicroVM TAP in Host Root Netns
-# Demonstrates host pollution, privilege requirements, and security risks.
+# 08-microvm-tap-host: Host TAP creation permission probe; no VM is started.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -15,7 +14,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== Scenario 08: MicroVM TAP in Host Root Namespace (Legacy Architecture) ==="
+echo "=== Scenario 08: Host TAP Creation Permission Probe (No VM) ==="
 
 # 1. Audit Root Namespace Permissions
 echo "--- 1. Privilege & Capability Audit ---"
@@ -33,15 +32,12 @@ echo "CAPABILITY_STATUS=${CAP_STATUS}"
 
 # 2. Host Root Namespace Interface Pollution Analysis
 echo "--- 2. Host Root Namespace Interface Pollution Analysis ---"
-HOST_TAP_COUNT=$(ip link show type tap 2>/dev/null | wc -l || echo 0)
-echo "HOST_ROOT_NETNS_CURRENT_TAPS=${HOST_TAP_COUNT}"
-echo "HOST_ROOT_NETNS_POLLUTION_RISK=CRITICAL"
-echo "POLLUTION_FACTOR_PER_1000_VMS=1000 TAP devices + 1000 Host Routes + Netlink Broadcast Storms"
+echo "Host TUN/TAP inventory (not a scaling measurement):"
+ip tuntap show || true
 
 # 3. Security Boundary Summary
 echo "--- 3. Architectural Boundary Summary ---"
-echo "HORIZON=Out-of-Capsule (L2/L3 Host Root)"
-echo "HOST_IPAM_POLLUTION=HIGH (Allocates subnet and host routes on host root table)"
-echo "HOST_CONNTRACK_POLLUTION=HIGH (Every microvm flow tracked in host conntrack table)"
-echo "HOST_SECURITY_BOUNDARY=VIOLATED (Hypervisor requires full host root networking capabilities)"
-echo "=== MicroVM TAP Host: Audit Complete ==="
+echo "TOPOLOGY=Host TAP permission probe only"
+echo "SCALING_MEASURED=false"
+echo "SECURITY_ISOLATION_TESTED=false"
+echo "=== Host TAP Permission Probe Complete ==="

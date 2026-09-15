@@ -1,6 +1,6 @@
 // Command connect-proxy is a minimal reference boundary: CONNECT for
 // TCP and connect-udp (RFC 9298) for UDP, applying deny-by-default
-// policy on destination NAMES and writing one audit line per decision.
+// policy on destination names and IP addresses, with one audit line per decision.
 // -h2 switches from HTTP/1.1 (one connection per flow) to a single
 // multiplexed cleartext HTTP/2 session (prior knowledge, HBONE-shaped):
 // TCP flows are CONNECT streams, UDP sessions extended CONNECT streams.
@@ -17,6 +17,7 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -37,28 +38,93 @@ import (
 
 const dialTimeout = 15 * time.Second
 
+func boundaryTLSConfig(certPath, keyPath, clientCAPath string) (*tls.Config, error) {
+	if certPath == "" && keyPath == "" && clientCAPath == "" {
+		return nil, nil
+	}
+	if certPath == "" || keyPath == "" {
+		return nil, errors.New("TLS requires both -tls-cert and -tls-key; -tls-client-ca cannot be used without them")
+	}
+	cert, err := tls.LoadX509KeyPair(certPath, keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("load boundary certificate: %w", err)
+	}
+	config := &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cert},
+		NextProtos:   []string{"h2", "http/1.1"},
+	}
+	if clientCAPath != "" {
+		pem, err := os.ReadFile(clientCAPath)
+		if err != nil {
+			return nil, fmt.Errorf("load client CA: %w", err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("no CA certificates in %s", clientCAPath)
+		}
+		config.ClientCAs = pool
+		config.ClientAuth = tls.RequireAndVerifyClientCert
+	}
+	return config, nil
+}
+
 var (
-	allowAll  bool
-	allowed   = map[string]bool{}
-	enableUDP bool
+	allowAll   bool
+	allowed    = map[string]bool{}
+	allowedIPs []netip.Prefix
+	enableUDP  bool
 )
 
 func audit(decision, target string) {
 	log.Printf("%s %s", decision, target)
 }
 
-// authorize applies policy to a destination name. IP literals are
-// refused outright: policy reasons about names, and a flow that arrives
-// without one was never authorized.
+// authorize applies hostname policy or the explicit IP allowlist.
 func authorize(host string) (reason string, ok bool) {
 	host = strings.ToLower(host)
-	if _, err := netip.ParseAddr(host); err == nil {
-		return "ip-literal", false
+	if address, err := netip.ParseAddr(host); err == nil {
+		if address.Zone() != "" {
+			return "scoped-ip", false
+		}
+		for _, prefix := range allowedIPs {
+			if prefix.Contains(address.Unmap()) {
+				return "", true
+			}
+		}
+		return "ip-not-on-allowlist", false
 	}
 	if allowAll || allowed[host] {
 		return "", true
 	}
 	return "not-on-allowlist", false
+}
+
+func parseIPAllowlist(value string) ([]netip.Prefix, error) {
+	var prefixes []netip.Prefix
+	for _, entry := range strings.Split(value, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		if address, err := netip.ParseAddr(entry); err == nil && address.Zone() == "" {
+			address = address.Unmap()
+			prefixes = append(prefixes, netip.PrefixFrom(address, address.BitLen()))
+			continue
+		}
+		prefix, err := netip.ParsePrefix(entry)
+		if err != nil {
+			return nil, fmt.Errorf("invalid -allow-ip entry %q: %w", entry, err)
+		}
+		if prefix.Addr().Is4In6() {
+			if prefix.Bits() < 96 {
+				return nil, fmt.Errorf("invalid IPv4-mapped prefix %q", entry)
+			}
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
+		}
+		prefixes = append(prefixes, prefix.Masked())
+	}
+	return prefixes, nil
 }
 
 func refuse(conn net.Conn, reason string) {
@@ -162,6 +228,10 @@ func pumpUDP(cs *tun2connect.CapsuleStream, upstream net.Conn) {
 
 func serve(conn net.Conn) {
 	defer conn.Close()
+	if _, err := sessionPeer(conn); err != nil {
+		audit("TLS-FAIL", err.Error())
+		return
+	}
 	br := bufio.NewReader(conn)
 	req, err := http.ReadRequest(br)
 	if err != nil {
@@ -223,7 +293,9 @@ func sessionPeer(conn net.Conn) (string, error) {
 	if !ok {
 		return "", nil
 	}
-	if err := tc.HandshakeContext(context.Background()); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	if err := tc.HandshakeContext(ctx); err != nil {
 		return "", err
 	}
 	cs := tc.ConnectionState()
@@ -313,7 +385,8 @@ func serveH2(peer string) http.HandlerFunc {
 
 func main() {
 	listen := flag.String("listen", "unix:///tmp/boundary.sock", "listen address (unix:///path or tcp://host:port)")
-	allow := flag.String("allow", "", "comma-separated destination names to allow; '*' allows all (default: deny everything)")
+	allow := flag.String("allow", "", "comma-separated destination names to allow; '*' allows all names (default: deny everything)")
+	allowIP := flag.String("allow-ip", "", "comma-separated IP addresses or CIDRs to allow for literal destinations (default: deny IP literals)")
 	udp := flag.Bool("udp", false, "serve connect-udp tunnels")
 	h2 := flag.Bool("h2", false, "speak multiplexed cleartext HTTP/2 (prior knowledge) instead of HTTP/1.1")
 	tlsCert := flag.String("tls-cert", "", "PEM server certificate; enables TLS (with -h2: the HBONE-style mTLS+h2 arrangement)")
@@ -321,6 +394,15 @@ func main() {
 	clientCA := flag.String("tls-client-ca", "", "PEM CA bundle; when set, REQUIRE verified client certificates and audit their identity")
 	flag.Parse()
 	enableUDP = *udp
+	var err error
+	allowedIPs, err = parseIPAllowlist(*allowIP)
+	if err != nil {
+		log.Fatal(err)
+	}
+	tlsConfig, err := boundaryTLSConfig(*tlsCert, *tlsKey, *clientCA)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	// x/net's h2 server only advertises extended CONNECT (UDP over h2)
 	// under GODEBUG=http2xconnect=1 (golang/go#71128), read at init --
@@ -362,30 +444,10 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if *tlsCert != "" {
-		cert, err := tls.LoadX509KeyPair(*tlsCert, *tlsKey)
-		if err != nil {
-			log.Fatal(err)
-		}
-		cfg := &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			NextProtos:   []string{"h2", "http/1.1"},
-		}
-		if *clientCA != "" {
-			pem, err := os.ReadFile(*clientCA)
-			if err != nil {
-				log.Fatal(err)
-			}
-			pool := x509.NewCertPool()
-			if !pool.AppendCertsFromPEM(pem) {
-				log.Fatalf("no CA certificates in %s", *clientCA)
-			}
-			cfg.ClientCAs = pool
-			cfg.ClientAuth = tls.RequireAndVerifyClientCert
-		}
-		ln = tls.NewListener(ln, cfg)
+	if tlsConfig != nil {
+		ln = tls.NewListener(ln, tlsConfig)
 	}
-	log.Printf("boundary listening on %s (allow=%q udp=%v h2=%v tls=%v mtls=%v)", *listen, *allow, *udp, *h2, *tlsCert != "", *clientCA != "")
+	log.Printf("boundary listening on %s (allow=%q allow-ip=%q udp=%v h2=%v tls=%v mtls=%v)", *listen, *allow, *allowIP, *udp, *h2, *tlsCert != "", *clientCA != "")
 
 	h2s := &http2.Server{}
 	for {

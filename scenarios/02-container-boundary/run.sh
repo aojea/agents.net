@@ -45,27 +45,28 @@ trap cleanup EXIT
 sleep 0.5
 
 echo "=== Horizon 2 (Boundary Intercept): Measuring Conntrack Delta ==="
-CONNTRACK_BEFORE=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+CONNTRACK_BEFORE=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_BEFORE=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
 
 echo "=== Horizon 2 (Boundary Intercept): Real curl HTTPS Benchmark (5 rounds x 20 requests = 100 flows) ==="
-BENCH_OUTPUT=$(python3 "${REPO_ROOT}/scenarios/common/benchmark_client.py" \
+python3 "${REPO_ROOT}/scenarios/common/benchmark_client.py" \
   --url "https://test.example.com:${TARGET_PORT}/ping" \
   --cacert "${RUN_DIR}/cert.pem" \
   --proxy "http://127.0.0.1:${PROXY_PORT}" \
   --rounds 5 --requests 20 --warmup 5 \
   --throughput-url "https://test.example.com:${TARGET_PORT}/stream?mb=50" \
-  --throughput-trials 3)
+  --throughput-trials 3
 
-echo "${BENCH_OUTPUT}"
-
-CONNTRACK_AFTER=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+CONNTRACK_AFTER=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_AFTER=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
-CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+CONNTRACK_DELTA=unknown
+if [[ "${CONNTRACK_BEFORE}" != unknown && "${CONNTRACK_AFTER}" != unknown ]]; then
+    CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+fi
 echo "CONNTRACK_DELTA=${CONNTRACK_DELTA}"
 echo "HOST_IPAM_ALLOCATED=0"
 echo "=== Horizon 2: Verification Complete ==="

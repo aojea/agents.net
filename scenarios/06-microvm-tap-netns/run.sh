@@ -41,14 +41,14 @@ HOST_TAP_COUNT=$(ip link show type tap 2>/dev/null | wc -l || echo 0)
 echo "HOST_ROOT_NETNS_TAP_DEVICES=${HOST_TAP_COUNT} (Must be 0 to avoid polluting host)"
 
 echo "=== Horizon 1 (MicroVM TAP Netns): Measuring Conntrack Delta ==="
-CONNTRACK_BEFORE=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+CONNTRACK_BEFORE=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_BEFORE=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
 
 echo "=== Horizon 1 (MicroVM TAP Netns): Real curl HTTPS Benchmark (5 rounds x 20 requests = 100 flows) ==="
 # Inside the dedicated netns, create tap0 and route to gateway
-BENCH_OUTPUT=$(docker run --rm \
+docker run --rm \
   --cap-add NET_ADMIN --device /dev/net/tun \
   --add-host test.example.com:${HOST_GATEWAY_IP} \
   -v "${RUN_DIR}:/var/run/agents.net" \
@@ -64,15 +64,16 @@ BENCH_OUTPUT=$(docker run --rm \
       --rounds 5 --requests 20 --warmup 5 \
       --throughput-url "https://test.example.com:'"${TARGET_PORT}"'/stream?mb=50" \
       --throughput-trials 3
-')
+    '
 
-echo "${BENCH_OUTPUT}"
-
-CONNTRACK_AFTER=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+CONNTRACK_AFTER=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_AFTER=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
-CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+CONNTRACK_DELTA=unknown
+if [[ "${CONNTRACK_BEFORE}" != unknown && "${CONNTRACK_AFTER}" != unknown ]]; then
+    CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+fi
 echo "CONNTRACK_DELTA=${CONNTRACK_DELTA}"
 echo "HOST_IPAM_ALLOCATED=1 (Netns bridge IP)"
 

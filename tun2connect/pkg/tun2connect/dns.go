@@ -27,8 +27,8 @@ var ErrPoolExhausted = errors.New("tun2connect: synthetic address pool exhausted
 // VirtualDNS is the name-preservation contract. It never resolves
 // upstream: it invents one stable synthetic address per (name, family)
 // and remembers the pairing so the engine can recover the name at dial
-// time. A reverse miss means the guest used an address it never asked
-// for, which callers must treat as a policy event, not an error.
+// time. A reverse miss leaves the destination as an IP literal for
+// authorization at the boundary.
 type VirtualDNS struct {
 	mu      sync.Mutex
 	next4   netip.Addr

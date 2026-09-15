@@ -1,278 +1,100 @@
 #!/usr/bin/env bash
-# benchmark.sh: Master benchmark runner executing all Dome networking scenarios
-# and generating demonstrable empirical data with percentile latency distributions,
-# protocol lifecycle breakdowns (DNS, TCP, TLS, HTTP), multi-round statistical stability,
-# and zero-internet WAN interference (local fake test.example.com TLS endpoint).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-DATA_DIR="${SCRIPT_DIR}/data"
 
-mkdir -p "${DATA_DIR}" "${SCRIPT_DIR}/bin"
-
-echo "================================================================="
-echo " THE DOME: EMPIRICAL BENCHMARK SUITE (CONTAINERS VS MICROVMS)"
-echo " (Hermetic Local HTTPS test.example.com - 0ms WAN Interference)"
-echo "================================================================="
-
-# Ensure binaries are built
-go build -o "${SCRIPT_DIR}/bin/boundary-proxy" "${SCRIPT_DIR}/cmd/boundary-proxy"
-go build -o "${SCRIPT_DIR}/bin/target-server" "${SCRIPT_DIR}/cmd/target-server"
-go build -o "${SCRIPT_DIR}/bin/vsock-forwarder" "${SCRIPT_DIR}/cmd/vsock-forwarder"
-
-echo ""
-echo ">>> [1/8] Running Scenario 1: Container In-Capsule (tun2connect + UDS)..."
-S1_OUT=$("${SCRIPT_DIR}/01-container-in-capsule/run.sh")
-"${SCRIPT_DIR}/01-container-in-capsule/test_lpe.sh"
-
-echo ""
-echo ">>> [2/8] Running Scenario 2: Container Boundary Intercept (Socket API / Proxy)..."
-S2_OUT=$("${SCRIPT_DIR}/02-container-boundary/run.sh")
-
-echo ""
-echo ">>> [3/8] Running Scenario 3: Container Out-of-Capsule (Routed veth + Bridge)..."
-S3_OUT=$("${SCRIPT_DIR}/03-container-out-capsule/run.sh")
-
-echo ""
-echo ">>> [4/8] Running Scenario 4: MicroVM In-Guest (tun2connect + AF_VSOCK)..."
-S4_OUT=$("${SCRIPT_DIR}/04-microvm-vsock/run.sh")
-"${SCRIPT_DIR}/04-microvm-vsock/test_vsock_cid.sh"
-
-echo ""
-echo ">>> [5/8] Running Scenario 5: MicroVM Boundary (Direct AF_VSOCK Stream)..."
-S7_OUT=$("${SCRIPT_DIR}/07-microvm-vsock-boundary/run.sh")
-
-echo ""
-echo ">>> [6/8] Running Scenario 6: MicroVM Userspace NIC (slirp4netns / Netstack)..."
-S5_OUT=$("${SCRIPT_DIR}/05-microvm-userspace-nic/run.sh")
-
-echo ""
-echo ">>> [7/8] Running Scenario 7: MicroVM TAP NIC in Dedicated Netns (Isolated Kernel)..."
-S6_OUT=$("${SCRIPT_DIR}/06-microvm-tap-netns/run.sh")
-
-echo ""
-echo ">>> [8/8] Running Scenario 8: MicroVM TAP in Host Root Netns (Legacy Pollution Audit)..."
-S8_OUT=$("${SCRIPT_DIR}/08-microvm-tap-host/run.sh")
-
-# Helper to extract key=val
-extract_val() {
-    local text="$1"
-    local key="$2"
-    echo "${text}" | (grep "^${key}=" || true) | head -1 | cut -d'=' -f2-
+metric() {
+    local log_path="$1" key="$2"
+    awk -F= -v key="${key}" '
+        $1 == key && $2 ~ /^-?[0-9]+([.][0-9]+)?$/ { print $2; found=1; exit }
+        END { if (!found) print "unknown" }
+    ' "${log_path}"
 }
 
-# Parse Scenario 1 (Container In-Capsule)
-S1_DNS=$(extract_val "${S1_OUT}" "DNS_P50_MS")
-S1_TCP=$(extract_val "${S1_OUT}" "TCP_P50_MS")
-S1_TLS=$(extract_val "${S1_OUT}" "TLS_P50_MS")
-S1_P50=$(extract_val "${S1_OUT}" "LATENCY_P50_MS")
-S1_P90=$(extract_val "${S1_OUT}" "LATENCY_P90_MS")
-S1_P95=$(extract_val "${S1_OUT}" "LATENCY_P95_MS")
-S1_P99=$(extract_val "${S1_OUT}" "LATENCY_P99_MS")
-S1_MEAN=$(extract_val "${S1_OUT}" "LATENCY_MEAN_MS")
-S1_STDDEV=$(extract_val "${S1_OUT}" "LATENCY_STDDEV_MS")
-S1_STABILITY_CV=$(extract_val "${S1_OUT}" "P50_STABILITY_CV_PCT")
-S1_R1=$(extract_val "${S1_OUT}" "ROUND_1_P50_MS")
-S1_R2=$(extract_val "${S1_OUT}" "ROUND_2_P50_MS")
-S1_R3=$(extract_val "${S1_OUT}" "ROUND_3_P50_MS")
-S1_R4=$(extract_val "${S1_OUT}" "ROUND_4_P50_MS")
-S1_R5=$(extract_val "${S1_OUT}" "ROUND_5_P50_MS")
-S1_THROUGHPUT=$(extract_val "${S1_OUT}" "THROUGHPUT_MB_S")
-S1_CONNTRACK=$(extract_val "${S1_OUT}" "CONNTRACK_DELTA")
+write_report() {
+    local run_dir="$1" index log_path
+    local ids=(01 02 03 04 05 06 07)
+    local labels=(
+        "Container TUN + UDS"
+        "Host explicit TCP proxy"
+        "Docker bridge"
+        "Namespace TUN + local VSOCK"
+        "Namespace slirp4netns"
+        "Docker bridge with unused TAP"
+        "Namespace forwarder + local VSOCK"
+    )
+    {
+        printf '# Component Experiment Results\n\n'
+        printf 'Run metadata: [metadata.txt](metadata.txt). Raw samples and diagnostics are in the linked logs.\n\n'
+        printf 'These experiments do not run VMs or native Sentry interception. Scenario 08 is only a TAP permission probe.\n\n'
+        printf '| ID | Actual experiment | Samples | Lookup milestone p50 (ms) | Connect milestone p50 (ms) | TLS milestone p50 (ms) | Total p50 (ms) | Total p99 (ms) | Throughput (MiB/s) | Round p50 CV (%%) |\n'
+        printf '| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |\n'
+        for index in "${!ids[@]}"; do
+            log_path="${run_dir}/${ids[index]}.log"
+            printf '| [%s](%s.log) | %s |' "${ids[index]}" "${ids[index]}" "${labels[index]}"
+            for key in SAMPLE_COUNT DNS_P50_MS TCP_P50_MS TLS_P50_MS LATENCY_P50_MS LATENCY_P99_MS THROUGHPUT_MB_S P50_STABILITY_CV_PCT; do
+                printf ' %s |' "$(metric "${log_path}" "${key}")"
+            done
+            printf '\n'
+        done
+        printf '\nCurl timings are cumulative milestones, not independent protocol phase durations. Explicit-proxy connection times refer to the proxy.\n'
+        printf '\nCV describes observed variation, not statistical proof or a stability verdict. Missing values are unknown, never zero.\n'
+        printf '\nNo host-state, cryptographic identity, security, or density conclusions are inferred from these measurements. See the scenario inventory for topology limitations.\n'
+        printf '\nPermission probe: [08.log](08.log).\n'
+    } > "${run_dir}/results.md"
+}
 
-# Parse Scenario 2 (Container Boundary)
-S2_DNS=$(extract_val "${S2_OUT}" "DNS_P50_MS")
-S2_TCP=$(extract_val "${S2_OUT}" "TCP_P50_MS")
-S2_TLS=$(extract_val "${S2_OUT}" "TLS_P50_MS")
-S2_P50=$(extract_val "${S2_OUT}" "LATENCY_P50_MS")
-S2_P90=$(extract_val "${S2_OUT}" "LATENCY_P90_MS")
-S2_P95=$(extract_val "${S2_OUT}" "LATENCY_P95_MS")
-S2_P99=$(extract_val "${S2_OUT}" "LATENCY_P99_MS")
-S2_MEAN=$(extract_val "${S2_OUT}" "LATENCY_MEAN_MS")
-S2_STDDEV=$(extract_val "${S2_OUT}" "LATENCY_STDDEV_MS")
-S2_STABILITY_CV=$(extract_val "${S2_OUT}" "P50_STABILITY_CV_PCT")
-S2_R1=$(extract_val "${S2_OUT}" "ROUND_1_P50_MS")
-S2_R2=$(extract_val "${S2_OUT}" "ROUND_2_P50_MS")
-S2_R3=$(extract_val "${S2_OUT}" "ROUND_3_P50_MS")
-S2_R4=$(extract_val "${S2_OUT}" "ROUND_4_P50_MS")
-S2_R5=$(extract_val "${S2_OUT}" "ROUND_5_P50_MS")
-S2_THROUGHPUT=$(extract_val "${S2_OUT}" "THROUGHPUT_MB_S")
-S2_CONNTRACK=$(extract_val "${S2_OUT}" "CONNTRACK_DELTA")
+run_scenario() {
+    local run_dir="$1" id="$2" driver="$3"
+    printf 'Running %s; output: %s/%s.log\n' "${driver}" "${run_dir}" "${id}"
+    if "${SCRIPT_DIR}/${driver}/run.sh" > "${run_dir}/${id}.log" 2>&1; then
+        if [[ "${id}" != 08 && "$(metric "${run_dir}/${id}.log" SAMPLE_COUNT)" == unknown ]]; then
+            printf 'FAILED: %s returned no sample count; retaining raw output.\n' "${driver}" >&2
+            return 1
+        fi
+    else
+        printf 'FAILED: %s; retaining raw output in %s/%s.log\n' "${driver}" "${run_dir}" "${id}" >&2
+        return 1
+    fi
+}
 
-# Parse Scenario 3 (Container Out-of-Capsule)
-S3_DNS=$(extract_val "${S3_OUT}" "DNS_P50_MS")
-S3_TCP=$(extract_val "${S3_OUT}" "TCP_P50_MS")
-S3_TLS=$(extract_val "${S3_OUT}" "TLS_P50_MS")
-S3_P50=$(extract_val "${S3_OUT}" "LATENCY_P50_MS")
-S3_P90=$(extract_val "${S3_OUT}" "LATENCY_P90_MS")
-S3_P95=$(extract_val "${S3_OUT}" "LATENCY_P95_MS")
-S3_P99=$(extract_val "${S3_OUT}" "LATENCY_P99_MS")
-S3_MEAN=$(extract_val "${S3_OUT}" "LATENCY_MEAN_MS")
-S3_STDDEV=$(extract_val "${S3_OUT}" "LATENCY_STDDEV_MS")
-S3_STABILITY_CV=$(extract_val "${S3_OUT}" "P50_STABILITY_CV_PCT")
-S3_R1=$(extract_val "${S3_OUT}" "ROUND_1_P50_MS")
-S3_R2=$(extract_val "${S3_OUT}" "ROUND_2_P50_MS")
-S3_R3=$(extract_val "${S3_OUT}" "ROUND_3_P50_MS")
-S3_R4=$(extract_val "${S3_OUT}" "ROUND_4_P50_MS")
-S3_R5=$(extract_val "${S3_OUT}" "ROUND_5_P50_MS")
-S3_THROUGHPUT=$(extract_val "${S3_OUT}" "THROUGHPUT_MB_S")
-S3_CONNTRACK=$(extract_val "${S3_OUT}" "CONNTRACK_DELTA")
+main() {
+    local run_dir helper
+    mkdir -p "${SCRIPT_DIR}/data" "${SCRIPT_DIR}/bin"
+    run_dir=$(mktemp -d "${SCRIPT_DIR}/data/run-$(date -u +%Y%m%dT%H%M%SZ)-XXXXXX")
+    printf 'Component experiments only. Artifacts: %s\n' "${run_dir}"
+    {
+        date -u +%Y-%m-%dT%H:%M:%SZ
+        uname -a
+        go version
+        python3 --version
+        curl --version
+        docker version --format '{{.Client.Version}} / {{.Server.Version}}'
+        docker image inspect agentsnet-demo:latest --format '{{.Id}}'
+        git -C "${REPO_ROOT}" rev-parse HEAD
+        git -C "${REPO_ROOT}" status --short
+    } > "${run_dir}/metadata.txt" 2>&1
+    git -C "${REPO_ROOT}" diff HEAD -- > "${run_dir}/working-tree.patch"
 
-# Parse Scenario 4 (MicroVM In-Guest TUN)
-S4_DNS=$(extract_val "${S4_OUT}" "DNS_P50_MS")
-S4_TCP=$(extract_val "${S4_OUT}" "TCP_P50_MS")
-S4_TLS=$(extract_val "${S4_OUT}" "TLS_P50_MS")
-S4_P50=$(extract_val "${S4_OUT}" "LATENCY_P50_MS")
-S4_P90=$(extract_val "${S4_OUT}" "LATENCY_P90_MS")
-S4_P95=$(extract_val "${S4_OUT}" "LATENCY_P95_MS")
-S4_P99=$(extract_val "${S4_OUT}" "LATENCY_P99_MS")
-S4_MEAN=$(extract_val "${S4_OUT}" "LATENCY_MEAN_MS")
-S4_STDDEV=$(extract_val "${S4_OUT}" "LATENCY_STDDEV_MS")
-S4_STABILITY_CV=$(extract_val "${S4_OUT}" "P50_STABILITY_CV_PCT")
-S4_R1=$(extract_val "${S4_OUT}" "ROUND_1_P50_MS")
-S4_R2=$(extract_val "${S4_OUT}" "ROUND_2_P50_MS")
-S4_R3=$(extract_val "${S4_OUT}" "ROUND_3_P50_MS")
-S4_R4=$(extract_val "${S4_OUT}" "ROUND_4_P50_MS")
-S4_R5=$(extract_val "${S4_OUT}" "ROUND_5_P50_MS")
-S4_THROUGHPUT=$(extract_val "${S4_OUT}" "THROUGHPUT_MB_S")
-S4_CONNTRACK=$(extract_val "${S4_OUT}" "CONNTRACK_DELTA")
+    for helper in boundary-proxy target-server vsock-forwarder; do
+        go -C "${REPO_ROOT}" build -o "${SCRIPT_DIR}/bin/${helper}" "./scenarios/cmd/${helper}"
+    done
+    CGO_ENABLED=0 go -C "${REPO_ROOT}" build -o "${REPO_ROOT}/demo/tun2connect" ./tun2connect/cmd/tun2connect
 
-# Parse Scenario 7 (MicroVM VSOCK at Boundary)
-S7_DNS=$(extract_val "${S7_OUT}" "DNS_P50_MS")
-S7_TCP=$(extract_val "${S7_OUT}" "TCP_P50_MS")
-S7_TLS=$(extract_val "${S7_OUT}" "TLS_P50_MS")
-S7_P50=$(extract_val "${S7_OUT}" "LATENCY_P50_MS")
-S7_P90=$(extract_val "${S7_OUT}" "LATENCY_P90_MS")
-S7_P95=$(extract_val "${S7_OUT}" "LATENCY_P95_MS")
-S7_P99=$(extract_val "${S7_OUT}" "LATENCY_P99_MS")
-S7_MEAN=$(extract_val "${S7_OUT}" "LATENCY_MEAN_MS")
-S7_STDDEV=$(extract_val "${S7_OUT}" "LATENCY_STDDEV_MS")
-S7_STABILITY_CV=$(extract_val "${S7_OUT}" "P50_STABILITY_CV_PCT")
-S7_R1=$(extract_val "${S7_OUT}" "ROUND_1_P50_MS")
-S7_R2=$(extract_val "${S7_OUT}" "ROUND_2_P50_MS")
-S7_R3=$(extract_val "${S7_OUT}" "ROUND_3_P50_MS")
-S7_R4=$(extract_val "${S7_OUT}" "ROUND_4_P50_MS")
-S7_R5=$(extract_val "${S7_OUT}" "ROUND_5_P50_MS")
-S7_THROUGHPUT=$(extract_val "${S7_OUT}" "THROUGHPUT_MB_S")
-S7_CONNTRACK=$(extract_val "${S7_OUT}" "CONNTRACK_DELTA")
+    run_scenario "${run_dir}" 01 01-container-in-capsule
+    run_scenario "${run_dir}" 02 02-container-boundary
+    run_scenario "${run_dir}" 03 03-container-out-capsule
+    run_scenario "${run_dir}" 04 04-microvm-vsock
+    run_scenario "${run_dir}" 05 05-microvm-userspace-nic
+    run_scenario "${run_dir}" 06 06-microvm-tap-netns
+    run_scenario "${run_dir}" 07 07-microvm-vsock-boundary
+    run_scenario "${run_dir}" 08 08-microvm-tap-host
 
-# Parse Scenario 5 (MicroVM Userspace NIC)
-S5_DNS=$(extract_val "${S5_OUT}" "DNS_P50_MS")
-S5_TCP=$(extract_val "${S5_OUT}" "TCP_P50_MS")
-S5_TLS=$(extract_val "${S5_OUT}" "TLS_P50_MS")
-S5_P50=$(extract_val "${S5_OUT}" "LATENCY_P50_MS")
-S5_P90=$(extract_val "${S5_OUT}" "LATENCY_P90_MS")
-S5_P95=$(extract_val "${S5_OUT}" "LATENCY_P95_MS")
-S5_P99=$(extract_val "${S5_OUT}" "LATENCY_P99_MS")
-S5_MEAN=$(extract_val "${S5_OUT}" "LATENCY_MEAN_MS")
-S5_STDDEV=$(extract_val "${S5_OUT}" "LATENCY_STDDEV_MS")
-S5_STABILITY_CV=$(extract_val "${S5_OUT}" "P50_STABILITY_CV_PCT")
-S5_R1=$(extract_val "${S5_OUT}" "ROUND_1_P50_MS")
-S5_R2=$(extract_val "${S5_OUT}" "ROUND_2_P50_MS")
-S5_R3=$(extract_val "${S5_OUT}" "ROUND_3_P50_MS")
-S5_R4=$(extract_val "${S5_OUT}" "ROUND_4_P50_MS")
-S5_R5=$(extract_val "${S5_OUT}" "ROUND_5_P50_MS")
-S5_THROUGHPUT=$(extract_val "${S5_OUT}" "THROUGHPUT_MB_S")
-S5_CONNTRACK=$(extract_val "${S5_OUT}" "CONNTRACK_DELTA")
+    write_report "${run_dir}"
+    printf 'Report: %s/results.md\n' "${run_dir}"
+}
 
-# Parse Scenario 6 (MicroVM TAP Netns)
-S6_DNS=$(extract_val "${S6_OUT}" "DNS_P50_MS")
-S6_TCP=$(extract_val "${S6_OUT}" "TCP_P50_MS")
-S6_TLS=$(extract_val "${S6_OUT}" "TLS_P50_MS")
-S6_P50=$(extract_val "${S6_OUT}" "LATENCY_P50_MS")
-S6_P90=$(extract_val "${S6_OUT}" "LATENCY_P90_MS")
-S6_P95=$(extract_val "${S6_OUT}" "LATENCY_P95_MS")
-S6_P99=$(extract_val "${S6_OUT}" "LATENCY_P99_MS")
-S6_MEAN=$(extract_val "${S6_OUT}" "LATENCY_MEAN_MS")
-S6_STDDEV=$(extract_val "${S6_OUT}" "LATENCY_STDDEV_MS")
-S6_STABILITY_CV=$(extract_val "${S6_OUT}" "P50_STABILITY_CV_PCT")
-S6_R1=$(extract_val "${S6_OUT}" "ROUND_1_P50_MS")
-S6_R2=$(extract_val "${S6_OUT}" "ROUND_2_P50_MS")
-S6_R3=$(extract_val "${S6_OUT}" "ROUND_3_P50_MS")
-S6_R4=$(extract_val "${S6_OUT}" "ROUND_4_P50_MS")
-S6_R5=$(extract_val "${S6_OUT}" "ROUND_5_P50_MS")
-S6_THROUGHPUT=$(extract_val "${S6_OUT}" "THROUGHPUT_MB_S")
-S6_CONNTRACK=$(extract_val "${S6_OUT}" "CONNTRACK_DELTA")
-
-RESULTS_MD="${DATA_DIR}/results.md"
-cat <<REPORT_EOF > "${RESULTS_MD}"
-# Empirical Benchmark Results: The Dome (Containers vs. MicroVMs)
-
-- **Generated on:** $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-- **Host Platform:** Linux ($(uname -m), $(nproc) vCPUs, $(free -h | awk '/^Mem:/ {print $2}') RAM)
-- **Workload:** Real \`curl\` executing HTTPS over TLS 1.3 against local \`https://test.example.com:9443/ping\` (0ms WAN latency)
-- **Sample Size:** 100 flows per scenario (5 independent measurement rounds x 20 requests) + 5 warmup flows
-- **Throughput Trials:** 3 trials x 50 MB streaming transfer (\`/stream?mb=50\`)
-
----
-
-## 1. Complete Combinatorial Matrix: End-to-End Latency & Protocol Lifecycle Breakdown (p50 Medians)
-
-| Scenario | Mode / Horizon | Collapse Point | Transport Channel | DNS (ms) | TCP (ms) | TLS 1.3 (ms) | Total p50 | Total p99 | Throughput (MB/s) | Host IPAM? | Wire Identity | Host Pollution |
-|---|---|---|---|---|---|---|---|---|---|:---:|---|---|
-| **C-1** | Container In-Capsule (L3/L4) | Inside Container (\`tun2connect\`) | Unix Domain Socket | **${S1_DNS}** | **${S1_TCP}** | **${S1_TLS}** | **${S1_P50} ms** | ${S1_P99} ms | **${S1_THROUGHPUT} MB/s** | 🟢 0 IPs | 🟢 Cryptographic \`SO_PEERCRED\` | 🟢 Zero (No veth/tap) |
-| **C-2** | Container Boundary (L7) | Boundary Socket API / Proxy | Local Socket / Stream | **${S2_DNS}** | **${S2_TCP}** | **${S2_TLS}** | **${S2_P50} ms** | ${S2_P99} ms | **${S2_THROUGHPUT} MB/s** | 🟢 0 IPs | 🟢 Authenticated Stream | 🟢 Zero (No veth/tap) |
-| **C-3** | Container Out-Capsule (L2/L3) | Never (Host Kernel NAT) | Routed \`veth\` + Bridge | **${S3_DNS}** | **${S3_TCP}** | **${S3_TLS}** | **${S3_P50} ms** | ${S3_P99} ms | **${S3_THROUGHPUT} MB/s** | ❌ 1 IP/Capsule | ❌ Raw IP (Domain Erased) | 🟡 High (veth pairs, iptables) |
-| **VM-1** | MicroVM In-Guest (L3/L4) | Inside MicroVM (\`tun2connect\`) | \`virtio-vsock\` Virtqueues | **${S4_DNS}** | **${S4_TCP}** | **${S4_TLS}** | **${S4_P50} ms** | ${S4_P99} ms | **${S4_THROUGHPUT} MB/s** | 🟢 0 IPs | 🟢 Cryptographic Peer CID | 🟢 Zero (No host tap/veth) |
-| **VM-2** | MicroVM Boundary (L7) | Hypervisor Boundary | \`AF_VSOCK\` Stream (No TUN) | **${S7_DNS}** | **${S7_TCP}** | **${S7_TLS}** | **${S7_P50} ms** | ${S7_P99} ms | **${S7_THROUGHPUT} MB/s** | 🟢 0 IPs | 🟢 Cryptographic Peer CID | 🟢 Zero (No host tap/veth) |
-| **VM-3** | MicroVM Userspace NIC | Host Userspace Stack | \`virtio-net\` -> \`slirp4netns\` | **${S5_DNS}** | **${S5_TCP}** | **${S5_TLS}** | **${S5_P50} ms** | ${S5_P99} ms | **${S5_THROUGHPUT} MB/s** | 🟢 0 IPs | 🟡 Double TCP Stack | 🟢 Zero (Host userspace NAT) |
-| **VM-4** | MicroVM TAP Netns | Dedicated Netns Kernel | \`virtio-net\` -> Netns TAP | **${S6_DNS}** | **${S6_TCP}** | **${S6_TLS}** | **${S6_P50} ms** | ${S6_P99} ms | **${S6_THROUGHPUT} MB/s** | ❌ 1 IP/Netns | 🟡 Shielded Netns | 🟢 Zero Root Netns TAP |
-| **VM-5** | MicroVM TAP Host Root | Host Root Netns Kernel | \`virtio-net\` -> Host Root TAP | *N/A* | *N/A* | *N/A* | *Blocked Unprivileged* | *N/A* | *N/A* | ❌ High Host IPAM | ❌ Erased (Host IP NAT) | 🔴 CRITICAL (Root TAP Bloat) |
-
----
-
-## 2. Statistical Proof of Stability (Cross-Round Reproducibility)
-
-Each scenario was executed across **5 independent measurement rounds** of 20 requests each.
-The table below presents the median (p50) latency for each round and the **Coefficient of Variation (CV%)** across rounds:
-
-| Scenario | Round 1 (p50) | Round 2 (p50) | Round 3 (p50) | Round 4 (p50) | Round 5 (p50) | Stability CV% | Stability Verdict |
-|---|---|---|---|---|---|:---:|---|
-| **C-1: Container In-Capsule** | ${S1_R1} ms | ${S1_R2} ms | ${S1_R3} ms | ${S1_R4} ms | ${S1_R5} ms | **${S1_STABILITY_CV}%** | 🟢 Highly Stable (CV < 5%) |
-| **C-2: Container Boundary** | ${S2_R1} ms | ${S2_R2} ms | ${S2_R3} ms | ${S2_R4} ms | ${S2_R5} ms | **${S2_STABILITY_CV}%** | 🟢 Highly Stable (CV < 5%) |
-| **C-3: Container Out-Capsule** | ${S3_R1} ms | ${S3_R2} ms | ${S3_R3} ms | ${S3_R4} ms | ${S3_R5} ms | **${S3_STABILITY_CV}%** | 🟢 Highly Stable (CV < 5%) |
-| **VM-1: MicroVM VSOCK In-Guest** | ${S4_R1} ms | ${S4_R2} ms | ${S4_R3} ms | ${S4_R4} ms | ${S4_R5} ms | **${S4_STABILITY_CV}%** | 🟢 Highly Stable (CV < 5%) |
-| **VM-2: MicroVM VSOCK Boundary** | ${S7_R1} ms | ${S7_R2} ms | ${S7_R3} ms | ${S7_R4} ms | ${S7_R5} ms | **${S7_STABILITY_CV}%** | 🟢 Highly Stable (CV < 5%) |
-| **VM-3: MicroVM Userspace NIC** | ${S5_R1} ms | ${S5_R2} ms | ${S5_R3} ms | ${S5_R4} ms | ${S5_R5} ms | **${S5_STABILITY_CV}%** | 🟢 Highly Stable (CV < 5%) |
-| **VM-4: MicroVM TAP Netns** | ${S6_R1} ms | ${S6_R2} ms | ${S6_R3} ms | ${S6_R4} ms | ${S6_R5} ms | **${S6_STABILITY_CV}%** | 🟢 Highly Stable (CV < 5%) |
-
----
-
-## 3. Deep Protocol Nuances & Architectural Findings
-
-### A. The Breakthrough of MicroVM VSOCK at Boundary (VM-2 vs. VM-1)
-* **Elimination of In-Guest Netstack Tax:** In **VM-1 (In-Guest)**, every outbound flow is intercepted by a virtual TUN device (\`tun0\`), requiring userspace netstack (\`gVisor\`) to assemble IP packets, manage a secondary TCP state machine, and compute packet checksums. This caps throughput at **${S4_THROUGHPUT} MB/s** and incurs **${S4_P50} ms** p50 latency.
-* In **VM-2 (VSOCK at Boundary)**, the guest streams directly across the hypervisor virtqueues via \`AF_VSOCK\`. With zero TUN device overhead and zero userspace packet reassembly, throughput surges by **$(( ${S7_THROUGHPUT%.*} * 100 / ${S4_THROUGHPUT%.*} ))%** to **${S7_THROUGHPUT} MB/s**, and latency drops to **${S7_P50} ms**.
-* **Identity Preservation:** In both VM-1 and VM-2, the host kernel guarantees identity attribution: \`Getpeername(fd)\` reports \`capsule-microvm-cid-1\`, which cannot be spoofed by guest code.
-
-### B. The "Double TCP Stack Tax" (VM-3 Userspace NIC)
-* In **VM-3 (Userspace NIC)**, packets cross the hypervisor boundary as raw Ethernet/IP frames. A host userspace network stack (\`libslirp\`) terminates the guest TCP stack, parses TCP headers, reassembles bytes, and establishes an outbound socket. This results in **${S5_P50} ms** latency and lacks peer identity verification.
-
-### C. Host Pollution & Security Boundary: Dedicated Netns (VM-4) vs. Host Root (VM-5)
-* **VM-4 (TAP in Dedicated Netns):** MicroVM \`tap0\` is strictly created inside an isolated network namespace. The host root namespace has **0 TAP devices**, preventing interface bloat, route table explosion, and netlink broadcast storms.
-* **VM-5 (TAP in Host Root):** Legacy VM setups require root \`CAP_NET_ADMIN\` on the host, creating TAP devices directly in the host root namespace. For 1,000 MicroVMs, this pollutes the host with 1,000 interfaces and 1,000 routing entries, while filling the host conntrack table.
-
-### D. The Zero-IP Guarantee (C-1, C-2, VM-1, VM-2, VM-3)
-* These scenarios completely eliminate host IPAM:
-  - **Zero host IP addresses allocated.**
-  - **Zero host virtual devices (\`veth\` or \`TAP\`) in the host root network namespace.**
-  - **Zero conntrack table bloat on the host default namespace.**
-
----
-
-## 4. How to Reproduce
-
-To independently run and verify all scenarios:
-\`\`\`bash
-git clone https://github.com/aojea/agents.net.git
-cd agents.net
-./scenarios/benchmark.sh
-\`\`\`
-REPORT_EOF
-
-echo ""
-echo "================================================================="
-echo " BENCHMARK SUITE COMPLETE - SUMMARY REPORT:"
-echo "================================================================="
-cat "${RESULTS_MD}"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -43,13 +43,13 @@ trap cleanup EXIT
 sleep 0.5
 
 echo "=== Horizon 1 (MicroVM VSOCK): Measuring Conntrack Delta ==="
-CONNTRACK_BEFORE=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+CONNTRACK_BEFORE=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_BEFORE=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
 
 echo "=== Horizon 1 (MicroVM VSOCK): Real curl HTTPS Benchmark (5 rounds x 20 requests = 100 flows) ==="
-BENCH_OUTPUT=$(unshare -m -n -r bash -c "
+unshare -m -n -r bash -c "
   echo 'nameserver 100.127.255.253' > /tmp/resolv.conf && mount --bind /tmp/resolv.conf /etc/resolv.conf && \
   ${LAUNCHER} run vsock://1:${VSOCK_PORT} \
     python3 ${REPO_ROOT}/scenarios/common/benchmark_client.py \
@@ -58,15 +58,16 @@ BENCH_OUTPUT=$(unshare -m -n -r bash -c "
       --rounds 5 --requests 20 --warmup 5 \
       --throughput-url 'https://test.example.com:${TARGET_PORT}/stream?mb=50' \
       --throughput-trials 3
-")
+    "
 
-echo "${BENCH_OUTPUT}"
-
-CONNTRACK_AFTER=0
-if [ -f /proc/sys/net/netfilter/nf_conntrack_count ]; then
+CONNTRACK_AFTER=unknown
+if [[ -r /proc/sys/net/netfilter/nf_conntrack_count ]]; then
     CONNTRACK_AFTER=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
 fi
-CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+CONNTRACK_DELTA=unknown
+if [[ "${CONNTRACK_BEFORE}" != unknown && "${CONNTRACK_AFTER}" != unknown ]]; then
+    CONNTRACK_DELTA=$((CONNTRACK_AFTER - CONNTRACK_BEFORE))
+fi
 echo "CONNTRACK_DELTA=${CONNTRACK_DELTA}"
 
 echo "HOST_IPAM_ALLOCATED=0"
