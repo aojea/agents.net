@@ -372,6 +372,47 @@ func TestHostnameDialsCheckedAddress(t *testing.T) {
 	}
 }
 
+// TestStaticMappingIsStillAddressChecked checks that -resolve replaces DNS
+// for a name but does not bypass address policy.
+func TestStaticMappingIsStillAddressChecked(t *testing.T) {
+	previousIPs, previousNames, previousStatic, previousLookup := allowedIPs, allowed, static, lookupNetIP
+	t.Cleanup(func() {
+		allowedIPs, allowed, static, lookupNetIP = previousIPs, previousNames, previousStatic, previousLookup
+	})
+	var lookups atomic.Int32
+	lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		lookups.Add(1)
+		return nil, errors.New("DNS must not be consulted for a mapped name")
+	}
+	var err error
+	if static, err = parseStatic(" target.internal=127.0.0.1+::1 , Public.Example.=93.184.216.34"); err != nil {
+		t.Fatal(err)
+	}
+	allowed = map[string]bool{"target.internal": true, "public.example": true}
+	ctx := context.Background()
+	allowedIPs = nil
+	if _, reason, err := authorize(ctx, "target.internal", "9099"); err != nil || reason != "resolved-address-denied" {
+		t.Fatalf("loopback mapping without -allow-ip: %q, %v", reason, err)
+	}
+	allowedIPs = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
+	addresses, reason, err := authorize(ctx, "target.internal.", "9099")
+	if err != nil || reason != "" || len(addresses) != 1 || addresses[0] != netip.MustParseAddr("127.0.0.1") {
+		t.Fatalf("mapped and listed: %v %q %v", addresses, reason, err)
+	}
+	addresses, reason, err = authorize(ctx, "public.example", "443")
+	if err != nil || reason != "" || len(addresses) != 1 || addresses[0] != netip.MustParseAddr("93.184.216.34") {
+		t.Fatalf("public mapping: %v %q %v", addresses, reason, err)
+	}
+	if lookups.Load() != 0 {
+		t.Fatalf("DNS consulted %d times for mapped names", lookups.Load())
+	}
+	for _, entry := range []string{"nohost", "=1.2.3.4", "a.example=", "a.example=not-an-ip", "1.2.3.4=5.6.7.8", "a.example=fe80::1%eth0"} {
+		if _, err := parseStatic(entry); err == nil {
+			t.Errorf("invalid mapping accepted: %q", entry)
+		}
+	}
+}
+
 func TestRequestHeadDeadline(t *testing.T) {
 	previous := headTimeout
 	t.Cleanup(func() { headTimeout = previous })

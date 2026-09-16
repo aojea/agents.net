@@ -20,8 +20,8 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
+	"github.com/mdlayher/vsock"
 	"golang.org/x/sys/unix"
 
 	"github.com/aojea/agents.net/tun2connect/pkg/tun2connect"
@@ -49,57 +49,34 @@ func openTUN(name string, mtu uint32) (int, error) {
 	return fd, nil
 }
 
-type vsockAddr struct {
-	cid  uint32
-	port uint32
+// parseVSOCK splits "cid:port". In a Firecracker guest the boundary is
+// CID 2 (the host); Firecracker delivers the connection to the host Unix
+// socket "<uds_path>_<port>", which the boundary listens on directly.
+func parseVSOCK(addr string) (cid, port uint32, err error) {
+	rawCID, rawPort, found := strings.Cut(addr, ":")
+	if !found {
+		return 0, 0, fmt.Errorf("invalid vsock address %q (want cid:port)", addr)
+	}
+	parsedCID, err := strconv.ParseUint(rawCID, 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid vsock cid %q: %w", rawCID, err)
+	}
+	parsedPort, err := strconv.ParseUint(rawPort, 10, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid vsock port %q: %w", rawPort, err)
+	}
+	return uint32(parsedCID), uint32(parsedPort), nil
 }
 
-func (a vsockAddr) Network() string { return "vsock" }
-func (a vsockAddr) String() string  { return fmt.Sprintf("%d:%d", a.cid, a.port) }
-
-type vsockConn struct {
-	*os.File
-	laddr vsockAddr
-	raddr vsockAddr
-}
-
-func (c *vsockConn) LocalAddr() net.Addr                { return c.laddr }
-func (c *vsockConn) RemoteAddr() net.Addr               { return c.raddr }
-func (c *vsockConn) SetDeadline(t time.Time) error      { return c.File.SetDeadline(t) }
-func (c *vsockConn) SetReadDeadline(t time.Time) error  { return c.File.SetReadDeadline(t) }
-func (c *vsockConn) SetWriteDeadline(t time.Time) error { return c.File.SetWriteDeadline(t) }
-
+// dialVSOCK opens one AF_VSOCK stream. The library returns a pollable
+// net.Conn: wrapping a blocking descriptor in os.NewFile silently loses
+// deadlines and Close cannot interrupt a blocked Read.
 func dialVSOCK(addr string) (net.Conn, error) {
-	parts := strings.Split(addr, ":")
-	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid vsock address %q (want cid:port)", addr)
-	}
-	cid, err := strconv.ParseUint(parts[0], 10, 32)
+	cid, port, err := parseVSOCK(addr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid vsock cid: %w", err)
+		return nil, err
 	}
-	port, err := strconv.ParseUint(parts[1], 10, 32)
-	if err != nil {
-		return nil, fmt.Errorf("invalid vsock port: %w", err)
-	}
-	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
-	if err != nil {
-		return nil, fmt.Errorf("socket(AF_VSOCK): %w", err)
-	}
-	sa := &unix.SockaddrVM{
-		CID:  uint32(cid),
-		Port: uint32(port),
-	}
-	if err := unix.Connect(fd, sa); err != nil {
-		unix.Close(fd)
-		return nil, fmt.Errorf("connect(AF_VSOCK): %w", err)
-	}
-	f := os.NewFile(uintptr(fd), "vsock")
-	return &vsockConn{
-		File:  f,
-		laddr: vsockAddr{cid: unix.VMADDR_CID_ANY, port: 0},
-		raddr: vsockAddr{cid: uint32(cid), port: uint32(port)},
-	}, nil
+	return vsock.Dial(cid, port, nil)
 }
 
 // boundaryDialer returns a per-flow dial function for unix://, tcp://, or vsock://.
@@ -123,15 +100,8 @@ func boundaryDialer(proxy string) (func(ctx context.Context) (net.Conn, error), 
 		}, nil
 	case "vsock":
 		addr := u.Host
-		parts := strings.Split(addr, ":")
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("invalid vsock address %q (want cid:port)", addr)
-		}
-		if _, err := strconv.ParseUint(parts[0], 10, 32); err != nil {
-			return nil, fmt.Errorf("invalid vsock cid %q: %w", parts[0], err)
-		}
-		if _, err := strconv.ParseUint(parts[1], 10, 32); err != nil {
-			return nil, fmt.Errorf("invalid vsock port %q: %w", parts[1], err)
+		if _, _, err := parseVSOCK(addr); err != nil {
+			return nil, err
 		}
 		return func(ctx context.Context) (net.Conn, error) {
 			return dialVSOCK(addr)

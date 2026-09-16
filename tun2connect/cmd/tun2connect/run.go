@@ -15,10 +15,13 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
+	"github.com/mdlayher/vsock"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
@@ -62,7 +65,7 @@ func runLauncher(args []string) {
 	device := fs.String("device", "tun0", "TUN device name to create")
 	mtu := fs.Uint("mtu", 1500, "TUN MTU")
 	udp := fs.Bool("udp", false, "tunnel UDP sessions via connect-udp (DNS is always answered locally)")
-	ingress := fs.String("ingress-socket", "", "serve the ingress handshake (CONNECT <port> -> OK) on this Unix socket")
+	ingress := fs.String("ingress-socket", "", "serve the ingress handshake (CONNECT <port> -> OK) on this Unix socket path or vsock://PORT")
 	sandboxID := fs.String("sandbox-id", "", "value for the Sandbox-Id header on every tunnel request")
 	fs.Usage = runUsage(fs)
 	fs.Parse(args)
@@ -92,6 +95,12 @@ func runLauncher(args []string) {
 	dial, err := boundaryDialer(boundary)
 	if err != nil {
 		log.Fatal(err)
+	}
+	var ingressListener net.Listener
+	if *ingress != "" {
+		if ingressListener, err = listenIngress(*ingress); err != nil {
+			log.Fatalf("ingress listener %s: %v", *ingress, err)
+		}
 	}
 	fd, err := openTUN(*device, uint32(*mtu))
 	if err != nil {
@@ -125,8 +134,8 @@ func runLauncher(args []string) {
 	}
 	defer eng.Close()
 
-	if *ingress != "" {
-		go serveIngress(*ingress)
+	if ingressListener != nil {
+		go serveIngress(ingressListener)
 	}
 
 	log.Printf("launcher up: device=%s boundary=%s agent=%q", *device, boundary, argv)
@@ -170,6 +179,13 @@ func dropNetAdmin() error {
 // answer, because the engine serves port 53 on any address routed to it,
 // and a dial to a literal IP reaches the boundary for authorization.
 func configureTUN(name string) error {
+	// As a VM init nothing else brings loopback up; left down, the default
+	// route below would send 127.0.0.1 into the TUN instead of the guest stack.
+	if lo, err := netlink.LinkByName("lo"); err == nil {
+		if err := netlink.LinkSetUp(lo); err != nil {
+			return fmt.Errorf("loopback up: %w", err)
+		}
+	}
 	link, err := netlink.LinkByName(name)
 	if err != nil {
 		return err
@@ -243,20 +259,35 @@ func runChild(argv []string) int {
 	return 0
 }
 
-// serveIngress answers the hybrid-vsock handshake ("CONNECT <port>\n" ->
-// "OK\n") and joins each accepted stream to the agent's loopback
-// listener, so the host can deliver inbound requests without the sandbox
-// exposing any port.
-func serveIngress(path string) {
+// listenIngress opens the reverse channel: a Unix socket path, or
+// vsock://PORT for a VM whose VMM delivers host connections to a guest
+// AF_VSOCK listener (Firecracker performs its own CONNECT/OK exchange on
+// the host side before handing the stream to this port).
+func listenIngress(spec string) (net.Listener, error) {
+	if rawPort, ok := strings.CutPrefix(spec, "vsock://"); ok {
+		port, err := strconv.ParseUint(strings.TrimPrefix(rawPort, ":"), 10, 32)
+		if err != nil {
+			return nil, fmt.Errorf("invalid vsock port %q: %w", rawPort, err)
+		}
+		return vsock.Listen(uint32(port), nil)
+	}
+	path := strings.TrimPrefix(spec, "unix://")
 	os.Remove(path)
 	ln, err := net.Listen("unix", path)
 	if err != nil {
-		log.Printf("[!] ingress socket %s: %v", path, err)
-		return
+		return nil, err
 	}
 	// The host-side gateway may run unprivileged; the socket file is
 	// created by container root.
 	os.Chmod(path, 0o666)
+	return ln, nil
+}
+
+// serveIngress answers the hybrid-vsock handshake ("CONNECT <port>\n" ->
+// "OK\n") and joins each accepted stream to the agent's loopback
+// listener, so the host can deliver inbound requests without the sandbox
+// exposing any port.
+func serveIngress(ln net.Listener) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -274,7 +305,7 @@ func serveIngress(path string) {
 				io.WriteString(conn, "ERR malformed handshake\n")
 				return
 			}
-			upstream, err := net.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+			upstream, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
 			if err != nil {
 				io.WriteString(conn, "ERR the agent is not listening\n")
 				return

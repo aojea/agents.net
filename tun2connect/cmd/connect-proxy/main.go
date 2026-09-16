@@ -81,6 +81,8 @@ var (
 	allowed    = map[string]bool{}
 	allowedIPs []netip.Prefix
 	enableUDP  bool
+	// static maps a hostname to fixed addresses used instead of DNS.
+	static = map[string][]netip.Addr{}
 	// lookupNetIP resolves permitted hostnames; tests substitute it.
 	lookupNetIP = net.DefaultResolver.LookupNetIP
 )
@@ -154,12 +156,15 @@ func authorize(ctx context.Context, host, port string) (addresses []netip.Addr, 
 		}
 		return []netip.Addr{address}, "", nil
 	}
-	if !allowAll && !allowed[strings.TrimSuffix(host, ".")] {
+	host = strings.TrimSuffix(host, ".")
+	if !allowAll && !allowed[host] {
 		return nil, "not-on-allowlist", nil
 	}
-	resolved, err := lookupNetIP(ctx, "ip", host)
-	if err != nil {
-		return nil, "", err
+	resolved, mapped := static[host]
+	if !mapped {
+		if resolved, err = lookupNetIP(ctx, "ip", host); err != nil {
+			return nil, "", err
+		}
 	}
 	for _, address := range resolved {
 		address = address.Unmap()
@@ -212,6 +217,34 @@ func parseIPAllowlist(value string) ([]netip.Prefix, error) {
 		prefixes = append(prefixes, prefix.Masked())
 	}
 	return prefixes, nil
+}
+
+// parseStatic reads "name=ip[+ip...]" entries. Mapped addresses are still
+// subject to address policy: a non-public mapping needs -allow-ip.
+func parseStatic(value string) (map[string][]netip.Addr, error) {
+	mappings := map[string][]netip.Addr{}
+	for _, entry := range strings.Split(value, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		name, rawAddresses, found := strings.Cut(entry, "=")
+		name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
+		if !found || name == "" {
+			return nil, fmt.Errorf("invalid -resolve entry %q (want name=ip)", entry)
+		}
+		if _, err := netip.ParseAddr(name); err == nil {
+			return nil, fmt.Errorf("invalid -resolve entry %q: name is an address", entry)
+		}
+		for _, raw := range strings.Split(rawAddresses, "+") {
+			address, err := netip.ParseAddr(strings.TrimSpace(raw))
+			if err != nil || address.Zone() != "" {
+				return nil, fmt.Errorf("invalid -resolve address %q in %q", raw, entry)
+			}
+			mappings[name] = append(mappings[name], address.Unmap())
+		}
+	}
+	return mappings, nil
 }
 
 func refuse(conn net.Conn, reason string) {
@@ -499,6 +532,7 @@ func main() {
 	listen := flag.String("listen", "unix:///tmp/boundary.sock", "listen address (unix:///path or tcp://host:port)")
 	allow := flag.String("allow", "", "comma-separated destination names to allow; '*' allows all names (default: deny everything). Resolved addresses must be public unless listed in -allow-ip")
 	allowIP := flag.String("allow-ip", "", "comma-separated IP addresses or CIDRs to allow for literal destinations and for non-public resolved addresses (default: deny)")
+	resolve := flag.String("resolve", "", "comma-separated name=ip[+ip] static mappings used instead of DNS for those names; addresses still need -allow-ip unless public")
 	udp := flag.Bool("udp", false, "serve connect-udp tunnels")
 	h2 := flag.Bool("h2", false, "speak multiplexed cleartext HTTP/2 (prior knowledge) instead of HTTP/1.1")
 	tlsCert := flag.String("tls-cert", "", "PEM server certificate; enables TLS (with -h2: the HBONE-style mTLS+h2 arrangement)")
@@ -508,6 +542,10 @@ func main() {
 	enableUDP = *udp
 	var err error
 	allowedIPs, err = parseIPAllowlist(*allowIP)
+	if err != nil {
+		log.Fatal(err)
+	}
+	static, err = parseStatic(*resolve)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -559,7 +597,7 @@ func main() {
 	if tlsConfig != nil {
 		ln = tls.NewListener(ln, tlsConfig)
 	}
-	log.Printf("boundary listening on %s (allow=%q allow-ip=%q udp=%v h2=%v tls=%v mtls=%v)", *listen, *allow, *allowIP, *udp, *h2, *tlsCert != "", *clientCA != "")
+	log.Printf("boundary listening on %s (allow=%q allow-ip=%q resolve=%q udp=%v h2=%v tls=%v mtls=%v)", *listen, *allow, *allowIP, *resolve, *udp, *h2, *tlsCert != "", *clientCA != "")
 
 	h2s := &http2.Server{}
 	for {
