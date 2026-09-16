@@ -1139,20 +1139,8 @@ script bound to that VM's listener; the test checks that no record is missing
 them.
 
 The test passes on Firecracker v1.16.1 with guest kernel 6.18.41 from the
-Firecracker CI artifacts, locally and in the
-[Firecracker workflow](.github/workflows/firecracker.yml) on GitHub-hosted
-runners with KVM. It does not test guest attestation, snapshot and restore,
-other VMMs, draining, or resource exhaustion.
-
-### 8.3 Continuous Integration
-
-[.github/workflows](.github/workflows) runs on pushes and pull requests to
-`main`: build, `go vet`, `gofmt`, and the race-enabled test suites of both Go
-modules including the live namespace integration test; the fuzz targets for
-45 seconds each; the Envoy interoperability presubmit; the Docker demo
-presubmit; and the Firecracker scenario. Hosted runs are evidence for the
-checks they execute, not a substitute for the deployment review described in
-Section 8.1.
+Firecracker CI artifacts. It does not test guest attestation, snapshot and
+restore, other VMMs, draining, or resource exhaustion.
 
 ## 9. Normative References
 
