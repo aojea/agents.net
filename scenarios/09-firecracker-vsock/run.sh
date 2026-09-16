@@ -40,6 +40,7 @@ command -v firecracker >/dev/null || fail "firecracker not on PATH"
 [ -r /dev/kvm ] && [ -w /dev/kvm ] || fail "no read/write access to /dev/kvm"
 command -v mke2fs >/dev/null || fail "mke2fs missing"
 command -v python3 >/dev/null || fail "python3 missing"
+command -v jq >/dev/null || fail "jq missing"
 firecracker --version | head -1
 
 echo "=== 1. Guest kernel ==="
@@ -101,9 +102,11 @@ start_vm() {
     local uds="${RUN_DIR}/${name}.vsock" api="${RUN_DIR}/${name}.api"
     # The boundary listens exactly where Firecracker delivers guest
     # connections to CID 2 port ${BOUNDARY_PORT}. Nothing else is bound
-    # under this VM's prefix.
-    "${BIN_DIR}/connect-proxy" -listen "unix://${uds}_${BOUNDARY_PORT}" "$@" \
-        > "${RUN_DIR}/${name}.boundary.log" 2>&1 &
+    # under this VM's prefix. The sandbox identity in every audit record
+    # is this flag, bound to the listener by the controller (this script).
+    "${BIN_DIR}/connect-proxy" -listen "unix://${uds}_${BOUNDARY_PORT}" \
+        -sandbox "${name}" -policy-version "scenario-09" "$@" \
+        > "${RUN_DIR}/${name}.audit" 2> "${RUN_DIR}/${name}.boundary.log" &
     PIDS+=($!)
     for _ in $(seq 1 50); do [ -S "${uds}_${BOUNDARY_PORT}" ] && break; sleep 0.1; done
     [ -S "${uds}_${BOUNDARY_PORT}" ] || fail "${name}: boundary did not listen"
@@ -116,7 +119,7 @@ start_vm() {
     # Unknown KEY=VALUE cmdline words reach PID 1 as environment variables.
     fc_put "${api}" /boot-source "{
         \"kernel_image_path\": \"${KERNEL}\",
-        \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off ro quiet BOUNDARY_PORT=${BOUNDARY_PORT} OTHER_BOUNDARY_PORT=${OTHER_PORT} INGRESS_PORT=${INGRESS_PORT} TARGET_PORT=${TARGET_PORT} INGRESS_WAIT=12\"
+        \"boot_args\": \"console=ttyS0 reboot=k panic=1 pci=off ro quiet BOUNDARY_PORT=${BOUNDARY_PORT} OTHER_BOUNDARY_PORT=${OTHER_PORT} INGRESS_PORT=${INGRESS_PORT} GUEST_HTTP_PORT=${GUEST_HTTP_PORT} TARGET_PORT=${TARGET_PORT} INGRESS_WAIT=12\"
     }"
     fc_put "${api}" /machine-config '{"vcpu_count": 1, "mem_size_mib": 128}'
     fc_put "${api}" /drives/rootfs "{
@@ -148,9 +151,10 @@ result() { # NAME KEY -> value
 }
 
 echo "=== 5. Boot two sandboxes with different policies ==="
-# vm-a may reach test.example.com, which the boundary maps to the target.
-start_vm vm-a 3 -allow test.example.com \
-    -resolve "test.example.com=${TARGET_ADDR}" -allow-ip "${TARGET_ADDR}/32"
+# vm-a may reach test.example.com on the target port only; the boundary
+# maps the name to the target address.
+start_vm vm-a 3 -allow "test.example.com:${TARGET_PORT}" \
+    -resolve "test.example.com=${TARGET_ADDR}" -allow-ip "${TARGET_ADDR}:${TARGET_PORT}"
 # vm-b has an empty policy: every destination is refused.
 start_vm vm-b 4
 
@@ -163,6 +167,16 @@ for vm in vm-a vm-b; do
         echo "${vm}: $(cat "${RUN_DIR}/${vm}.ingress")"
     else
         echo "${vm}: ingress FAILED: $(cat "${RUN_DIR}/${vm}.ingress")"; FAILED=1
+    fi
+    # The launcher pins the loopback port; naming another is refused even
+    # though nothing else listens there anyway.
+    if python3 "${SCRIPT_DIR}/ingress_probe.py" "${RUN_DIR}/${vm}.vsock" "${INGRESS_PORT}" 22 \
+        > "${RUN_DIR}/${vm}.ingress-other" 2>&1; then
+        echo "${vm}: ingress to an unpinned port SUCCEEDED"; FAILED=1
+    elif grep -q 'port not permitted' "${RUN_DIR}/${vm}.ingress-other"; then
+        echo "${vm}: ingress to an unpinned port refused by the launcher"
+    else
+        echo "${vm}: unexpected unpinned-port result: $(cat "${RUN_DIR}/${vm}.ingress-other")"; FAILED=1
     fi
 done
 
@@ -181,14 +195,16 @@ check() { # NAME KEY EXPECTED-SUBSTRING
         echo "  FAIL $1 $2: got '${got}', want '*$3*'"; FAILED=1
     fi
 }
-echo "vm-a (test.example.com permitted):"
+echo "vm-a (test.example.com:${TARGET_PORT} permitted):"
 check vm-a allow-name "http=200"
 check vm-a deny-name "curl-exit=7"
+check vm-a deny-port "curl-exit=7"
 check vm-a deny-ip "curl-exit=7"
 check vm-a forged-connect "403"
 echo "vm-b (nothing permitted):"
 check vm-b allow-name "curl-exit=7"
 check vm-b deny-name "curl-exit=7"
+check vm-b deny-port "curl-exit=7"
 check vm-b deny-ip "curl-exit=7"
 check vm-b forged-connect "403"
 for vm in vm-a vm-b; do
@@ -197,17 +213,30 @@ for vm in vm-a vm-b; do
     fi
 done
 
-echo "=== 8. Boundary audit logs ==="
+echo "=== 8. Boundary audit records ==="
+# audit_count NAME JQ-FILTER -> number of records matching the filter
+audit_count() {
+    jq -c "select($2)" "${RUN_DIR}/$1.audit" 2>/dev/null | wc -l
+}
 for vm in vm-a vm-b; do
-    echo "--- ${vm} ---"; grep -E 'ALLOW|BLOCK|DIAL-FAIL|RESOLVE-FAIL' "${RUN_DIR}/${vm}.boundary.log" || true
+    echo "--- ${vm} ---"
+    jq -c '{sandbox,decision,reason,destination,address}' "${RUN_DIR}/${vm}.audit" || true
+    if ! jq -e . "${RUN_DIR}/${vm}.audit" >/dev/null 2>&1; then
+        echo "  FAIL ${vm}: audit is not one JSON object per line"; FAILED=1
+    fi
+    if [ "$(audit_count "${vm}" ".sandbox != \"${vm}\" or .policy != \"scenario-09\"")" -ne 0 ]; then
+        echo "  FAIL ${vm}: a record lacks the listener-bound sandbox identity"; FAILED=1
+    fi
 done
-grep -q 'ALLOW tcp test.example.com:9443 via 127.0.0.2:9443' "${RUN_DIR}/vm-a.boundary.log" \
-    || { echo "  FAIL vm-a audit lacks the allowed dial"; FAILED=1; }
-grep -q 'BLOCK ip-not-on-allowlist 192.0.2.10:9443' "${RUN_DIR}/vm-a.boundary.log" \
+[ "$(audit_count vm-a ".decision == \"allow\" and .destination == \"test.example.com:${TARGET_PORT}\" and .address == \"${TARGET_ADDR}:${TARGET_PORT}\"")" -ge 1 ] \
+    || { echo "  FAIL vm-a audit lacks the allowed dial to the checked address"; FAILED=1; }
+[ "$(audit_count vm-a '.decision == "block" and .reason == "port-not-allowed" and .destination == "test.example.com:80"')" -ge 1 ] \
+    || { echo "  FAIL vm-a audit lacks the refused port"; FAILED=1; }
+[ "$(audit_count vm-a ".decision == \"block\" and .reason == \"ip-not-on-allowlist\" and .destination == \"192.0.2.10:${TARGET_PORT}\"")" -ge 1 ] \
     || { echo "  FAIL vm-a audit lacks the refused literal"; FAILED=1; }
-grep -q 'ALLOW' "${RUN_DIR}/vm-b.boundary.log" \
-    && { echo "  FAIL vm-b boundary allowed something"; FAILED=1; }
-grep -c 'BLOCK not-on-allowlist test.example.com' "${RUN_DIR}/vm-b.boundary.log" >/dev/null \
+[ "$(audit_count vm-b '.decision == "allow"')" -eq 0 ] \
+    || { echo "  FAIL vm-b boundary allowed something"; FAILED=1; }
+[ "$(audit_count vm-b '.decision == "block" and .reason == "not-on-allowlist" and (.destination | startswith("test.example.com:"))')" -ge 1 ] \
     || { echo "  FAIL vm-b audit lacks the refused name"; FAILED=1; }
 
 if [ "${FAILED}" -ne 0 ]; then

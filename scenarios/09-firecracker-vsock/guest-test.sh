@@ -25,6 +25,8 @@ cat /etc/resolv.conf
 
 probe allow-name  "https://test.example.com:${PORT}/ping"
 probe deny-name   "https://denied.example:${PORT}/ping"
+# The allowed name on a port the policy does not list.
+probe deny-port   "http://test.example.com:80/ping"
 # A literal address never named by DNS reaches the boundary as an IP
 # CONNECT and needs -allow-ip; 192.0.2.10 is not listed.
 probe deny-ip     "https://192.0.2.10:${PORT}/ping"

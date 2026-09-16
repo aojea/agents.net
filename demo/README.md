@@ -220,7 +220,7 @@ Because the launched command is just a normal non-interactive invocation, the sa
 
 ## Lab 8 (Optional): Ingress -- Deliver a Webhook Into the Sandbox
 
-Ingress uses a second Unix socket, served from *inside* the sandbox by the launcher. Note that `--ingress-socket` must come **before** the boundary-socket argument: the launcher stops parsing flags at the first positional argument, so everything after it is passed to the agent untouched:
+Ingress uses a second Unix socket, served from *inside* the sandbox by the launcher. `--ingress-port` pins the one loopback port ingress streams may reach; the launcher refuses to start without it, and a handshake naming any other port is answered `ERR port not permitted`. Note that both flags must come **before** the boundary-socket argument: the launcher stops parsing flags at the first positional argument, so everything after it is passed to the agent untouched:
 
 ```bash
 docker run --rm \
@@ -230,7 +230,7 @@ docker run --rm \
   -v "$(pwd)/demo/tun2connect:/tun2connect:ro" \
   --entrypoint /tun2connect \
   agentsnet-demo \
-  run --ingress-socket /var/run/agents.net/ingress-proxy.sock \
+  run --ingress-socket /var/run/agents.net/ingress-proxy.sock --ingress-port 8081 \
   /var/run/agents.net/egress-proxy.sock \
   python3 /demo/agent.py "Fetch https://example.com and report its status code."
 ```
@@ -269,25 +269,28 @@ own channel access controls, workload identity, and destination policy.
 
 ### Lab A: the reference boundary, no root required
 
-`connect-proxy` is the Go sibling of `host_proxy.py`: deny-by-default on names, one audit line per decision. Because curl speaks CONNECT to HTTP proxies, you can watch the ACL work without a sandbox:
+`connect-proxy` is the Go sibling of `host_proxy.py`: deny-by-default on names, addresses, and ports, one JSON audit record per decision. Because curl speaks CONNECT to HTTP proxies, you can watch the ACL work without a sandbox:
 
 ```bash
 go -C tun2connect build -o /tmp/connect-proxy ./cmd/connect-proxy
-/tmp/connect-proxy -listen tcp://127.0.0.1:18080 -allow example.com &
+/tmp/connect-proxy -listen tcp://127.0.0.1:18080 -allow example.com:443 -sandbox lab-a &
 
 curl --proxy http://127.0.0.1:18080 https://example.com -o /dev/null -w '%{http_code}\n'   # 200
 curl --proxy http://127.0.0.1:18080 https://evil.example                                    # CONNECT tunnel failed, response 403
+curl --proxy http://127.0.0.1:18080 http://example.com:8080/                                # 403: port-not-allowed
 ```
 
-The audit log mirrors Lab 7's, decided on the same policy input -- the name in the CONNECT authority. The boundary resolves the allowed name itself, records the address it checked and dialed, and denies names that resolve to loopback, private, or link-local addresses unless `-allow-ip` lists them:
+The audit records mirror Lab 7's decisions, made on the same policy input -- the name and port in the CONNECT authority. The boundary resolves the allowed name itself, records the address it checked and dialed, and denies names that resolve to loopback, private, or link-local addresses unless `-allow-ip` lists them. Each record carries the listener-bound sandbox identity and policy version the controller passed on the command line, never anything the guest sent:
 
-```text
-ALLOW tcp example.com:443 via 93.184.216.34:443
-BLOCK not-on-allowlist evil.example:443
+```json
+{"ts":"2026-09-16T16:20:31Z","listener":"tcp://127.0.0.1:18080","sandbox":"lab-a","wire":"h1","transport":"tcp","destination":"example.com:443","address":"93.184.216.34:443","decision":"allow"}
+{"ts":"2026-09-16T16:20:33Z","listener":"tcp://127.0.0.1:18080","sandbox":"lab-a","wire":"h1","transport":"tcp","destination":"evil.example:443","decision":"block","reason":"not-on-allowlist"}
+{"ts":"2026-09-16T16:20:35Z","listener":"tcp://127.0.0.1:18080","sandbox":"lab-a","wire":"h1","transport":"tcp","destination":"example.com:8080","decision":"block","reason":"port-not-allowed"}
 ```
 
 `-h2` enables HTTP/2 CONNECT streams; `-udp` enables UDP proxying using
-`connect-udp` (RFC 9298).
+`connect-udp` (RFC 9298). `-max-connections`, `-max-streams`, and
+`-idle-timeout` bound the resources one sandbox can hold.
 
 ### Lab B: Envoy CONNECT Example
 
@@ -316,11 +319,11 @@ or gateway controllers that configure Envoy.
 
 The boundary channel can use mTLS. For example,
 `connect-proxy -h2 -tls-cert ... -tls-key ... -tls-client-ca ca.pem` requires a
-verified client certificate and records its identity in the audit log. A
+verified client certificate and records its identity in the audit record. A
 [SPIFFE](https://spiffe.io) URI is one possible certificate identity:
 
-```text
-ALLOW tcp/h2 api.example.com:443 peer=spiffe://cluster.local/ns/sandbox/sa/agent-123
+```json
+{"ts":"...","listener":"tcp://127.0.0.1:18443","wire":"h2","transport":"tcp","destination":"api.example.com:443","address":"203.0.113.10:443","peer":"spiffe://cluster.local/ns/sandbox/sa/agent-123","decision":"allow"}
 ```
 
 Other certificate identities are supported; the tests use

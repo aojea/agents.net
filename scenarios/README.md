@@ -25,6 +25,7 @@ they are retained as historical measurements. Scenario 09 boots real guests and
 is the executed evidence for the VM channel described in the specification.
 It requires `firecracker` on `PATH`, read/write access to `/dev/kvm`,
 `mke2fs` 1.47.1 or later with libarchive support, Docker for the rootfs build,
+`jq` for the audit assertions,
 and downloads the Firecracker CI guest kernel (digest pinned in the driver)
 into `~/.cache/agents.net`. It is not part of `benchmark.sh`:
 

@@ -1,7 +1,12 @@
 package main
 
 import (
+	"fmt"
+	"io"
+	"net"
+	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestBoundaryDialerSchemes(t *testing.T) {
@@ -42,5 +47,61 @@ func TestDialVSOCKInvalidAddresses(t *testing.T) {
 		if err == nil {
 			t.Errorf("dialVSOCK(%q) expected error, got nil", addr)
 		}
+	}
+}
+
+// TestIngressOnlyReachesPinnedPort runs the ingress handshake against two
+// loopback listeners and checks that only the pinned one is reachable,
+// whatever port the caller names.
+func TestIngressOnlyReachesPinnedPort(t *testing.T) {
+	listen := func(banner string) uint16 {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { ln.Close() })
+		go func() {
+			for {
+				conn, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				io.WriteString(conn, banner)
+				conn.Close()
+			}
+		}()
+		return uint16(ln.Addr().(*net.TCPAddr).Port)
+	}
+	pinned, other := listen("pinned\n"), listen("other\n")
+	socket := filepath.Join(t.TempDir(), "ingress.sock")
+	ln, err := listenIngress(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go serveIngress(ln, pinned)
+
+	handshake := func(line string) string {
+		conn, err := net.Dial("unix", socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		io.WriteString(conn, line)
+		reply, _ := io.ReadAll(conn)
+		return string(reply)
+	}
+	if got := handshake(fmt.Sprintf("CONNECT %d\n", pinned)); got != "OK\npinned\n" {
+		t.Fatalf("pinned port: %q", got)
+	}
+	if got := handshake(fmt.Sprintf("CONNECT %d\n", other)); got != "ERR port not permitted\n" {
+		t.Fatalf("other listening port must be unreachable: %q", got)
+	}
+	if got := handshake("CONNECT 22\n"); got != "ERR port not permitted\n" {
+		t.Fatalf("unlistened port: %q", got)
+	}
+	if got := handshake("GET / HTTP/1.1\n"); got != "ERR malformed handshake\n" {
+		t.Fatalf("malformed handshake: %q", got)
 	}
 }

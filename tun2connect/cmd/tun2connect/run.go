@@ -65,7 +65,8 @@ func runLauncher(args []string) {
 	device := fs.String("device", "tun0", "TUN device name to create")
 	mtu := fs.Uint("mtu", 1500, "TUN MTU")
 	udp := fs.Bool("udp", false, "tunnel UDP sessions via connect-udp (DNS is always answered locally)")
-	ingress := fs.String("ingress-socket", "", "serve the ingress handshake (CONNECT <port> -> OK) on this Unix socket path or vsock://PORT")
+	ingress := fs.String("ingress-socket", "", "serve the ingress handshake (CONNECT <port> -> OK) on this Unix socket path or vsock://PORT; requires -ingress-port")
+	ingressPort := fs.Uint("ingress-port", 0, "the only loopback port ingress streams may be joined to (1-65535)")
 	sandboxID := fs.String("sandbox-id", "", "value for the Sandbox-Id header on every tunnel request")
 	fs.Usage = runUsage(fs)
 	fs.Parse(args)
@@ -77,6 +78,9 @@ func runLauncher(args []string) {
 	boundary, argv := rest[0], rest[1:]
 	if !strings.Contains(boundary, "://") {
 		boundary = "unix://" + boundary
+	}
+	if *ingress != "" && (*ingressPort == 0 || *ingressPort > 65535) {
+		log.Fatal("-ingress-socket requires -ingress-port in the range 1-65535: the controller, not the caller, chooses which local service ingress reaches")
 	}
 
 	// Refuse to start if the namespace has any interface besides loopback:
@@ -135,7 +139,7 @@ func runLauncher(args []string) {
 	defer eng.Close()
 
 	if ingressListener != nil {
-		go serveIngress(ingressListener)
+		go serveIngress(ingressListener, uint16(*ingressPort))
 	}
 
 	log.Printf("launcher up: device=%s boundary=%s agent=%q", *device, boundary, argv)
@@ -286,8 +290,9 @@ func listenIngress(spec string) (net.Listener, error) {
 // serveIngress answers the hybrid-vsock handshake ("CONNECT <port>\n" ->
 // "OK\n") and joins each accepted stream to the agent's loopback
 // listener, so the host can deliver inbound requests without the sandbox
-// exposing any port.
-func serveIngress(ln net.Listener) {
+// exposing any port. Only the pinned port is reachable: the handshake
+// names it for compatibility, it does not choose it.
+func serveIngress(ln net.Listener, pinned uint16) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -295,17 +300,23 @@ func serveIngress(ln net.Listener) {
 		}
 		go func(conn net.Conn) {
 			defer conn.Close()
+			conn.SetReadDeadline(time.Now().Add(5 * time.Second))
 			br := bufio.NewReader(conn)
 			line, err := br.ReadString('\n')
 			if err != nil {
 				return
 			}
-			var port int
+			conn.SetReadDeadline(time.Time{})
+			var port uint16
 			if _, err := fmt.Sscanf(strings.TrimSpace(line), "CONNECT %d", &port); err != nil {
 				io.WriteString(conn, "ERR malformed handshake\n")
 				return
 			}
-			upstream, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 5*time.Second)
+			if port != pinned {
+				io.WriteString(conn, "ERR port not permitted\n")
+				return
+			}
+			upstream, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", pinned), 5*time.Second)
 			if err != nil {
 				io.WriteString(conn, "ERR the agent is not listening\n")
 				return
