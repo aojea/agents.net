@@ -64,7 +64,11 @@ containers/namespaces, bind local ports, and attempt host TAP creation. Do not
 run concurrent copies or run on a host where those operations are inappropriate.
 
 Individual drivers use fixed temporary paths and ports. They are development
-experiments, not a hardened multi-user benchmark service. The historical
+experiments, not a hardened multi-user benchmark service. The scenario
+[boundary helper](cmd/boundary-proxy/main.go) allows every hostname by default,
+makes its socket world-connectable, and dials names without checking resolved
+addresses; it exists to measure the data path and is not the reference
+boundary described in the main specification. The historical
 route-flush and CID scripts are limited smoke tests, not security certification.
 
 ## Local Validation

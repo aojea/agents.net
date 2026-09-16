@@ -1,6 +1,7 @@
 package tun2connect
 
 import (
+	"container/list"
 	"errors"
 	"net/netip"
 	"strings"
@@ -14,37 +15,59 @@ import (
 // block 169.254/16, which would break legitimate egress. v6 is the
 // discard-only prefix (RFC 6666): a flow that ever escapes through a
 // stray interface is blackholed by the first conforming router instead
-// of reaching a routable ULA network.
+// of reaching a routable ULA network. The top /24 (v4) and /120 (v6) of
+// each pool are never handed out: adapters place their own interface and
+// resolver addresses there.
 var (
-	v4Pool = netip.MustParsePrefix("100.64.0.0/10")
-	v6Pool = netip.MustParsePrefix("100::/64")
+	v4Pool     = netip.MustParsePrefix("100.64.0.0/10")
+	v6Pool     = netip.MustParsePrefix("100::/64")
+	v4Reserved = netip.MustParsePrefix("100.127.255.0/24")
+	v6Reserved = netip.MustParsePrefix("100::ffff:ffff:ffff:ff00/120")
 )
+
+// maxSyntheticNames bounds the names remembered per address family. The
+// guest chooses the names, and in namespace mode this state lives outside
+// the sandbox, so its size must not depend on guest behavior. The least
+// recently resolved or dialed name is forgotten first.
+const maxSyntheticNames = 1 << 16
 
 // ErrPoolExhausted is returned when a pool has no addresses left; the
 // DNS codec turns it into SERVFAIL, which fails closed.
 var ErrPoolExhausted = errors.New("tun2connect: synthetic address pool exhausted")
 
 // VirtualDNS is the name-preservation contract. It never resolves
-// upstream: it invents one stable synthetic address per (name, family)
-// and remembers the pairing so the engine can recover the name at dial
-// time. A reverse miss leaves the destination as an IP literal for
-// authorization at the boundary.
+// upstream: it invents one synthetic address per (name, family) and
+// remembers the pairing so the engine can recover the name at dial time.
+//
+// Addresses are never reused within one VirtualDNS lifetime. When a name
+// is forgotten under the memory bound, its address stays unassigned: a
+// guest dialing a cached copy gets a reverse miss, the destination is
+// forwarded as a literal in the synthetic range, and the boundary denies
+// it. A stale cache therefore fails closed instead of reaching the name
+// that would otherwise have inherited the address.
 type VirtualDNS struct {
 	mu      sync.Mutex
-	next4   netip.Addr
-	next6   netip.Addr
-	names4  map[string]netip.Addr
-	names6  map[string]netip.Addr
-	reverse map[netip.Addr]string
+	v4, v6  family
+	reverse map[netip.Addr]*list.Element
+}
+
+type family struct {
+	pool, reserved netip.Prefix
+	last           netip.Addr
+	names          map[string]*list.Element
+	order          list.List // front is most recently used
+}
+
+type binding struct {
+	name string
+	addr netip.Addr
 }
 
 func NewVirtualDNS() *VirtualDNS {
 	return &VirtualDNS{
-		next4:   v4Pool.Addr(),
-		next6:   v6Pool.Addr(),
-		names4:  make(map[string]netip.Addr),
-		names6:  make(map[string]netip.Addr),
-		reverse: make(map[netip.Addr]string),
+		v4:      family{pool: v4Pool, reserved: v4Reserved, last: v4Pool.Addr(), names: make(map[string]*list.Element)},
+		v6:      family{pool: v6Pool, reserved: v6Reserved, last: v6Pool.Addr(), names: make(map[string]*list.Element)},
+		reverse: make(map[netip.Addr]*list.Element),
 	}
 }
 
@@ -53,8 +76,8 @@ func canonical(name string) string {
 }
 
 // Resolve4 returns the synthetic IPv4 address for name, allocating one
-// if the name is new. The mapping is stable for the lifetime of the
-// VirtualDNS, so guests may cache answers indefinitely.
+// if the name is new. The mapping holds while the name stays among the
+// most recently used maxSyntheticNames names of its family.
 func (d *VirtualDNS) Resolve4(name string) (netip.Addr, error) {
 	return d.resolve(name, false)
 }
@@ -71,29 +94,49 @@ func (d *VirtualDNS) resolve(name string, v6 bool) (netip.Addr, error) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	names, next, pool := d.names4, &d.next4, v4Pool
+	f := &d.v4
 	if v6 {
-		names, next, pool = d.names6, &d.next6, v6Pool
+		f = &d.v6
 	}
-	if addr, ok := names[name]; ok {
-		return addr, nil
+	if element, ok := f.names[name]; ok {
+		f.order.MoveToFront(element)
+		return element.Value.(*binding).addr, nil
 	}
-	*next = next.Next()
-	if !pool.Contains(*next) {
+	addr := f.last.Next()
+	if !f.pool.Contains(addr) || f.reserved.Contains(addr) {
 		return netip.Addr{}, ErrPoolExhausted
 	}
-	names[name] = *next
-	d.reverse[*next] = name
-	return *next, nil
+	if f.order.Len() >= maxSyntheticNames {
+		oldest := f.order.Back()
+		evicted := oldest.Value.(*binding)
+		delete(f.names, evicted.name)
+		delete(d.reverse, evicted.addr)
+		f.order.Remove(oldest)
+	}
+	f.last = addr
+	element := f.order.PushFront(&binding{name: name, addr: addr})
+	f.names[name] = element
+	d.reverse[addr] = element
+	return addr, nil
 }
 
-// Reverse recovers the name behind a synthetic address. ok=false means
-// the address was never handed out by this resolver.
+// Reverse recovers the name behind a synthetic address and marks it as
+// recently used. ok=false means the address was never handed out by this
+// resolver or its name has since been forgotten.
 func (d *VirtualDNS) Reverse(addr netip.Addr) (string, bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	name, ok := d.reverse[addr.Unmap()]
-	return name, ok
+	element, ok := d.reverse[addr.Unmap()]
+	if !ok {
+		return "", false
+	}
+	b := element.Value.(*binding)
+	f := &d.v4
+	if b.addr.Is6() {
+		f = &d.v6
+	}
+	f.order.MoveToFront(element)
+	return b.name, true
 }
 
 // HandleQuery answers one guest DNS query from the synthetic pools.

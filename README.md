@@ -116,7 +116,12 @@ The host kernel, runtime confinement, controller, and boundary are trusted.
 Compromise of either adapter must not grant more than use of its assigned
 socket policy; protecting the host from such a compromise is the runtime's
 responsibility. The namespace adapter exposes the host kernel's packet stack,
-whereas the in-guest TUN adapter performs translation inside the sandbox.
+whereas the in-guest TUN adapter performs translation inside the sandbox. The
+two adapters also differ in privilege: the TUN adapter needs `CAP_NET_ADMIN`
+and `/dev/net/tun` inside the sandbox to create its device, while the
+namespace adapter needs `CAP_NET_ADMIN` only in its own namespace and the
+workload needs no capability. The reference launcher drops `CAP_NET_ADMIN`
+from itself and from the workload's bounding set once the device exists.
 
 FD registration, `SCM_CREDENTIALS`, workload mTLS, attestation, credential
 injection, and ingress are optional extensions, not prerequisites for this
@@ -312,7 +317,44 @@ granting access to a later workload.
 
 ---
 
-## 3. Architecture Benefits
+## 3. Rationale
+
+The design answers one question: how does an untrusted workload reach selected
+services when neither the workload, its resolver, nor its network stack can be
+trusted to enforce the selection? The answer is to give the sandbox no network
+path and to replace it with a request naming a destination, which a trusted
+component grants or denies before any external connection exists.
+
+### 3.1 Comparison with Common Alternatives
+
+| Property | CONNECT boundary (this specification) | Routed NIC with default-deny L3/L4 policy | Proxy settings (`HTTP_PROXY`, SDK options) |
+| --- | --- | --- | --- |
+| Enforcement independent of workload cooperation | Yes. The only path is the boundary channel; ignoring settings or replacing the adapter changes nothing. | Yes, for packets. | No. A client that ignores the settings connects directly. |
+| Policy expressed as the destination the application named | Yes. The name is carried in the request; the boundary resolves it and dials the checked address. | No. Names must be pre-resolved into address sets. Shared hosting, CDNs, and anycast make address lists stale or broad; DNS-snooping rules race with TTLs and guest-side resolvers. | Yes, for cooperating clients. |
+| Resolution performed by a trusted component | Yes. The guest receives synthetic addresses and never resolves the real one; guest-side rebinding cannot change the address dialed. | No. The guest resolves; the filter sees only the address. | Yes, for cooperating clients. |
+| Guest packets processed by the host IP stack | TUN mode: no; the host sees an HTTP stream on a Unix socket. Namespace mode: only a dedicated namespace stack with no external interface. | Yes. Bridging, routing, connection tracking, and filtering process every guest packet. | Yes. |
+| Denial visible to the application | Connection failure, with the requested name, port, and reason in the audit record. | Timeout or reset, with an address and port in the record. | Proxy error, for cooperating clients. |
+| Per-flow attribution | Listener identity, name or address, port, transport, and decision. | Address, port, and network identity. | Name and port, for cooperating clients. |
+| Reusable service credentials kept out of the workload | Yes, through an optional gateway on the same channel. | Requires a separate proxy path. | Same mechanism, but bypassable. |
+| Enforcement point | Any CONNECT-capable proxy. | Per-host firewall rules and their lifecycle. | Any HTTP proxy. |
+| Protocol coverage | TCP; UDP optional; no raw IP, ICMP, or multicast. | Everything the kernel routes. | What the client library supports. |
+| Additional cost | Userspace translation (TUN) or redirection (namespace), a proxy hop, per-flow proxy state, synthetic DNS limits. | Per-workload address policy and its lifecycle. | None, and no guarantee. |
+
+### 3.2 What Is and Is Not Gained
+
+The design changes what the guest can request, not what an allowed service
+will do. A successful tunnel carries arbitrary bytes to one authorized
+destination. The boundary does not see inside end-to-end TLS, and an allowed
+service may relay, store, or return hostile data. Destination policy is
+necessary but not sufficient; application policy requires the separate gateway
+described in Section 2.3.
+
+The design removes the guest's IP-level reach. Port scans, raw sockets, ICMP or
+DNS tunneling, and traffic to addresses that were never named end at the
+adapter. The guest-facing attack surface is the boundary's CONNECT parser on an
+access-controlled channel rather than the host's routing, bridging, connection
+tracking, and filtering paths. Section 4 states the requirements that keep that
+parser bounded.
 
 | Benefit | Description |
 | --- | --- |
@@ -674,7 +716,17 @@ forwarded as IP literals and require IP policy at the boundary.
 The synthetic address ranges are reserved while the adapter is running. If a
 literal destination equals an allocated synthetic address, a packet-based
 adapter cannot distinguish it from a connection made using that DNS answer.
-Deployments must avoid overlap with real destinations. These DNS limitations
+Deployments must avoid overlap with real destinations. The reference resolver
+remembers the 65,536 most recently resolved or dialed names per address
+family, so guest-chosen names cannot grow adapter memory without bound. It
+never reuses an address within one adapter lifetime: a guest that dials a
+cached address whose name has been forgotten produces a reverse miss, the
+destination is forwarded as a literal in the synthetic range, and the boundary
+denies it, after which re-resolution yields a fresh address. The top `/24`
+of the IPv4 pool and `/120` of the IPv6 pool are never allocated; adapters
+place their own interface and resolver addresses there. The IPv4 pool is
+exhausted, answering `SERVFAIL`, after about 4.19 million distinct names.
+These DNS limitations
 and optional UDP support mean the current adapters do not yet provide full
 compatibility with every networking application.
 
@@ -682,7 +734,7 @@ compatibility with every networking application.
 
 The supervision model for the in-guest networking process depends on the host virtualization environment. Running as **PID 1 is recommended where applicable, but not required**:
 
-- **Container Entrypoint Injection (Recommended for Containers):** The launcher binary (e.g. `tun2connect run`) is bind-mounted into the container and set as `--entrypoint`. It executes as PID 1, initializes the `tun` device, runs the agent process as a child, reaps orphans, forwards signals, and exits with the agent's return code. This provides tight lifecycle coupling: if the launcher dies, the sandbox terminates.
+- **Container Entrypoint Injection (Recommended for Containers):** The launcher binary (e.g. `tun2connect run`) is bind-mounted into the container and set as `--entrypoint`. It executes as PID 1, initializes the `tun` device, runs the agent process as a child, reaps orphans, forwards signals, and exits with the agent's return code. This provides tight lifecycle coupling: if the launcher dies, the sandbox terminates. The container must be started with `--network none`, `--cap-add NET_ADMIN`, and `--device /dev/net/tun`. After configuring the device the launcher removes `CAP_NET_ADMIN` from all of its threads and from the bounding set, so the agent cannot regain it through any executable; this needs `CAP_SETPCAP` (present in the default container capability set) and a cgo-free launcher build, and the launcher refuses to start the agent if the drop fails. Other capabilities, the container UID, and `no_new_privs` remain deployment choices.
 - **Sidecar Process / Shared Network Namespace:** In environments where the container entrypoint must remain untouched (or in Kubernetes pods), the launcher can run as a sidecar process sharing the sandbox network namespace. If the sidecar terminates, the agent simply loses network access (failing closed).
 - **MicroVM Guest Init / System Daemon (MicroVMs):** In microVMs (Firecracker, Cloud-Hypervisor), the networking daemon (e.g. `tun2connect`) runs as a standard guest init process (`/sbin/init`) or system service communicating over a vsock channel to the host.
 
@@ -814,9 +866,10 @@ requirements.
 | TLS handshake inspection | Not implemented by the reference proxies |
 | Third-party TCP CONNECT interoperability | Tested over loopback TCP; see Section 7.3 |
 | Dedicated socket with fixed destination policy | Reference command supports one listener and policy per process; exclusive exposure and lifecycle are runtime responsibilities |
-| Per-port and resolved-address policy, complete CONNECT validation | Required by the local model; incomplete in the reference boundary |
+| Resolved-address policy for hostnames | Implemented in the Go boundary: names are resolved by the boundary, non-public results are denied unless listed, and the checked address is dialed without a second resolution |
+| Per-port policy, complete CONNECT validation | Numeric port range and request-head deadline enforced by the Go boundary; per-port rules, authority/Host comparison, and a full negative corpus remain incomplete |
 | Multiple identities on one listener | Optional extension, not implemented; unnecessary for dedicated endpoints |
-| Connection/resource budgets, revocation lifecycle, complete decision audit | Partial timeouts and namespace session/queue limits; no complete per-tenant boundary enforcement |
+| Connection/resource budgets, revocation lifecycle, complete decision audit | Request-head deadline, bounded synthetic-name memory with no address reuse, and namespace session/queue limits; no complete per-tenant boundary enforcement |
 | Controller-registered connected FDs | Optional extension; registration and handoff are not implemented |
 | Software signature verification and launch attestation | Deployment requirements where selected; no verifier is implemented here |
 | Authenticated production ingress | Not implemented; demo reverse stream only |
@@ -846,10 +899,18 @@ go -C tun2connect run ./cmd/connect-proxy \
     -allow-ip '203.0.113.10,2001:db8::/64' -udp
 ```
 
-The IP list applies to TCP and enabled UDP on all ports. Per-port rules and
-resolved-address checks for hostname requests remain deployment requirements,
-not features of this reference command. The Python demo retains its
-hostname-only allowlist as a sample policy.
+The IP list applies to TCP and enabled UDP on all ports. For hostname
+requests the boundary resolves the name itself and keeps only public unicast
+results; loopback, private, link-local, multicast, shared-address-space,
+NAT64, documentation, and other special-purpose ranges are denied unless
+`-allow-ip` lists them. It dials the checked address, not the name, so a
+rebinding answer cannot change the destination after the check. `-allow '*'`
+therefore still cannot reach `localhost`, a metadata service, or a private
+network. Ports must be numeric and in the range 1-65535, and a client that
+does not complete its request head within 15 seconds is disconnected.
+Per-port rules remain a deployment requirement, not a feature of this
+reference command. The Python demo retains its hostname-only allowlist as a
+sample policy and dials names directly; it has no resolved-address check.
 
 The Go boundary rejects incomplete TLS flag combinations before listening.
 `-tls-client-ca` requires both `-tls-cert` and `-tls-key` and enables required,
@@ -871,7 +932,7 @@ A hands-on, runnable demonstration of a zero-network autonomous ReAct agent runn
 ![agents.net terminal demo](demo/terminal-demo.gif)
 
 - [demo/README.md](demo/README.md) — Step-by-step tutorial for building and running the sandbox.
-- [demo/host_proxy.py](demo/host_proxy.py) — Python host boundary implementing a 4-tier allowlist (fake responses, local Ollama relay, cloud credential injection, and uninspected passthrough).
+- [demo/host_proxy.py](demo/host_proxy.py) — Python host boundary implementing a 4-tier allowlist (fake responses, local Ollama relay, cloud credential injection, and uninspected passthrough). Credential injection rewrites only the first request on each tunnel; later requests on a reused connection are relayed unchanged, which a production gateway must not do (Section 4.8).
 - [demo/agent.py](demo/agent.py) — Sample ReAct agent demonstrating autonomous reasoning, tool execution, and handling connection refusals.
 - [demo/gen_certs.sh](demo/gen_certs.sh) — Script to generate demo root CA and multi-SAN leaf certificates.
 - [demo/Dockerfile](demo/Dockerfile) — Standard Debian-based container image definition for the agent.
@@ -930,15 +991,15 @@ ingress checks apply only when those extensions are used.
 | Mutual authentication | Valid client succeeds; anonymous, wrong issuer, wrong server identity, invalid validity period, wrong key usage, wrong key, and wrong ALPN fail before tunnel delivery | [mTLS tests](tun2connect/pkg/tun2connect/connect_tls_test.go); authorized-tenant identity mapping remains unimplemented |
 | Authentication configuration | Incomplete certificate/key settings or client CA without TLS fail at startup | [Reference boundary tests](tun2connect/cmd/connect-proxy/main_test.go) |
 | Transport integrity | Modify a protected TLS record; the tunnel fails without echoing modified application data | TLS record-corruption test in the mTLS suite |
-| Destination authorization | Named and literal IPv4/IPv6 allow/deny cases over TCP and UDP | Engine, boundary, and live namespace tests; no per-port or resolved-address policy in the reference boundary |
-| CONNECT parser safety | Conflicting authorities, malformed ports, duplicate framing, unsupported extended protocols, URI encoding, fragmented heads | Partial tests; complete negative corpus and fuzzing required |
+| Destination authorization | Named and literal IPv4/IPv6 allow/deny cases over TCP and UDP | Engine, boundary, and live namespace tests; hostname requests are resolved and address-checked by the reference boundary; no per-port policy |
+| CONNECT parser safety | Conflicting authorities, malformed ports, duplicate framing, unsupported extended protocols, URI encoding, fragmented heads | Numeric port range, stalled request head, malformed template, and unsupported `:protocol` tests; complete negative corpus and fuzzing required |
 | Payload separation | Send nested CONNECT and forged identity-looking bytes inside an authorized tunnel; verify unchanged opaque delivery and no new authority | Reference boundary test over HTTP/1.1 and HTTP/2 with a real upstream socket |
-| DNS/address safety | Rebinding, mixed permitted/forbidden A/AAAA results, mapped addresses, retries, redirects, static mappings | Literal and mapped-IP policy tests only; DNS pinning and gateway redirect tests required |
+| DNS/address safety | Rebinding, mixed permitted/forbidden A/AAAA results, mapped addresses, retries, redirects, static mappings | Reference boundary tests with a substituted resolver: loopback, private, link-local/metadata, mapped, NAT64, shared, reserved, multicast, and mixed answers are denied or filtered and the checked address is dialed; gateway redirect and retry tests required |
 | Optional FD registration | Wrong registrant, wrong descriptor type/count, truncation, inherited copies, stale generation, restart | Not implemented; not required by the local model |
 | Tenant separation | A cannot use B's endpoint, policy, key, signing service, or ingress route | Not implemented end to end |
 | Credentials | No key in guest, logs, errors, or redirects; every reused request reauthorized | Demo injection unit tests only; production gateway checks required |
 | Failure and revocation | Proxy loss, missing policy, channel closure, retained FDs, policy update, certificate expiry, draining | Refusal and namespace shutdown tests; controller revocation and draining not implemented |
-| Resource limits | Slow heads, oversized capsules, stream floods, DNS growth, stalled peers, UDP amplification | Capsule bounds and selected relay/lifecycle tests; multi-tenant overload tests required |
+| Resource limits | Slow heads, oversized capsules, stream floods, DNS growth, stalled peers, UDP amplification | Request-head deadline, capsule bounds, synthetic-name limit, and selected relay/lifecycle tests; multi-tenant overload tests required |
 | Software integrity | Wrong signer/digest, modified policy, stale update, replayed attestation, wrong session key | Not implemented; depends on deployment verifier |
 | Ingress | Caller auth, authorized service only, stale route rejection, port restrictions, namespace return path | Guest demo delivery only; namespace reverse channel is not implemented |
 

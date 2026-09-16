@@ -1,6 +1,9 @@
 // Command connect-proxy is a minimal reference boundary: CONNECT for
 // TCP and connect-udp (RFC 9298) for UDP, applying deny-by-default
 // policy on destination names and IP addresses, with one audit line per decision.
+// Hostnames are resolved by the boundary and only public or explicitly
+// listed resolved addresses are dialed, so an allowed name cannot reach
+// loopback, private, link-local, or metadata addresses.
 // -h2 switches from HTTP/1.1 (one connection per flow) to a single
 // multiplexed cleartext HTTP/2 session (prior knowledge, HBONE-shaped):
 // TCP flows are CONNECT streams, UDP sessions extended CONNECT streams.
@@ -27,6 +30,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -37,6 +41,9 @@ import (
 )
 
 const dialTimeout = 15 * time.Second
+
+// headTimeout bounds how long a client may take to send a request head.
+var headTimeout = dialTimeout
 
 func boundaryTLSConfig(certPath, keyPath, clientCAPath string) (*tls.Config, error) {
 	if certPath == "" && keyPath == "" && clientCAPath == "" {
@@ -74,30 +81,110 @@ var (
 	allowed    = map[string]bool{}
 	allowedIPs []netip.Prefix
 	enableUDP  bool
+	// lookupNetIP resolves permitted hostnames; tests substitute it.
+	lookupNetIP = net.DefaultResolver.LookupNetIP
 )
+
+// nonPublic lists special-purpose ranges that netip's classifiers do not
+// cover. Together with loopback, private, link-local, multicast, and
+// unspecified addresses they are denied for resolved hostnames unless
+// -allow-ip names them.
+var nonPublic = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b::/96"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("3fff::/20"),
+	netip.MustParsePrefix("5f00::/16"),
+	netip.MustParsePrefix("fec0::/10"),
+}
 
 func audit(decision, target string) {
 	log.Printf("%s %s", decision, target)
 }
 
-// authorize applies hostname policy or the explicit IP allowlist.
-func authorize(host string) (reason string, ok bool) {
+func listedAddress(address netip.Addr) bool {
+	for _, prefix := range allowedIPs {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+func publicAddress(address netip.Addr) bool {
+	if !address.IsGlobalUnicast() || address.IsPrivate() {
+		return false
+	}
+	for _, prefix := range nonPublic {
+		if prefix.Contains(address) {
+			return false
+		}
+	}
+	return true
+}
+
+// authorize applies destination policy and returns the exact addresses the
+// boundary may dial. Literals must be listed in -allow-ip. Hostnames must
+// pass -allow and are resolved here; only public or explicitly listed
+// resolved addresses are kept, so an allowed name cannot reach loopback,
+// private, or metadata addresses by rebinding. A non-empty reason is a
+// policy denial; a non-nil error is a resolution failure.
+func authorize(ctx context.Context, host, port string) (addresses []netip.Addr, reason string, err error) {
+	if number, err := strconv.ParseUint(port, 10, 16); err != nil || number == 0 {
+		return nil, "malformed-port", nil
+	}
 	host = strings.ToLower(host)
 	if address, err := netip.ParseAddr(host); err == nil {
 		if address.Zone() != "" {
-			return "scoped-ip", false
+			return nil, "scoped-ip", nil
 		}
-		for _, prefix := range allowedIPs {
-			if prefix.Contains(address.Unmap()) {
-				return "", true
-			}
+		if address = address.Unmap(); !listedAddress(address) {
+			return nil, "ip-not-on-allowlist", nil
 		}
-		return "ip-not-on-allowlist", false
+		return []netip.Addr{address}, "", nil
 	}
-	if allowAll || allowed[host] {
-		return "", true
+	if !allowAll && !allowed[strings.TrimSuffix(host, ".")] {
+		return nil, "not-on-allowlist", nil
 	}
-	return "not-on-allowlist", false
+	resolved, err := lookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return nil, "", err
+	}
+	for _, address := range resolved {
+		address = address.Unmap()
+		if address.Zone() == "" && (listedAddress(address) || publicAddress(address)) {
+			addresses = append(addresses, address)
+		}
+	}
+	if len(addresses) == 0 {
+		return nil, "resolved-address-denied", nil
+	}
+	return addresses, "", nil
+}
+
+// dialAuthorized connects to the first reachable checked address without
+// resolving the hostname again.
+func dialAuthorized(network string, addresses []netip.Addr, port string) (net.Conn, error) {
+	var err error
+	for _, address := range addresses {
+		var upstream net.Conn
+		upstream, err = net.DialTimeout(network, net.JoinHostPort(address.String(), port), dialTimeout)
+		if err == nil {
+			return upstream, nil
+		}
+	}
+	return nil, err
 }
 
 func parseIPAllowlist(value string) ([]netip.Prefix, error) {
@@ -131,55 +218,70 @@ func refuse(conn net.Conn, reason string) {
 	fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nBoundary-Reason: %s\r\nContent-Length: 0\r\n\r\n", reason)
 }
 
+func badGateway(conn net.Conn) {
+	fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+}
+
+// connectUpstream authorizes host:port and dials a checked address. It
+// writes the HTTP/1.1 refusal itself and returns nil when the tunnel
+// must not be established.
+func connectUpstream(conn net.Conn, network, host, port string) net.Conn {
+	target := net.JoinHostPort(host, port)
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	addresses, reason, err := authorize(ctx, host, port)
+	if reason != "" {
+		audit("BLOCK "+reason, target)
+		refuse(conn, reason)
+		return nil
+	}
+	if err != nil {
+		audit("RESOLVE-FAIL", target)
+		badGateway(conn)
+		return nil
+	}
+	if network == "udp" && !enableUDP {
+		audit("BLOCK udp-disabled", target)
+		refuse(conn, "udp-disabled")
+		return nil
+	}
+	upstream, err := dialAuthorized(network, addresses, port)
+	if err != nil {
+		audit("DIAL-FAIL", target)
+		badGateway(conn)
+		return nil
+	}
+	audit("ALLOW "+network, target+" via "+upstream.RemoteAddr().String())
+	return upstream
+}
+
 func handleConnect(conn net.Conn, br *bufio.Reader, req *http.Request) {
-	target := req.Host
-	host, _, err := net.SplitHostPort(target)
+	host, port, err := net.SplitHostPort(req.Host)
 	if err != nil {
 		refuse(conn, "malformed-target")
 		return
 	}
-	if reason, ok := authorize(host); !ok {
-		audit("BLOCK "+reason, target)
-		refuse(conn, reason)
-		return
-	}
-	upstream, err := net.DialTimeout("tcp", target, dialTimeout)
-	if err != nil {
-		audit("DIAL-FAIL", target)
-		fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+	upstream := connectUpstream(conn, "tcp", host, port)
+	if upstream == nil {
 		return
 	}
 	defer upstream.Close()
-	audit("ALLOW tcp", target)
 	io.WriteString(conn, "HTTP/1.1 200 OK\r\n\r\n")
 	go io.Copy(upstream, br) // br first: it may hold pipelined bytes
 	io.Copy(conn, upstream)
 }
 
 func handleConnectUDP(conn net.Conn, br *bufio.Reader, req *http.Request) {
-	host, target, ok := masqueTarget(req.URL.Path)
+	host, port, ok := masqueTarget(req.URL.Path)
 	if !ok {
 		refuse(conn, "malformed-template")
 		return
 	}
-	if reason, ok := authorize(host); !ok {
-		audit("BLOCK "+reason, target)
-		refuse(conn, reason)
-		return
-	}
-	if !enableUDP {
-		audit("BLOCK udp-disabled", target)
-		refuse(conn, "udp-disabled")
-		return
-	}
-	upstream, err := net.DialTimeout("udp", target, dialTimeout)
-	if err != nil {
-		audit("DIAL-FAIL", target)
-		fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
+	upstream := connectUpstream(conn, "udp", host, port)
+	if upstream == nil {
 		return
 	}
 	defer upstream.Close()
-	audit("ALLOW udp", target)
 	io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n")
 	pumpUDP(tun2connect.NewCapsuleStream(struct {
 		io.Reader
@@ -189,16 +291,16 @@ func handleConnectUDP(conn net.Conn, br *bufio.Reader, req *http.Request) {
 
 // masqueTarget parses the default connect-udp URI template
 // /.well-known/masque/udp/{host}/{port}/.
-func masqueTarget(path string) (host, target string, ok bool) {
+func masqueTarget(path string) (host, port string, ok bool) {
 	seg := strings.Split(strings.Trim(path, "/"), "/")
 	if len(seg) != 5 || seg[0] != ".well-known" || seg[1] != "masque" || seg[2] != "udp" {
 		return "", "", false
 	}
 	host, err := url.PathUnescape(seg[3])
-	if err != nil {
+	if err != nil || host == "" {
 		return "", "", false
 	}
-	return host, net.JoinHostPort(host, seg[4]), true
+	return host, seg[4], true
 }
 
 func pumpUDP(cs *tun2connect.CapsuleStream, upstream net.Conn) {
@@ -232,11 +334,14 @@ func serve(conn net.Conn) {
 		audit("TLS-FAIL", err.Error())
 		return
 	}
+	// Bound the request head so a stalled client cannot hold the handler.
+	conn.SetReadDeadline(time.Now().Add(headTimeout))
 	br := bufio.NewReader(conn)
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return
 	}
+	conn.SetReadDeadline(time.Time{})
 	switch {
 	case req.Method == http.MethodConnect:
 		handleConnect(conn, br, req)
@@ -307,6 +412,37 @@ func refuseH2(w http.ResponseWriter, reason string) {
 	w.WriteHeader(http.StatusForbidden)
 }
 
+// connectUpstreamH2 is connectUpstream for one HTTP/2 stream.
+func connectUpstreamH2(ctx context.Context, w http.ResponseWriter, network, host, port, peer string) net.Conn {
+	label := withPeer(net.JoinHostPort(host, port), peer)
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+	addresses, reason, err := authorize(ctx, host, port)
+	if reason != "" {
+		audit("BLOCK "+reason, label)
+		refuseH2(w, reason)
+		return nil
+	}
+	if err != nil {
+		audit("RESOLVE-FAIL", label)
+		w.WriteHeader(http.StatusBadGateway)
+		return nil
+	}
+	if network == "udp" && !enableUDP {
+		audit("BLOCK udp-disabled", label)
+		refuseH2(w, "udp-disabled")
+		return nil
+	}
+	upstream, err := dialAuthorized(network, addresses, port)
+	if err != nil {
+		audit("DIAL-FAIL", label)
+		w.WriteHeader(http.StatusBadGateway)
+		return nil
+	}
+	audit("ALLOW "+network+"/h2", label+" via "+upstream.RemoteAddr().String())
+	return upstream
+}
+
 // serveH2 handles one stream of the multiplexed session: CONNECT is a
 // TCP tunnel, extended CONNECT (:protocol connect-udp) a UDP session.
 // peer is the session's mTLS identity, audit-only.
@@ -322,30 +458,16 @@ func serveH2(peer string) http.HandlerFunc {
 				refuseH2(w, "unsupported-protocol")
 				return
 			}
-			host, target, ok := masqueTarget(r.URL.Path)
+			host, port, ok := masqueTarget(r.URL.Path)
 			if !ok {
 				refuseH2(w, "malformed-template")
 				return
 			}
-			label := withPeer(target, peer)
-			if reason, ok := authorize(host); !ok {
-				audit("BLOCK "+reason, label)
-				refuseH2(w, reason)
-				return
-			}
-			if !enableUDP {
-				audit("BLOCK udp-disabled", label)
-				refuseH2(w, "udp-disabled")
-				return
-			}
-			upstream, err := net.DialTimeout("udp", target, dialTimeout)
-			if err != nil {
-				audit("DIAL-FAIL", label)
-				w.WriteHeader(http.StatusBadGateway)
+			upstream := connectUpstreamH2(r.Context(), w, "udp", host, port, peer)
+			if upstream == nil {
 				return
 			}
 			defer upstream.Close()
-			audit("ALLOW udp/h2", label)
 			w.Header().Set("Capsule-Protocol", "?1")
 			w.WriteHeader(http.StatusOK)
 			f.Flush()
@@ -356,26 +478,16 @@ func serveH2(peer string) http.HandlerFunc {
 			return
 		}
 
-		target := r.Host
-		host, _, err := net.SplitHostPort(target)
+		host, port, err := net.SplitHostPort(r.Host)
 		if err != nil {
 			refuseH2(w, "malformed-target")
 			return
 		}
-		label := withPeer(target, peer)
-		if reason, ok := authorize(host); !ok {
-			audit("BLOCK "+reason, label)
-			refuseH2(w, reason)
-			return
-		}
-		upstream, err := net.DialTimeout("tcp", target, dialTimeout)
-		if err != nil {
-			audit("DIAL-FAIL", label)
-			w.WriteHeader(http.StatusBadGateway)
+		upstream := connectUpstreamH2(r.Context(), w, "tcp", host, port, peer)
+		if upstream == nil {
 			return
 		}
 		defer upstream.Close()
-		audit("ALLOW tcp/h2", label)
 		w.WriteHeader(http.StatusOK)
 		f.Flush()
 		go io.Copy(upstream, r.Body)
@@ -385,8 +497,8 @@ func serveH2(peer string) http.HandlerFunc {
 
 func main() {
 	listen := flag.String("listen", "unix:///tmp/boundary.sock", "listen address (unix:///path or tcp://host:port)")
-	allow := flag.String("allow", "", "comma-separated destination names to allow; '*' allows all names (default: deny everything)")
-	allowIP := flag.String("allow-ip", "", "comma-separated IP addresses or CIDRs to allow for literal destinations (default: deny IP literals)")
+	allow := flag.String("allow", "", "comma-separated destination names to allow; '*' allows all names (default: deny everything). Resolved addresses must be public unless listed in -allow-ip")
+	allowIP := flag.String("allow-ip", "", "comma-separated IP addresses or CIDRs to allow for literal destinations and for non-public resolved addresses (default: deny)")
 	udp := flag.Bool("udp", false, "serve connect-udp tunnels")
 	h2 := flag.Bool("h2", false, "speak multiplexed cleartext HTTP/2 (prior knowledge) instead of HTTP/1.1")
 	tlsCert := flag.String("tls-cert", "", "PEM server certificate; enables TLS (with -h2: the HBONE-style mTLS+h2 arrangement)")
@@ -420,7 +532,7 @@ func main() {
 	}
 
 	for _, h := range strings.Split(*allow, ",") {
-		if h = strings.ToLower(strings.TrimSpace(h)); h == "*" {
+		if h = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(h)), "."); h == "*" {
 			allowAll = true
 		} else if h != "" {
 			allowed[h] = true

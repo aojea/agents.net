@@ -17,6 +17,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -24,13 +25,13 @@ import (
 	"github.com/aojea/agents.net/tun2connect/pkg/tun2connect"
 )
 
-// Guest addresses sit at the TOP of the synthetic pools: VirtualDNS hands
-// out addresses from the bottom up, so these can never collide with an
-// invented answer. The /10 and /64 prefix lengths make the kernel install
-// the connected routes that cover every synthetic address, and the
-// resolver needs no route of its own -- any pool address works, because
-// the engine answers port 53 locally wherever the query is sent. The
-// device is also made the default route; see configureTUN for why.
+// Guest addresses sit at the TOP of the synthetic pools, inside the /24
+// and /120 that VirtualDNS reserves and never hands out, so they cannot
+// collide with an invented answer. The /10 and /64 prefix lengths make
+// the kernel install the connected routes that cover every synthetic
+// address, and the resolver needs no route of its own -- any pool address
+// works, because the engine answers port 53 locally wherever the query is
+// sent. The device is also made the default route; see configureTUN for why.
 const (
 	guestAddr4     = "100.127.255.254"
 	pool4PrefixLen = 10
@@ -102,6 +103,9 @@ func runLauncher(args []string) {
 	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver "+resolverAddr+"\n"), 0o644); err != nil {
 		log.Printf("[!] writing /etc/resolv.conf: %v (lookups may not reach the virtual DNS)", err)
 	}
+	if err := dropNetAdmin(); err != nil {
+		log.Fatalf("dropping CAP_NET_ADMIN after TUN setup: %v", err)
+	}
 	dev, err := tun2connect.NewTUNDevice(fd, uint32(*mtu))
 	if err != nil {
 		log.Fatalf("link endpoint: %v", err)
@@ -127,6 +131,33 @@ func runLauncher(args []string) {
 
 	log.Printf("launcher up: device=%s boundary=%s agent=%q", *device, boundary, argv)
 	os.Exit(runChild(argv))
+}
+
+// dropNetAdmin removes CAP_NET_ADMIN, which only TUN setup needed, from
+// every launcher thread and from the bounding set the agent inherits, so
+// neither a compromised launcher nor the agent can reconfigure networking.
+// Capability sets are per thread; the child is cloned from whichever thread
+// runs the goroutine, so all threads must agree (needs a cgo-free build).
+func dropNetAdmin() error {
+	if _, _, errno := syscall.AllThreadsSyscall6(unix.SYS_PRCTL, unix.PR_CAPBSET_DROP, unix.CAP_NET_ADMIN, 0, 0, 0, 0); errno != 0 {
+		return fmt.Errorf("bounding set: %w (needs CAP_SETPCAP and CGO_ENABLED=0)", errno)
+	}
+	header := unix.CapUserHeader{Version: unix.LINUX_CAPABILITY_VERSION_3}
+	var data [2]unix.CapUserData
+	if err := unix.Capget(&header, &data[0]); err != nil {
+		return fmt.Errorf("capget: %w", err)
+	}
+	const mask = ^uint32(1 << unix.CAP_NET_ADMIN)
+	data[0].Effective &= mask
+	data[0].Permitted &= mask
+	data[0].Inheritable &= mask
+	if _, _, errno := syscall.AllThreadsSyscall(unix.SYS_CAPSET, uintptr(unsafe.Pointer(&header)), uintptr(unsafe.Pointer(&data[0])), 0); errno != 0 {
+		return fmt.Errorf("capset: %w", errno)
+	}
+	if kept, err := unix.PrctlRetInt(unix.PR_CAPBSET_READ, unix.CAP_NET_ADMIN, 0, 0, 0); err != nil || kept != 0 {
+		return fmt.Errorf("CAP_NET_ADMIN still in bounding set (%d, %v)", kept, err)
+	}
+	return nil
 }
 
 // configureTUN gives the device the guest addresses, brings it up, and

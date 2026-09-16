@@ -1,6 +1,8 @@
 package tun2connect
 
 import (
+	"errors"
+	"fmt"
 	"net/netip"
 	"testing"
 
@@ -44,6 +46,85 @@ func TestReverseMissForUnknownAddress(t *testing.T) {
 	d := NewVirtualDNS()
 	if name, ok := d.Reverse(netip.MustParseAddr("100.64.9.9")); ok {
 		t.Fatalf("unexpected mapping %q for an address never handed out", name)
+	}
+}
+
+// TestNameLimitEvictsWithoutReusingAddresses fills a family past its bound
+// and checks that the least recently used name is forgotten, that a name
+// kept alive by dialing survives, and that no address is ever handed out
+// twice, so a stale guest cache misses rather than reaching another name.
+func TestNameLimitEvictsWithoutReusingAddresses(t *testing.T) {
+	d := NewVirtualDNS()
+	handed := make(map[netip.Addr]string, maxSyntheticNames+2)
+	var first, second netip.Addr
+	for i := range maxSyntheticNames {
+		addr, err := d.Resolve6(fmt.Sprintf("n%d.example", i))
+		if err != nil {
+			t.Fatalf("name %d: %v", i, err)
+		}
+		if previous, dup := handed[addr]; dup {
+			t.Fatalf("%v handed to %q and %q", addr, previous, fmt.Sprintf("n%d.example", i))
+		}
+		handed[addr] = fmt.Sprintf("n%d.example", i)
+		switch i {
+		case 0:
+			first = addr
+		case 1:
+			second = addr
+		}
+	}
+	// Dialing n1 makes it recent; n0 is now the least recently used.
+	if name, ok := d.Reverse(second); !ok || name != "n1.example" {
+		t.Fatalf("Reverse(%v) = %q, %v", second, name, ok)
+	}
+	overflow, err := d.Resolve6("overflow.example")
+	if err != nil {
+		t.Fatalf("resolution past the bound must evict, not fail: %v", err)
+	}
+	if _, dup := handed[overflow]; dup {
+		t.Fatalf("address %v reused after eviction", overflow)
+	}
+	if name, ok := d.Reverse(first); ok {
+		t.Fatalf("evicted n0 still reverses to %q", name)
+	}
+	if name, ok := d.Reverse(second); !ok || name != "n1.example" {
+		t.Fatalf("recently dialed n1 was evicted: %q, %v", name, ok)
+	}
+	if again, err := d.Resolve6("n0.example"); err != nil || again == first {
+		t.Fatalf("re-resolved n0 = %v, %v; want a fresh address, not %v", again, err, first)
+	}
+	if d.v6.order.Len() != maxSyntheticNames || len(d.v6.names) != maxSyntheticNames {
+		t.Fatalf("family holds %d/%d names, want %d", d.v6.order.Len(), len(d.v6.names), maxSyntheticNames)
+	}
+	if len(d.reverse) != maxSyntheticNames {
+		t.Fatalf("reverse map holds %d entries, want %d", len(d.reverse), maxSyntheticNames)
+	}
+	if _, err := d.Resolve4("other-family.example"); err != nil {
+		t.Fatalf("limit is per family: %v", err)
+	}
+}
+
+func TestReservedTopOfPoolIsNeverAllocated(t *testing.T) {
+	d := NewVirtualDNS()
+	d.v4.last = v4Reserved.Addr().Prev().Prev()
+	addr, err := d.Resolve4("last.example")
+	if err != nil || v4Reserved.Contains(addr) {
+		t.Fatalf("last free address: %v, %v", addr, err)
+	}
+	if _, err := d.Resolve4("reserved.example"); !errors.Is(err, ErrPoolExhausted) {
+		t.Fatalf("allocation entered the reserved range: %v", err)
+	}
+	resp, err := d.HandleQuery(buildQuery(t, "reserved.example.", dnsmessage.TypeA))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p dnsmessage.Parser
+	hdr, err := p.Start(resp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.RCode != dnsmessage.RCodeServerFailure {
+		t.Fatalf("want SERVFAIL when exhausted, got %v", hdr.RCode)
 	}
 }
 

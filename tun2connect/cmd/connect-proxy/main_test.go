@@ -182,12 +182,18 @@ func TestTunnelPayloadDoesNotGrantAuthority(t *testing.T) {
 }
 
 func TestIPAllowlist(t *testing.T) {
-	previousIPs, previousAll, previousNames := allowedIPs, allowAll, allowed
-	t.Cleanup(func() { allowedIPs, allowAll, allowed = previousIPs, previousAll, previousNames })
+	previousIPs, previousAll, previousNames, previousLookup := allowedIPs, allowAll, allowed, lookupNetIP
+	t.Cleanup(func() {
+		allowedIPs, allowAll, allowed, lookupNetIP = previousIPs, previousAll, previousNames, previousLookup
+	})
+	lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	}
+	ctx := context.Background()
 	allowed = map[string]bool{"api.example": true}
 	allowAll = true
 	allowedIPs = nil
-	if _, ok := authorize("127.0.0.1"); ok {
+	if _, reason, _ := authorize(ctx, "127.0.0.1", "443"); reason == "" {
 		t.Fatal("hostname wildcard must not authorize literal addresses")
 	}
 	allowAll = false
@@ -198,18 +204,27 @@ func TestIPAllowlist(t *testing.T) {
 	}
 	for _, test := range []struct {
 		host string
+		port string
 		want bool
 	}{
-		{"API.EXAMPLE", true}, {"denied.example", false},
-		{"192.0.2.1", true}, {"192.0.2.2", false},
-		{"198.51.100.254", true}, {"198.51.101.1", false},
-		{"2001:db8::1", true}, {"2001:db8:0:1::1", false},
-		{"::ffff:192.0.2.1", true}, {"203.0.113.1", true},
-		{"127.0.0.1", false}, {"169.254.169.254", false}, {"fe80::1%eth0", false},
+		{"API.EXAMPLE", "443", true}, {"api.example.", "443", true}, {"denied.example", "443", false},
+		{"192.0.2.1", "443", true}, {"192.0.2.2", "443", false},
+		{"198.51.100.254", "443", true}, {"198.51.101.1", "443", false},
+		{"2001:db8::1", "443", true}, {"2001:db8:0:1::1", "443", false},
+		{"::ffff:192.0.2.1", "443", true}, {"203.0.113.1", "443", true},
+		{"127.0.0.1", "443", false}, {"169.254.169.254", "80", false}, {"fe80::1%eth0", "443", false},
+		{"192.0.2.1", "0", false}, {"192.0.2.1", "65536", false}, {"192.0.2.1", "https", false}, {"192.0.2.1", "", false},
 	} {
-		t.Run(test.host, func(t *testing.T) {
-			if reason, ok := authorize(test.host); ok != test.want {
+		t.Run(test.host+":"+test.port, func(t *testing.T) {
+			addresses, reason, err := authorize(ctx, test.host, test.port)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok := reason == ""; ok != test.want {
 				t.Fatalf("authorize = %v (%s), want %v", ok, reason, test.want)
+			}
+			if test.want && len(addresses) != 1 {
+				t.Fatalf("addresses = %v, want exactly one", addresses)
 			}
 		})
 	}
@@ -217,6 +232,162 @@ func TestIPAllowlist(t *testing.T) {
 		if _, err := parseIPAllowlist(entry); err == nil {
 			t.Errorf("invalid IP policy accepted: %s", entry)
 		}
+	}
+}
+
+// TestResolvedAddressPolicy checks that an allowed hostname only yields
+// public or explicitly listed addresses, whatever its DNS answers say.
+func TestResolvedAddressPolicy(t *testing.T) {
+	previousIPs, previousAll, previousNames, previousLookup := allowedIPs, allowAll, allowed, lookupNetIP
+	t.Cleanup(func() {
+		allowedIPs, allowAll, allowed, lookupNetIP = previousIPs, previousAll, previousNames, previousLookup
+	})
+	allowAll = true
+	allowed = map[string]bool{}
+	allowedIPs = []netip.Prefix{netip.MustParsePrefix("10.1.2.0/24")}
+	ctx := context.Background()
+	answers := map[string][]string{
+		"public.example":    {"93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"},
+		"metadata.example":  {"169.254.169.254"},
+		"loopback.example":  {"127.0.0.1", "::1"},
+		"private.example":   {"10.0.0.5", "172.16.0.1", "192.168.1.1", "fd00::1"},
+		"mapped.example":    {"::ffff:127.0.0.1", "::ffff:10.0.0.1"},
+		"nat64.example":     {"64:ff9b::7f00:1"},
+		"shared.example":    {"100.64.0.1", "100::1"},
+		"reserved.example":  {"0.0.0.1", "240.0.0.1", "255.255.255.255", "2001:db8::1", "2002:7f00:1::1", "fec0::1"},
+		"multicast.example": {"224.0.0.1", "ff02::1", "0.0.0.0", "::"},
+		"mixed.example":     {"127.0.0.1", "93.184.216.34", "169.254.169.254"},
+		"listed.example":    {"10.1.2.3"},
+		"empty.example":     {},
+	}
+	lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		records, ok := answers[host]
+		if !ok {
+			return nil, errors.New("no such host")
+		}
+		var addresses []netip.Addr
+		for _, record := range records {
+			addresses = append(addresses, netip.MustParseAddr(record))
+		}
+		return addresses, nil
+	}
+	for host, want := range map[string][]string{
+		"public.example":    {"93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"},
+		"metadata.example":  nil,
+		"loopback.example":  nil,
+		"private.example":   nil,
+		"mapped.example":    nil,
+		"nat64.example":     nil,
+		"shared.example":    nil,
+		"reserved.example":  nil,
+		"multicast.example": nil,
+		"mixed.example":     {"93.184.216.34"},
+		"listed.example":    {"10.1.2.3"},
+		"empty.example":     nil,
+	} {
+		t.Run(host, func(t *testing.T) {
+			addresses, reason, err := authorize(ctx, host, "443")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want == nil {
+				if reason != "resolved-address-denied" || len(addresses) != 0 {
+					t.Fatalf("expected denial, got %v (%q)", addresses, reason)
+				}
+				return
+			}
+			if reason != "" || len(addresses) != len(want) {
+				t.Fatalf("addresses = %v (%q), want %v", addresses, reason, want)
+			}
+			for i, address := range addresses {
+				if address.String() != want[i] {
+					t.Fatalf("addresses = %v, want %v", addresses, want)
+				}
+			}
+		})
+	}
+	if _, reason, err := authorize(ctx, "missing.example", "443"); err == nil || reason != "" {
+		t.Fatalf("resolution failure must be an error, not a policy decision: %v %q", err, reason)
+	}
+}
+
+// TestHostnameDialsCheckedAddress sends a hostname CONNECT and checks the
+// boundary dials the resolved address it checked rather than the name.
+func TestHostnameDialsCheckedAddress(t *testing.T) {
+	previousIPs, previousNames, previousLookup := allowedIPs, allowed, lookupNetIP
+	t.Cleanup(func() { allowedIPs, allowed, lookupNetIP = previousIPs, previousNames, previousLookup })
+	upstream, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	var connections atomic.Int32
+	go func() {
+		for {
+			conn, err := upstream.Accept()
+			if err != nil {
+				return
+			}
+			connections.Add(1)
+			go func() { defer conn.Close(); io.Copy(conn, conn) }()
+		}
+	}()
+	port := uint16(upstream.Addr().(*net.TCPAddr).Port)
+	allowed = map[string]bool{"echo.example": true, "rebound.example": true}
+	lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
+	}
+	for _, protocol := range []string{"h1", "h2"} {
+		t.Run(protocol, func(t *testing.T) {
+			client := boundaryClient(t, protocol)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			// Loopback is not public: without -allow-ip the resolved address is denied.
+			allowedIPs = nil
+			_, err := client.DialTCP(ctx, "rebound.example", port)
+			var refusal *tun2connect.DialError
+			if !errors.As(err, &refusal) || refusal.StatusCode != http.StatusForbidden || refusal.Reason != "resolved-address-denied" {
+				t.Fatalf("allowed name resolving to loopback must be denied: %v", err)
+			}
+			if connections.Load() != 0 {
+				t.Fatal("denied name produced an upstream connection")
+			}
+			allowedIPs = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
+			conn, err := client.DialTCP(ctx, "echo.example", port)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			stop := context.AfterFunc(ctx, func() { conn.Close() })
+			defer stop()
+			if _, err := conn.Write([]byte("named")); err != nil {
+				t.Fatal(err)
+			}
+			response := make([]byte, 5)
+			if _, err := io.ReadFull(conn, response); err != nil || string(response) != "named" {
+				t.Fatalf("echo = %q, err = %v", response, err)
+			}
+			connections.Store(0)
+		})
+	}
+}
+
+func TestRequestHeadDeadline(t *testing.T) {
+	previous := headTimeout
+	t.Cleanup(func() { headTimeout = previous })
+	headTimeout = 50 * time.Millisecond
+	client, server := net.Pipe()
+	defer client.Close()
+	done := make(chan struct{})
+	go func() { defer close(done); serve(server) }()
+	// A client that never completes the request head must not hold the
+	// handler indefinitely; net.Pipe honors deadlines.
+	client.SetDeadline(time.Now().Add(time.Second))
+	io.WriteString(client, "CONNECT ")
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stalled request head kept the handler alive")
 	}
 }
 

@@ -136,7 +136,8 @@ Anything not on the four lists is refused with `403 Forbidden` and a
 `Boundary-Reason` header and logged. The guest sees a connection failure. This
 demo policy denies IP literals; that is not a protocol or adapter restriction.
 The [Go boundary](../tun2connect/cmd/connect-proxy/main.go) accepts explicitly
-authorized addresses and CIDRs through `-allow-ip`.
+authorized addresses and CIDRs through `-allow-ip`, and unlike this demo it
+also resolves allowed hostnames itself and refuses non-public results.
 
 Start the boundary on the host. For the local-only demo in this tutorial, no credentials are needed at all:
 
@@ -278,10 +279,10 @@ curl --proxy http://127.0.0.1:18080 https://example.com -o /dev/null -w '%{http_
 curl --proxy http://127.0.0.1:18080 https://evil.example                                    # CONNECT tunnel failed, response 403
 ```
 
-The audit log mirrors Lab 7's, decided on the same policy input -- the name in the CONNECT authority:
+The audit log mirrors Lab 7's, decided on the same policy input -- the name in the CONNECT authority. The boundary resolves the allowed name itself, records the address it checked and dialed, and denies names that resolve to loopback, private, or link-local addresses unless `-allow-ip` lists them:
 
 ```text
-ALLOW tcp example.com:443
+ALLOW tcp example.com:443 via 93.184.216.34:443
 BLOCK not-on-allowlist evil.example:443
 ```
 
@@ -341,6 +342,9 @@ The container was not started with `--network none`. The launcher refuses to run
 
 **`tun2connect` fails to create the tun**
 Missing `--cap-add NET_ADMIN` and/or `--device /dev/net/tun` on the `docker run` line.
+
+**`dropping CAP_NET_ADMIN after TUN setup: ...`**
+After the tun exists the launcher removes `CAP_NET_ADMIN` from itself and from the agent's bounding set, and refuses to start the agent if it cannot. It needs `CAP_SETPCAP` (in the default container set; do not `--cap-drop SETPCAP`) and a launcher built with `CGO_ENABLED=0`, as in Lab 1.
 
 **`[!] no demo MITM cert (run gen_certs.sh) -- refusing`**
 Lab 4 was started before Lab 2 completed. Run `./demo/gen_certs.sh` and restart `host_proxy.py`.
