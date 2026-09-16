@@ -30,6 +30,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/textproto"
 	"net/url"
 	"os"
 	"strconv"
@@ -39,6 +40,7 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2"
 
 	"github.com/aojea/agents.net/tun2connect/pkg/tun2connect"
@@ -327,6 +329,26 @@ func splitPort(entry string) (rest string, port uint16, hasPort bool, err error)
 	return rest, port, err == nil, err
 }
 
+// validName accepts a normalized (lowercase, no trailing dot) hostname
+// policy entry: dot-separated non-empty labels of letters, digits,
+// hyphens, and underscores, within DNS length limits.
+func validName(name string) bool {
+	if name == "" || len(name) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if label == "" || len(label) > 63 {
+			return false
+		}
+		for _, c := range label {
+			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // parseAllow reads "name[:port]" entries; "*" matches every name. An
 // entry without a port permits every port on that name.
 func parseAllow(value string) (map[string]*portSet, error) {
@@ -341,11 +363,11 @@ func parseAllow(value string) (map[string]*portSet, error) {
 			return nil, fmt.Errorf("invalid -allow entry %q: %w", entry, err)
 		}
 		name = strings.TrimSuffix(strings.ToLower(name), ".")
-		if name == "" {
-			return nil, fmt.Errorf("invalid -allow entry %q: empty name", entry)
-		}
 		if _, err := netip.ParseAddr(name); err == nil {
 			return nil, fmt.Errorf("invalid -allow entry %q: addresses belong in -allow-ip", entry)
+		}
+		if name != "*" && !validName(name) {
+			return nil, fmt.Errorf("invalid -allow entry %q: not a hostname", entry)
 		}
 		set := names[name]
 		if set == nil {
@@ -405,7 +427,7 @@ func parseStatic(value string) (map[string][]netip.Addr, error) {
 		}
 		name, rawAddresses, found := strings.Cut(entry, "=")
 		name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
-		if !found || name == "" {
+		if !found || !validName(name) {
 			return nil, fmt.Errorf("invalid -resolve entry %q (want name=ip)", entry)
 		}
 		if _, err := netip.ParseAddr(name); err == nil {
@@ -430,6 +452,9 @@ type responder interface {
 type h1Responder struct{ conn net.Conn }
 
 func (r h1Responder) deny(status int, reason string) {
+	// The connection ends after a refusal; a peer that never reads must
+	// not hold the handler.
+	r.conn.SetWriteDeadline(time.Now().Add(headTimeout))
 	fmt.Fprintf(r.conn, "HTTP/1.1 %d %s\r\nBoundary-Reason: %s\r\nContent-Length: 0\r\n\r\n", status, http.StatusText(status), reason)
 }
 
@@ -477,7 +502,7 @@ func connectUpstream(ctx context.Context, r responder, wire, network, host, port
 // malformed records and refuses a request that never reached policy.
 func malformed(r responder, wire, network, destination, peer, reason string) {
 	audit(auditRecord{Wire: wire, Transport: network, Destination: destination, Peer: peer, Decision: "block", Reason: reason})
-	r.deny(http.StatusForbidden, reason)
+	r.deny(http.StatusBadRequest, reason)
 }
 
 type closeWriter interface{ CloseWrite() error }
@@ -540,10 +565,10 @@ func relay(client io.ReadWriter, upstream net.Conn, closeClient func()) {
 	io.Copy(client, activityReader{upstream, touch})
 }
 
-func handleConnect(conn net.Conn, br *bufio.Reader, req *http.Request, peer string) {
-	host, port, err := net.SplitHostPort(req.Host)
-	if err != nil {
-		malformed(h1Responder{conn}, "h1", "tcp", req.Host, peer, "malformed-target")
+func handleConnect(conn net.Conn, br *bufio.Reader, h *head, peer string) {
+	host, port, reason := connectTarget(h)
+	if reason != "" {
+		malformed(h1Responder{conn}, "h1", "tcp", h.target, peer, reason)
 		return
 	}
 	upstream := connectUpstream(context.Background(), h1Responder{conn}, "h1", "tcp", host, port, peer)
@@ -559,10 +584,15 @@ func handleConnect(conn net.Conn, br *bufio.Reader, req *http.Request, peer stri
 	}{br, conn}, upstream, func() { conn.Close() })
 }
 
-func handleConnectUDP(conn net.Conn, br *bufio.Reader, req *http.Request, peer string) {
-	host, port, ok := masqueTarget(req.URL.Path)
+func handleConnectUDP(conn net.Conn, br *bufio.Reader, h *head, peer string) {
+	path, ok := upgradeTarget(h)
 	if !ok {
-		malformed(h1Responder{conn}, "h1", "udp", req.URL.Path, peer, "malformed-template")
+		malformed(h1Responder{conn}, "h1", "udp", h.target, peer, "malformed-upgrade")
+		return
+	}
+	host, port, ok := masqueTarget(path)
+	if !ok {
+		malformed(h1Responder{conn}, "h1", "udp", h.target, peer, "malformed-template")
 		return
 	}
 	upstream := connectUpstream(context.Background(), h1Responder{conn}, "h1", "udp", host, port, peer)
@@ -575,6 +605,145 @@ func handleConnectUDP(conn net.Conn, br *bufio.Reader, req *http.Request, peer s
 		io.Reader
 		io.Writer
 	}{br, conn}), upstream, func() { conn.Close() })
+}
+
+// maxHeadBytes bounds an HTTP/1.x request head. The limit is lifted for
+// tunnel data once the head has been parsed.
+const maxHeadBytes = 64 << 10
+
+// headError is a request head the boundary refuses with an HTTP status.
+type headError struct {
+	status int
+	reason string
+}
+
+func (e *headError) Error() string { return e.reason }
+
+// boundedReader caps the bytes read while remaining is non-negative.
+type boundedReader struct {
+	r         io.Reader
+	remaining int64
+}
+
+func (b *boundedReader) Read(p []byte) (int, error) {
+	if b.remaining < 0 {
+		return b.r.Read(p)
+	}
+	if b.remaining == 0 {
+		return 0, &headError{http.StatusRequestHeaderFieldsTooLarge, "head-too-large"}
+	}
+	if int64(len(p)) > b.remaining {
+		p = p[:b.remaining]
+	}
+	n, err := b.r.Read(p)
+	b.remaining -= int64(n)
+	return n, err
+}
+
+// head is a parsed HTTP/1.x request head. It is parsed here rather than
+// with http.ReadRequest because that reader discards the Host field,
+// which Section 4.5 requires comparing against the CONNECT authority.
+type head struct {
+	method, target string
+	major, minor   int
+	header         textproto.MIMEHeader
+}
+
+// readHead parses the request line and header block. It rejects a
+// request line without exactly three single-space-separated fields, a
+// non-token method, an HTTP version other than 1.x, and more than one
+// Host field. Content-Length and Transfer-Encoding are ignored on CONNECT
+// (RFC 9110 Section 9.3.6): bytes after the head are tunnel data.
+func readHead(br *bufio.Reader) (*head, error) {
+	tp := textproto.NewReader(br)
+	line, err := tp.ReadLine()
+	if err != nil {
+		return nil, err
+	}
+	method, rest, found := strings.Cut(line, " ")
+	target, proto, foundProto := strings.Cut(rest, " ")
+	if !found || !foundProto || target == "" || strings.Contains(proto, " ") || !httpguts.ValidHeaderFieldName(method) {
+		return nil, &headError{http.StatusBadRequest, "malformed-request-line"}
+	}
+	major, minor, ok := http.ParseHTTPVersion(proto)
+	if !ok || major != 1 {
+		return nil, &headError{http.StatusHTTPVersionNotSupported, "unsupported-version"}
+	}
+	header, err := tp.ReadMIMEHeader()
+	if err != nil {
+		var he *headError
+		if errors.As(err, &he) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, os.ErrDeadlineExceeded) {
+			return nil, err
+		}
+		return nil, &headError{http.StatusBadRequest, "malformed-header"}
+	}
+	if len(header.Values("Host")) > 1 {
+		return nil, &headError{http.StatusBadRequest, "duplicate-host"}
+	}
+	// textproto tolerates whitespace before the colon (go.dev/issue/34540);
+	// RFC 9112 Section 5.1 requires rejecting it.
+	for key := range header {
+		if !httpguts.ValidHeaderFieldName(key) {
+			return nil, &headError{http.StatusBadRequest, "malformed-header"}
+		}
+	}
+	if minor >= 1 && len(header.Values("Host")) == 0 {
+		return nil, &headError{http.StatusBadRequest, "missing-host"}
+	}
+	return &head{method: method, target: target, major: major, minor: minor, header: header}, nil
+}
+
+// connectTarget validates an authority-form CONNECT target: a host and an
+// explicit numeric port, no userinfo, path, or query, and a Host field
+// (when present) naming the same destination.
+func connectTarget(h *head) (host, port, reason string) {
+	if !httpguts.ValidHostHeader(h.target) {
+		return "", "", "malformed-target"
+	}
+	host, port, err := net.SplitHostPort(h.target)
+	if err != nil || host == "" {
+		return "", "", "malformed-target"
+	}
+	if _, err := parsePort(port); err != nil {
+		return "", "", "malformed-port"
+	}
+	if hostField := h.header.Get("Host"); hostField != "" && !sameAuthority(hostField, h.target) {
+		return "", "", "authority-mismatch"
+	}
+	return host, port, ""
+}
+
+// sameAuthority compares two host:port authorities after normalizing
+// case, a trailing DNS dot, and IP address text.
+func sameAuthority(a, b string) bool {
+	hostA, portA, errA := net.SplitHostPort(a)
+	hostB, portB, errB := net.SplitHostPort(b)
+	if errA != nil || errB != nil || portA != portB {
+		return false
+	}
+	if addrA, err := netip.ParseAddr(hostA); err == nil {
+		addrB, err := netip.ParseAddr(hostB)
+		return err == nil && addrA == addrB
+	}
+	return strings.EqualFold(strings.TrimSuffix(hostA, "."), strings.TrimSuffix(hostB, "."))
+}
+
+// upgradeTarget accepts a connect-udp upgrade (RFC 9298 Section 3.1) in
+// origin or absolute form and returns its path.
+func upgradeTarget(h *head) (path string, ok bool) {
+	if !httpguts.HeaderValuesContainsToken(h.header.Values("Connection"), "Upgrade") ||
+		!httpguts.HeaderValuesContainsToken(h.header.Values("Upgrade"), "connect-udp") {
+		return "", false
+	}
+	u, err := url.ParseRequestURI(h.target)
+	if err != nil || u.User != nil {
+		return "", false
+	}
+	return u.Path, true
+}
+
+func isUpgrade(h *head) bool {
+	return httpguts.HeaderValuesContainsToken(h.header.Values("Upgrade"), "connect-udp")
 }
 
 // masqueTarget parses the default connect-udp URI template
@@ -627,19 +796,27 @@ func serve(conn net.Conn) {
 		audit(auditRecord{Wire: "h1", Decision: "fail", Reason: "tls-failed"})
 		return
 	}
-	// Bound the request head so a stalled client cannot hold the handler.
+	// Bound the request head in time and bytes so a stalled or oversized
+	// head cannot hold the handler or its memory.
 	conn.SetReadDeadline(time.Now().Add(headTimeout))
-	br := bufio.NewReader(conn)
-	req, err := http.ReadRequest(br)
+	limiter := &boundedReader{r: conn, remaining: maxHeadBytes}
+	br := bufio.NewReader(limiter)
+	h, err := readHead(br)
 	if err != nil {
+		var he *headError
+		if errors.As(err, &he) {
+			audit(auditRecord{Wire: "h1", Peer: peer, Decision: "block", Reason: he.reason})
+			h1Responder{conn}.deny(he.status, he.reason)
+		}
 		return
 	}
 	conn.SetReadDeadline(time.Time{})
+	limiter.remaining = -1
 	switch {
-	case req.Method == http.MethodConnect:
-		handleConnect(conn, br, req, peer)
-	case req.Method == http.MethodGet && strings.EqualFold(req.Header.Get("Upgrade"), "connect-udp"):
-		handleConnectUDP(conn, br, req, peer)
+	case h.method == http.MethodConnect:
+		handleConnect(conn, br, h, peer)
+	case h.method == http.MethodGet && isUpgrade(h):
+		handleConnectUDP(conn, br, h, peer)
 	default:
 		h1Responder{conn}.deny(http.StatusMethodNotAllowed, "connect-only")
 	}
@@ -730,8 +907,12 @@ func serveH2(peer string) http.HandlerFunc {
 		}
 
 		host, port, err := net.SplitHostPort(r.Host)
-		if err != nil {
+		if err != nil || host == "" {
 			malformed(h2Responder{w}, "h2", "tcp", r.Host, peer, "malformed-target")
+			return
+		}
+		if _, err := parsePort(port); err != nil {
+			malformed(h2Responder{w}, "h2", "tcp", r.Host, peer, "malformed-port")
 			return
 		}
 		upstream := connectUpstream(r.Context(), h2Responder{w}, "h2", "tcp", host, port, peer)

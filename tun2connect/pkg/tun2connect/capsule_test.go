@@ -2,6 +2,7 @@ package tun2connect
 
 import (
 	"bytes"
+	"io"
 	"testing"
 )
 
@@ -59,4 +60,34 @@ func TestCapsuleRejectsOversizedLength(t *testing.T) {
 	if _, err := s.ReadDatagram(); err == nil {
 		t.Fatal("oversized capsule length must be rejected")
 	}
+}
+
+// FuzzReadDatagram feeds arbitrary bytes to the capsule reader, which the
+// boundary runs on guest-controlled input. It must never panic, and every
+// datagram it returns must fit the declared bound.
+func FuzzReadDatagram(f *testing.F) {
+	var seed bytes.Buffer
+	s := NewCapsuleStream(&seed)
+	s.WriteDatagram([]byte("seed"))
+	s.WriteDatagram(bytes.Repeat([]byte{1}, 65000))
+	f.Add(seed.Bytes())
+	f.Add(appendVarint(appendVarint(nil, capsuleTypeDatagram), 1<<20))
+	f.Add(appendVarint(appendVarint(nil, 0x17), 3))
+	f.Add([]byte{0xc0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
+	f.Add([]byte{})
+	f.Fuzz(func(t *testing.T, data []byte) {
+		s := NewCapsuleStream(struct {
+			io.Reader
+			io.Writer
+		}{bytes.NewReader(data), io.Discard})
+		for {
+			payload, err := s.ReadDatagram()
+			if err != nil {
+				return
+			}
+			if len(payload) > maxCapsulePayload {
+				t.Fatalf("datagram of %d bytes exceeds the bound", len(payload))
+			}
+		}
+	})
 }

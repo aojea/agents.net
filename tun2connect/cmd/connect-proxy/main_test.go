@@ -306,10 +306,13 @@ func TestPortPolicy(t *testing.T) {
 	if _, reason, _ := authorize(ctx, "internal.example", "443"); reason != "resolved-address-denied" {
 		t.Fatalf("unlisted port on a private address: %q", reason)
 	}
-	for _, entry := range []string{"api.example:0", "api.example:65536", "api.example:https", ":443", "192.0.2.1", "[api.example]:443x"} {
+	for _, entry := range []string{"api.example:0", "api.example:65536", "api.example:https", ":443", "192.0.2.1", "[api.example]:443x", "..", "a..b", "a b.example", "ex*ample.com", "-" + strings.Repeat("a", 63) + ".example"} {
 		if _, err := parseAllow(entry); err == nil {
 			t.Errorf("invalid -allow entry accepted: %q", entry)
 		}
+	}
+	if _, err := parseAllow("xn--bcher-kva.example, my_service.internal:8080, a-b.c"); err != nil {
+		t.Fatalf("valid names rejected: %v", err)
 	}
 }
 

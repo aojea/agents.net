@@ -878,7 +878,7 @@ requirements.
 | Third-party TCP CONNECT interoperability | Tested over loopback TCP; see Section 7.3 |
 | Dedicated socket with fixed destination policy | Reference command supports one listener and policy per process; exclusive exposure and lifecycle are runtime responsibilities |
 | Resolved-address policy for hostnames | Implemented in the Go boundary: names are resolved by the boundary, non-public results are denied unless listed, and the checked address is dialed without a second resolution |
-| Per-port policy, complete CONNECT validation | Per-port rules on names, literals, and the wildcard; numeric port range and request-head deadline enforced by the Go boundary; authority/Host comparison and a full negative corpus remain incomplete |
+| Per-port policy, complete CONNECT validation | Per-port rules on names, literals, and the wildcard; HTTP/1.1 head parsed by the boundary with request-line, version, Host/authority, userinfo/path, port, header-name, and size checks; a 34-case negative corpus and fuzz targets for the head, policy, template, capsule, and DNS parsers |
 | Multiple identities on one listener | Optional extension, not implemented; unnecessary for dedicated endpoints |
 | Connection/resource budgets, revocation lifecycle, complete decision audit | Go boundary: connection and HTTP/2 stream budgets, tunnel idle timeout, request-head deadline, one JSON record per decision with listener-bound sandbox identity and policy version; bounded synthetic-name memory with no address reuse; namespace session/queue limits. Revocation of live tunnels is stop/restart only |
 | Controller-registered connected FDs | Optional extension; registration and handoff are not implemented |
@@ -929,6 +929,25 @@ private network. Ports must be numeric and in the range 1-65535. Denials
 report `not-on-allowlist`, `port-not-allowed`, `ip-not-on-allowlist`, or
 `resolved-address-denied` in `Boundary-Reason`.
 
+The HTTP/1.1 head is parsed by the boundary itself, not by
+`net/http.ReadRequest`, because that reader discards the `Host` field before
+it can be compared with the CONNECT authority. The boundary requires a
+request line of exactly three single-space-separated fields with a token
+method, HTTP/1.0 or HTTP/1.1, at most one `Host` field (required for
+HTTP/1.1), header names without whitespace before the colon, a head of at
+most 64 KiB, and for CONNECT an authority of host and numeric port with no
+userinfo, path, or query whose `Host` field names the same destination after
+case, trailing-dot, and IP-text normalization. `Content-Length` and
+`Transfer-Encoding` are ignored on CONNECT; bytes after the head are tunnel
+data and reach the upstream only after a 200. Malformed requests receive
+400 (`malformed-request-line`, `malformed-header`, `duplicate-host`,
+`missing-host`, `malformed-target`, `malformed-port`, `authority-mismatch`,
+`malformed-upgrade`, `malformed-template`), an unsupported version 505, an
+oversized head 431, a non-CONNECT method 405, and policy denials 403. Policy
+hostnames are validated as dot-separated labels of letters, digits, hyphens,
+and underscores; a fuzzer found that `..` normalized to `.` was previously
+accepted as a name.
+
 Resource limits are `-max-connections` (accepted connections or HTTP/2
 sessions, default 1024; further connections receive 503 `busy` before their
 request head is read), `-max-streams` (concurrent streams per HTTP/2 session,
@@ -953,8 +972,8 @@ the command applies a global destination policy, not per-identity authorization.
 One process with one listener can serve the baseline's fixed sandbox policy.
 This does not make the example a complete secure deployment: the runtime must
 provide exclusive socket exposure and lifecycle control, and the boundary
-still lacks authority/Host comparison, a fuzzed parser corpus, and revocation
-of live tunnels other than by stopping the process.
+still lacks revocation of live tunnels other than by stopping the process,
+and HTTP/2 stream validation relies on `golang.org/x/net/http2`.
 Sharing this listener between unrelated sandboxes would give them the same
 policy; adding an identity header would not separate them.
 
@@ -1025,7 +1044,7 @@ ingress checks apply only when those extensions are used.
 | Authentication configuration | Incomplete certificate/key settings or client CA without TLS fail at startup | [Reference boundary tests](tun2connect/cmd/connect-proxy/main_test.go) |
 | Transport integrity | Modify a protected TLS record; the tunnel fails without echoing modified application data | TLS record-corruption test in the mTLS suite |
 | Destination authorization | Named and literal IPv4/IPv6 allow/deny cases over TCP and UDP | Engine, boundary, and live namespace tests; hostname requests are resolved and address-checked by the reference boundary; per-port rules tested on names, literals, prefixes, and the wildcard, and live in the Firecracker scenario |
-| CONNECT parser safety | Conflicting authorities, malformed ports, duplicate framing, unsupported extended protocols, URI encoding, fragmented heads | Numeric port range, stalled request head, malformed template, and unsupported `:protocol` tests; complete negative corpus and fuzzing required |
+| CONNECT parser safety | Conflicting authorities, malformed ports, duplicate framing, unsupported extended protocols, URI encoding, fragmented heads | [Negative corpus](tun2connect/cmd/connect-proxy/corpus_test.go): missing, duplicate, and conflicting `Host`; no, zero, out-of-range, and named ports; userinfo, path, query, absolute-form, empty and unbracketed IPv6 authorities; HTTP/2.0 and HTTP/0.9 request lines; extra spaces, tab in method, whitespace before a header colon, oversized head; trailing bytes on a denied request; bad upgrade tokens and templates. Each asserts the status, reason, and upstream dial count. Fuzz targets for the head parser, authorization, policy parsers, template, capsule reader, and DNS handler run with [test_fuzz.sh](tun2connect/test_fuzz.sh); HTTP/2 framing is not fuzzed here |
 | Payload separation | Send nested CONNECT and forged identity-looking bytes inside an authorized tunnel; verify unchanged opaque delivery and no new authority | Reference boundary test over HTTP/1.1 and HTTP/2 with a real upstream socket |
 | DNS/address safety | Rebinding, mixed permitted/forbidden A/AAAA results, mapped addresses, retries, redirects, static mappings | Reference boundary tests with a substituted resolver: loopback, private, link-local/metadata, mapped, NAT64, shared, reserved, multicast, and mixed answers are denied or filtered and the checked address is dialed; gateway redirect and retry tests required |
 | Optional FD registration | Wrong registrant, wrong descriptor type/count, truncation, inherited copies, stale generation, restart | Not implemented; not required by the local model |
@@ -1046,6 +1065,13 @@ Run the authentication, integrity, payload, and literal-destination checks:
 
 ```bash
 go -C tun2connect test -race -count=1 ./pkg/tun2connect ./cmd/connect-proxy
+```
+
+Run the fuzz targets for a bounded time each (regression inputs under
+`testdata/fuzz` are replayed by ordinary `go test`):
+
+```bash
+FUZZTIME=1m tun2connect/test_fuzz.sh
 ```
 
 These tests create temporary test certificates and local sockets. They do not
