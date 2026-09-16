@@ -479,9 +479,9 @@ func TestStaticMappingIsStillAddressChecked(t *testing.T) {
 }
 
 func TestRequestHeadDeadline(t *testing.T) {
-	previous := headTimeout
-	t.Cleanup(func() { headTimeout = previous })
-	headTimeout = 50 * time.Millisecond
+	previous := headTimeout.Load()
+	t.Cleanup(func() { headTimeout.Store(previous) })
+	headTimeout.Store(50 * time.Millisecond)
 	client, server := net.Pipe()
 	defer client.Close()
 	done := make(chan struct{})
@@ -733,9 +733,9 @@ func TestConnectionBudget(t *testing.T) {
 // direction is closed after -idle-timeout on both wires, while an active
 // tunnel survives.
 func TestIdleTunnelIsClosed(t *testing.T) {
-	previous := idleTimeout
-	t.Cleanup(func() { idleTimeout = previous })
-	idleTimeout = 100 * time.Millisecond
+	previous := idleTimeout.Load()
+	t.Cleanup(func() { idleTimeout.Store(previous) })
+	idleTimeout.Store(100 * time.Millisecond)
 	setPolicy(t, "", "127.0.0.1/32", "")
 	upstream, _ := echoListener(t)
 	port := uint16(upstream.Addr().(*net.TCPAddr).Port)

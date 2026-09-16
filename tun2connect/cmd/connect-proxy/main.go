@@ -48,12 +48,25 @@ import (
 
 const dialTimeout = 15 * time.Second
 
+// atomicDuration is a timeout that tests change while handlers from an
+// earlier test may still be running.
+type atomicDuration struct{ ns atomic.Int64 }
+
+func newDuration(d time.Duration) *atomicDuration {
+	v := &atomicDuration{}
+	v.Store(d)
+	return v
+}
+
+func (d *atomicDuration) Load() time.Duration   { return time.Duration(d.ns.Load()) }
+func (d *atomicDuration) Store(v time.Duration) { d.ns.Store(int64(v)) }
+
 // headTimeout bounds how long a client may take to send a request head.
-var headTimeout = dialTimeout
+var headTimeout = newDuration(dialTimeout)
 
 // idleTimeout closes a tunnel that has carried no data in either
 // direction for this long; zero disables the check.
-var idleTimeout = time.Hour
+var idleTimeout = newDuration(time.Hour)
 
 func boundaryTLSConfig(certPath, keyPath, clientCAPath string) (*tls.Config, error) {
 	if certPath == "" && keyPath == "" && clientCAPath == "" {
@@ -454,7 +467,7 @@ type h1Responder struct{ conn net.Conn }
 func (r h1Responder) deny(status int, reason string) {
 	// The connection ends after a refusal; a peer that never reads must
 	// not hold the handler.
-	r.conn.SetWriteDeadline(time.Now().Add(headTimeout))
+	r.conn.SetWriteDeadline(time.Now().Add(headTimeout.Load()))
 	fmt.Fprintf(r.conn, "HTTP/1.1 %d %s\r\nBoundary-Reason: %s\r\nContent-Length: 0\r\n\r\n", status, http.StatusText(status), reason)
 }
 
@@ -524,7 +537,7 @@ func (a activityReader) Read(p []byte) (int, error) {
 // configured when the tunnel starts. The returned cancel ends the watch
 // and must be called exactly once.
 func idleWatch(stop func()) (touch, cancel func()) {
-	idle := idleTimeout
+	idle := idleTimeout.Load()
 	if idle <= 0 {
 		return func() {}, func() {}
 	}
@@ -798,7 +811,7 @@ func serve(conn net.Conn) {
 	}
 	// Bound the request head in time and bytes so a stalled or oversized
 	// head cannot hold the handler or its memory.
-	conn.SetReadDeadline(time.Now().Add(headTimeout))
+	conn.SetReadDeadline(time.Now().Add(headTimeout.Load()))
 	limiter := &boundedReader{r: conn, remaining: maxHeadBytes}
 	br := bufio.NewReader(limiter)
 	h, err := readHead(br)
@@ -934,7 +947,7 @@ func serveH2(peer string) http.HandlerFunc {
 // read, so a flood cannot hold handler goroutines.
 func serveListener(ln net.Listener, useH2 bool, maxConnections, maxStreams int) error {
 	slots := make(chan struct{}, maxConnections)
-	h2s := &http2.Server{MaxConcurrentStreams: uint32(maxStreams), IdleTimeout: idleTimeout}
+	h2s := &http2.Server{MaxConcurrentStreams: uint32(maxStreams), IdleTimeout: idleTimeout.Load()}
 	wire := "h1"
 	if useH2 {
 		wire = "h2"
@@ -988,7 +1001,7 @@ func main() {
 	clientCA := flag.String("tls-client-ca", "", "PEM CA bundle; when set, REQUIRE verified client certificates and audit their identity")
 	flag.Parse()
 	enableUDP = *udp
-	idleTimeout = *idle
+	idleTimeout.Store(*idle)
 	listenerName, sandboxID, policyVersion = *listen, *sandbox, *policy
 	if *maxConnections <= 0 || *maxStreams <= 0 {
 		log.Fatal("-max-connections and -max-streams must be positive")
