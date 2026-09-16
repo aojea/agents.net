@@ -89,7 +89,11 @@ jobs:
       - name: Namespace redirect integration
         env:
           NETNS_PROXY_INTEGRATION: '1'
-        run: go test -race -count=1 -v ./pkg/netnsproxy -run '^TestNamespaceIntegration$'
+        run: |
+          # Ubuntu 24.04 runners confine unprivileged user namespaces with
+          # AppArmor; the test creates one with unshare -Urn.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          go test -race -count=1 -v ./pkg/netnsproxy -run '^TestNamespaceIntegration$'
 
   fuzz:
     name: Fuzz guest-facing parsers
