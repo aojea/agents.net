@@ -338,18 +338,29 @@ component grants or denies before any external connection exists.
 
 ### 3.1 Comparison with Common Alternatives
 
-| Property | CONNECT boundary (this specification) | Routed NIC with default-deny L3/L4 policy | Proxy settings (`HTTP_PROXY`, SDK options) |
-| --- | --- | --- | --- |
-| Enforcement independent of workload cooperation | Yes. The only path is the boundary channel; ignoring settings or replacing the adapter changes nothing. | Yes, for packets. | No. A client that ignores the settings connects directly. |
-| Policy expressed as the destination the application named | Yes. The name is carried in the request; the boundary resolves it and dials the checked address. | No. Names must be pre-resolved into address sets. Shared hosting, CDNs, and anycast make address lists stale or broad; DNS-snooping rules race with TTLs and guest-side resolvers. | Yes, for cooperating clients. |
-| Resolution performed by a trusted component | Yes. The guest receives synthetic addresses and never resolves the real one; guest-side rebinding cannot change the address dialed. | No. The guest resolves; the filter sees only the address. | Yes, for cooperating clients. |
-| Guest packets processed by the host IP stack | TUN mode: no; the host sees an HTTP stream on a Unix socket. Namespace mode: only a dedicated namespace stack with no external interface. | Yes. Bridging, routing, connection tracking, and filtering process every guest packet. | Yes. |
-| Denial visible to the application | Connection failure, with the requested name, port, and reason in the audit record. | Timeout or reset, with an address and port in the record. | Proxy error, for cooperating clients. |
-| Per-flow attribution | Listener identity, name or address, port, transport, and decision. | Address, port, and network identity. | Name and port, for cooperating clients. |
-| Reusable service credentials kept out of the workload | Yes, through an optional gateway on the same channel. | Requires a separate proxy path. | Same mechanism, but bypassable. |
-| Enforcement point | Any CONNECT-capable proxy. | Per-host firewall rules and their lifecycle. | Any HTTP proxy. |
-| Protocol coverage | TCP; UDP optional; no raw IP, ICMP, or multicast. | Everything the kernel routes. | What the client library supports. |
-| Additional cost | Userspace translation (TUN) or redirection (namespace), a proxy hop, per-flow proxy state, synthetic DNS limits. | Per-workload address policy and its lifecycle. | None, and no guarantee. |
+| Property | CONNECT boundary (this specification) | Explicit proxy in a confined namespace | Routed NIC with default-deny L3/L4 policy | Proxy settings alone (`HTTP_PROXY`, SDK options) |
+| --- | --- | --- | --- | --- |
+| Arrangement | Sandbox has no external NIC; an adapter turns every supported socket into CONNECT on a controller-assigned channel to a host proxy. | Sandbox runs in its own network namespace with no external NIC, under a syscall filter that limits socket families; the runtime creates a loopback listener inside it, bridged to a host proxy; clients are pointed at it through proxy environment variables. | Sandbox NIC is routed or bridged; a firewall filters packets. | Clients are told about a proxy; nothing prevents direct connections. |
+| Enforcement independent of workload cooperation | Yes. Ignoring settings or replacing the adapter changes nothing; there is no other path. | Yes for confinement: a client that ignores the settings fails, it does not connect; the syscall filter also denies Unix sockets the namespace would otherwise leave reachable. Only proxy-aware clients work at all. | Yes, for packets. | No. A client that ignores the settings connects directly. |
+| Policy expressed as the destination the application named | Yes. The name is carried in the request; the boundary resolves it and dials the checked address. | Yes. CONNECT carries the name; resolution happens at the proxy. | No. Names must be pre-resolved into address sets. Shared hosting, CDNs, and anycast make address lists stale or broad; DNS-snooping rules race with TTLs and guest-side resolvers. | Yes, for cooperating clients. |
+| Resolution performed by a trusted component | Yes. The guest receives synthetic addresses and never resolves the real one; the boundary dials the address it checked. | Yes, at the proxy; whether the checked address is the one dialed depends on the proxy. | No. The guest resolves; the filter sees only the address. | Yes, for cooperating clients. |
+| Guest packets processed by the host IP stack | TUN mode: no; the host sees an HTTP stream on a Unix socket. Namespace mode: only a dedicated namespace stack with no external interface. | Only the namespace's loopback; the bridge relays bytes to the host proxy. | Yes. Bridging, routing, connection tracking, and filtering process every guest packet. | Yes. |
+| Denial visible to the application | Connection failure, with the requested name, port, and reason in the audit record. | Proxy error (403) for proxy-aware clients; connection failure for others. | Timeout or reset, with an address and port in the record. | Proxy error, for cooperating clients. |
+| Per-flow attribution | Listener identity, name or address, port, transport, and decision. | Bridge or token identity, name, port, and decision. | Address, port, and network identity. | Name and port, for cooperating clients. |
+| Reusable service credentials kept out of the workload | Yes, through an optional gateway on the same channel. | Yes, through the same proxy with TLS termination. | Requires a separate proxy path. | Same mechanism, but bypassable. |
+| Enforcement point | Any CONNECT-capable proxy. | Any CONNECT-capable proxy. | Per-host firewall rules and their lifecycle. | Any HTTP proxy. |
+| Protocol coverage | Any TCP client, including ones without proxy support (SSH, database drivers, raw sockets); UDP optional; no raw IP, ICMP, or multicast. | Clients that honor proxy variables for HTTP CONNECT or SOCKS; each tool family needs its own variable; everything else fails. | Everything the kernel routes. | What the client library supports. |
+| Platform | Linux TUN or network namespace; Firecracker VM over vsock. | Linux namespaces; equivalent OS sandboxes on other platforms. | Any host with a packet filter. | Any. |
+| Additional cost | Userspace translation (TUN) or redirection (namespace), a proxy hop, per-flow proxy state, synthetic DNS limits. | A bridge relay per sandbox and a proxy hop; no packet translation. | Per-workload address policy and its lifecycle. | None, and no guarantee. |
+
+The second column and this specification share the boundary: a dedicated
+namespace, a controller-created channel, a host proxy, and HTTP CONNECT. They
+differ in what reaches the channel. An explicit proxy carries only the
+connections of clients that were configured for it; the adapter here carries
+every supported connection, so compatibility does not depend on each tool
+honoring its proxy variables. The price is the translation step. A deployment
+can combine them: the same boundary can serve proxy-aware clients through an
+explicit loopback endpoint and everything else through the adapter.
 
 ### 3.2 What Is and Is Not Gained
 
@@ -997,9 +1008,29 @@ A hands-on, runnable demonstration of a zero-network autonomous ReAct agent runn
 | Envoy | HTTP/1.1 and HTTP/2 TCP CONNECT | Live test with the repository's clients on September 15, 2026, using the v1.32 image over loopback TCP. UDP, IPC identity, and workload authorization were not tested. |
 | kgateway | Route-level CONNECT termination through `TrafficPolicy.httpUpgrade` with `connect.terminate: true` | API source, translator, and upstream tests inspected at revision `634b53c`. No local interoperability run; release availability and complete boundary behavior are unverified. |
 | Apache HTTP Server 2.4 | CONNECT tunneling through `mod_proxy_connect`, with destination-port restrictions | Official documentation checked. No local interoperability run. |
+| Codex CLI `codex-network-proxy` | HTTP CONNECT and SOCKS5 forward proxy on host loopback with domain allow/deny lists (`*.example.com`, `**.example.com`), a read-only "limited" mode enforced by TLS termination with a proxy-held CA, and local/private address rejection | Source and README read on September 16, 2026 (`codex-rs/network-proxy`, `codex-rs/linux-sandbox` at `49305d7`). No local interoperability run. |
 
-The [example configuration](tun2connect/examples/envoy-boundary.yaml) and
-[interop test](tun2connect/test_envoy.sh) reproduce that result. A gateway that
+The Codex CLI arrangement is the second column of Section 3.1. Its Linux
+sandbox has two layers. Bubblewrap runs the command with `--unshare-net`; a
+helper binds a loopback TCP listener inside that namespace, passes it over a
+Unix socket to a bridge process on the host, rewrites the proxy environment
+variables to that listener, and the bridge relays each accepted connection to
+the proxy after sending a per-command attribution token. A seccomp filter on
+the command then denies `ptrace`, `process_vm_readv`/`writev`, and `io_uring`,
+and in proxy mode permits `socket()` only for `AF_INET` and `AF_INET6`, so the
+command cannot open Unix sockets (only `socketpair`) unless the policy grants
+them; with networking disabled it denies `connect`, `bind`, `listen`,
+`accept`, `sendto`, and every socket family except `AF_UNIX`. The namespace
+removes external egress; the filter closes the paths a namespace does not
+cover, which this specification lists as runtime responsibilities in Section
+4.3. Only clients that honor the proxy variables reach the proxy. Its
+documentation states that hostnames resolving to local or private addresses
+are rejected by a best-effort lookup and that DNS rebinding is not fully
+prevented; the reference boundary here dials the address it checked. Whether
+this repository's clients interoperate with that proxy has not been tested.
+
+The Envoy [example configuration](tun2connect/examples/envoy-boundary.yaml) and
+[interop test](tun2connect/test_envoy.sh) reproduce the Envoy result. A gateway that
 uses the same proxy internally still needs its own configuration and
 interoperability validation.
 
@@ -1007,6 +1038,7 @@ Implementation references:
 
 - kgateway: [API definition](https://github.com/kgateway-dev/kgateway/blob/634b53c502168b5a05bd8dd111e5d6b6c6113b9f/api/v1alpha1/kgateway/traffic_policy_types.go), [translator](https://github.com/kgateway-dev/kgateway/blob/634b53c502168b5a05bd8dd111e5d6b6c6113b9f/pkg/kgateway/extensions2/plugins/trafficpolicy/http_upgrade.go), and [upstream tests](https://github.com/kgateway-dev/kgateway/blob/634b53c502168b5a05bd8dd111e5d6b6c6113b9f/pkg/kgateway/extensions2/plugins/trafficpolicy/http_upgrade_test.go). Enabling a listener upgrade alone forwards CONNECT without terminating it.
 - Apache: [mod_proxy_connect](https://httpd.apache.org/docs/2.4/mod/mod_proxy_connect.html).
+- Codex CLI: [network-proxy README](https://github.com/openai/codex/blob/main/codex-rs/network-proxy/README.md), [bubblewrap network modes](https://github.com/openai/codex/blob/main/codex-rs/linux-sandbox/src/bwrap.rs), [proxy routing bridge](https://github.com/openai/codex/blob/main/codex-rs/linux-sandbox/src/proxy_routing.rs), and [seccomp network filter](https://github.com/openai/codex/blob/main/codex-rs/linux-sandbox/src/landlock.rs).
 
 ---
 
