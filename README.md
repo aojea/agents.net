@@ -294,7 +294,7 @@ flowchart LR
 
 1. **Host Ingress Gateway:** A production gateway MUST authenticate requests, terminate public TLS, apply rate and payload limits, and authorize the external route to a specific workload and local service.
 2. **Reverse Stream Channel:** An ingress stream channel (`ingress-proxy.sock` or vsock port) is provided inside the sandbox. When an external request arrives, the host connects to this channel using a stream handshake (`CONNECT <port>\n` -> `OK\n` or standard HTTP CONNECT).
-3. **Loopback Forwarding:** The in-guest listener forwards the incoming stream to the agent's local web server listening on loopback (`127.0.0.1:$AGENT_INGRESS_PORT`).
+3. **Loopback Forwarding:** The in-guest listener forwards the incoming stream to the agent's local web server listening on loopback (`127.0.0.1:$AGENT_INGRESS_PORT`). The listener joins streams only to the port the controller pinned when it started the adapter; the port named in the handshake must match it and does not select another service.
 4. **Coordination Variables:** The agent specifies its listening port and public callback URL via environment variables:
 
    ```bash
@@ -303,7 +303,9 @@ flowchart LR
    ```
 
 The trusted controller, not those guest variables alone, MUST authorize this
-binding and revoke it during teardown. The textual `CONNECT <port>` handshake
+binding and revoke it during teardown. The reference launcher requires
+`-ingress-port` whenever ingress is enabled and answers a handshake for any
+other port with `ERR port not permitted`. The textual `CONNECT <port>` handshake
 is a deployment convention, not HTTP CONNECT. A portable ingress wire format
 is not defined by this draft.
 
@@ -336,18 +338,29 @@ component grants or denies before any external connection exists.
 
 ### 3.1 Comparison with Common Alternatives
 
-| Property | CONNECT boundary (this specification) | Routed NIC with default-deny L3/L4 policy | Proxy settings (`HTTP_PROXY`, SDK options) |
-| --- | --- | --- | --- |
-| Enforcement independent of workload cooperation | Yes. The only path is the boundary channel; ignoring settings or replacing the adapter changes nothing. | Yes, for packets. | No. A client that ignores the settings connects directly. |
-| Policy expressed as the destination the application named | Yes. The name is carried in the request; the boundary resolves it and dials the checked address. | No. Names must be pre-resolved into address sets. Shared hosting, CDNs, and anycast make address lists stale or broad; DNS-snooping rules race with TTLs and guest-side resolvers. | Yes, for cooperating clients. |
-| Resolution performed by a trusted component | Yes. The guest receives synthetic addresses and never resolves the real one; guest-side rebinding cannot change the address dialed. | No. The guest resolves; the filter sees only the address. | Yes, for cooperating clients. |
-| Guest packets processed by the host IP stack | TUN mode: no; the host sees an HTTP stream on a Unix socket. Namespace mode: only a dedicated namespace stack with no external interface. | Yes. Bridging, routing, connection tracking, and filtering process every guest packet. | Yes. |
-| Denial visible to the application | Connection failure, with the requested name, port, and reason in the audit record. | Timeout or reset, with an address and port in the record. | Proxy error, for cooperating clients. |
-| Per-flow attribution | Listener identity, name or address, port, transport, and decision. | Address, port, and network identity. | Name and port, for cooperating clients. |
-| Reusable service credentials kept out of the workload | Yes, through an optional gateway on the same channel. | Requires a separate proxy path. | Same mechanism, but bypassable. |
-| Enforcement point | Any CONNECT-capable proxy. | Per-host firewall rules and their lifecycle. | Any HTTP proxy. |
-| Protocol coverage | TCP; UDP optional; no raw IP, ICMP, or multicast. | Everything the kernel routes. | What the client library supports. |
-| Additional cost | Userspace translation (TUN) or redirection (namespace), a proxy hop, per-flow proxy state, synthetic DNS limits. | Per-workload address policy and its lifecycle. | None, and no guarantee. |
+| Property | CONNECT boundary (this specification) | Explicit proxy in a confined namespace | Routed NIC with default-deny L3/L4 policy | Proxy settings alone (`HTTP_PROXY`, SDK options) |
+| --- | --- | --- | --- | --- |
+| Arrangement | Sandbox has no external NIC; an adapter turns every supported socket into CONNECT on a controller-assigned channel to a host proxy. | Sandbox runs in its own network namespace with no external NIC, under a syscall filter that limits socket families; the runtime creates a loopback listener inside it, bridged to a host proxy; clients are pointed at it through proxy environment variables. | Sandbox NIC is routed or bridged; a firewall filters packets. | Clients are told about a proxy; nothing prevents direct connections. |
+| Enforcement independent of workload cooperation | Yes. Ignoring settings or replacing the adapter changes nothing; there is no other path. | Yes for confinement: a client that ignores the settings fails, it does not connect; the syscall filter also denies Unix sockets the namespace would otherwise leave reachable. Only proxy-aware clients work at all. | Yes, for packets. | No. A client that ignores the settings connects directly. |
+| Policy expressed as the destination the application named | Yes. The name is carried in the request; the boundary resolves it and dials the checked address. | Yes. CONNECT carries the name; resolution happens at the proxy. | No. Names must be pre-resolved into address sets. Shared hosting, CDNs, and anycast make address lists stale or broad; DNS-snooping rules race with TTLs and guest-side resolvers. | Yes, for cooperating clients. |
+| Resolution performed by a trusted component | Yes. The guest receives synthetic addresses and never resolves the real one; the boundary dials the address it checked. | Yes, at the proxy; whether the checked address is the one dialed depends on the proxy. | No. The guest resolves; the filter sees only the address. | Yes, for cooperating clients. |
+| Guest packets processed by the host IP stack | TUN mode: no; the host sees an HTTP stream on a Unix socket. Namespace mode: only a dedicated namespace stack with no external interface. | Only the namespace's loopback; the bridge relays bytes to the host proxy. | Yes. Bridging, routing, connection tracking, and filtering process every guest packet. | Yes. |
+| Denial visible to the application | Connection failure, with the requested name, port, and reason in the audit record. | Proxy error (403) for proxy-aware clients; connection failure for others. | Timeout or reset, with an address and port in the record. | Proxy error, for cooperating clients. |
+| Per-flow attribution | Listener identity, name or address, port, transport, and decision. | Bridge or token identity, name, port, and decision. | Address, port, and network identity. | Name and port, for cooperating clients. |
+| Reusable service credentials kept out of the workload | Yes, through an optional gateway on the same channel. | Yes, through the same proxy with TLS termination. | Requires a separate proxy path. | Same mechanism, but bypassable. |
+| Enforcement point | Any CONNECT-capable proxy. | Any CONNECT-capable proxy. | Per-host firewall rules and their lifecycle. | Any HTTP proxy. |
+| Protocol coverage | Any TCP client, including ones without proxy support (SSH, database drivers, raw sockets); UDP optional; no raw IP, ICMP, or multicast. | Clients that honor proxy variables for HTTP CONNECT or SOCKS; each tool family needs its own variable; everything else fails. | Everything the kernel routes. | What the client library supports. |
+| Platform | Linux TUN or network namespace; Firecracker VM over vsock. | Linux namespaces; equivalent OS sandboxes on other platforms. | Any host with a packet filter. | Any. |
+| Additional cost | Userspace translation (TUN) or redirection (namespace), a proxy hop, per-flow proxy state, synthetic DNS limits. | A bridge relay per sandbox and a proxy hop; no packet translation. | Per-workload address policy and its lifecycle. | None, and no guarantee. |
+
+The second column and this specification share the boundary: a dedicated
+namespace, a controller-created channel, a host proxy, and HTTP CONNECT. They
+differ in what reaches the channel. An explicit proxy carries only the
+connections of clients that were configured for it; the adapter here carries
+every supported connection, so compatibility does not depend on each tool
+honoring its proxy variables. The price is the translation step. A deployment
+can combine them: the same boundary can serve proxy-aware clients through an
+explicit loopback endpoint and everything else through the adapter.
 
 ### 3.2 What Is and Is Not Gained
 
@@ -876,12 +889,12 @@ requirements.
 | Third-party TCP CONNECT interoperability | Tested over loopback TCP; see Section 7.3 |
 | Dedicated socket with fixed destination policy | Reference command supports one listener and policy per process; exclusive exposure and lifecycle are runtime responsibilities |
 | Resolved-address policy for hostnames | Implemented in the Go boundary: names are resolved by the boundary, non-public results are denied unless listed, and the checked address is dialed without a second resolution |
-| Per-port policy, complete CONNECT validation | Numeric port range and request-head deadline enforced by the Go boundary; per-port rules, authority/Host comparison, and a full negative corpus remain incomplete |
+| Per-port policy, complete CONNECT validation | Per-port rules on names, literals, and the wildcard; HTTP/1.1 head parsed by the boundary with request-line, version, Host/authority, userinfo/path, port, header-name, and size checks; a 34-case negative corpus and fuzz targets for the head, policy, template, capsule, and DNS parsers |
 | Multiple identities on one listener | Optional extension, not implemented; unnecessary for dedicated endpoints |
-| Connection/resource budgets, revocation lifecycle, complete decision audit | Request-head deadline, bounded synthetic-name memory with no address reuse, and namespace session/queue limits; no complete per-tenant boundary enforcement |
+| Connection/resource budgets, revocation lifecycle, complete decision audit | Go boundary: connection and HTTP/2 stream budgets, tunnel idle timeout, request-head deadline, one JSON record per decision with listener-bound sandbox identity and policy version; bounded synthetic-name memory with no address reuse; namespace session/queue limits. Revocation is stop/restart of the per-sandbox boundary process, exercised in the Firecracker scenario (Section 8.2); no draining or hot handoff |
 | Controller-registered connected FDs | Optional extension; registration and handoff are not implemented |
 | Software signature verification and launch attestation | Deployment requirements where selected; no verifier is implemented here |
-| Authenticated production ingress | Not implemented; demo and Firecracker reverse stream only, without caller authentication |
+| Authenticated production ingress | Not implemented; demo and Firecracker reverse stream only, without caller authentication. The launcher pins the one loopback port ingress may reach |
 | Firecracker VM channel | Executed: two microVMs with no NIC, in-guest TUN over vsock, one boundary listener per VM on Firecracker's per-VM Unix socket prefix, disjoint policies, ingress into guest loopback (Section 8.2) |
 | Native runtime interception, other VMMs, attestation | Future work; Cloud Hypervisor and QEMU host `AF_VSOCK` channels are not tested |
 
@@ -895,34 +908,71 @@ A modular Go implementation (`github.com/aojea/agents.net/tun2connect`) of the H
 - [tun2connect/pkg/tun2connect/forwarder.go](tun2connect/pkg/tun2connect/forwarder.go) - Shared DNS-aware dialing and TCP/UDP socket relays.
 - [tun2connect/pkg/netnsproxy/proxy_linux.go](tun2connect/pkg/netnsproxy/proxy_linux.go) - Kernel socket adapter and namespace-local nftables setup.
 - [tun2connect/cmd/netnsproxy/main_linux.go](tun2connect/cmd/netnsproxy/main_linux.go) - Namespace proxy command using a Unix boundary socket.
-- [tun2connect/cmd/connect-proxy/main.go](tun2connect/cmd/connect-proxy/main.go) — Reference host boundary proxy with domain allowlisting, HTTP/1.1 and multiplexed HTTP/2 support, UDP capsule tunneling, and mTLS client certificate verification.
+- [tun2connect/cmd/connect-proxy/main.go](tun2connect/cmd/connect-proxy/main.go) — Reference host boundary proxy with name, address, and port allowlisting, boundary-side resolution, HTTP/1.1 and multiplexed HTTP/2 support, UDP capsule tunneling, mTLS client certificate verification, connection and idle budgets, and JSON audit records.
 - [tun2connect/cmd/tun2connect/main.go](tun2connect/cmd/tun2connect/main.go) — The in-guest side, in two modes: a standalone daemon, or (`run`) the injectable launcher that becomes PID 1, builds the TUN, and supervises the agent.
 
 The Go boundary uses `-allow` for hostnames and `-allow-ip` for literal addresses
-or CIDRs. Both lists are empty by default. `-allow '*'` permits all hostnames
-but does not grant literal-IP access. `-resolve name=ip[+ip]` substitutes fixed
-addresses for DNS on the named hosts; the addresses are still subject to the
-address policy below, so a private mapping also needs `-allow-ip`. For example:
+or CIDRs. Both lists are empty by default. Any entry may carry `:port`
+(`api.example.com:443`, `203.0.113.10:443`, `[2001:db8::/64]:443`, `*:443`);
+an entry without a port permits every port on that destination. `-allow '*'`
+permits all hostnames but does not grant literal-IP access. `-resolve
+name=ip[+ip]` substitutes fixed addresses for DNS on the named hosts; the
+addresses are still subject to the address policy below, so a private mapping
+also needs `-allow-ip`. `-sandbox` and `-policy-version` label every audit
+record with the identity and policy the controller bound to this listener.
+For example:
 
 ```bash
 go -C tun2connect run ./cmd/connect-proxy \
-    -listen unix:///tmp/boundary.sock \
-    -allow api.example.com \
-    -allow-ip '203.0.113.10,2001:db8::/64' -udp
+    -listen unix:///run/agents.net/sandbox-a/boundary.sock -sandbox sandbox-a \
+    -allow api.example.com:443 \
+    -allow-ip '203.0.113.10:443,[2001:db8::/64]:443' -udp
 ```
 
-The IP list applies to TCP and enabled UDP on all ports. For hostname
+For hostname
 requests the boundary resolves the name itself and keeps only public unicast
 results; loopback, private, link-local, multicast, shared-address-space,
 NAT64, documentation, and other special-purpose ranges are denied unless
-`-allow-ip` lists them. It dials the checked address, not the name, so a
-rebinding answer cannot change the destination after the check. `-allow '*'`
-therefore still cannot reach `localhost`, a metadata service, or a private
-network. Ports must be numeric and in the range 1-65535, and a client that
-does not complete its request head within 15 seconds is disconnected.
-Per-port rules remain a deployment requirement, not a feature of this
-reference command. The Python demo retains its hostname-only allowlist as a
-sample policy and dials names directly; it has no resolved-address check.
+`-allow-ip` lists them for that port. It dials the checked address, not the
+name, so a rebinding answer cannot change the destination after the check.
+`-allow '*'` therefore still cannot reach `localhost`, a metadata service, or a
+private network. Ports must be numeric and in the range 1-65535. Denials
+report `not-on-allowlist`, `port-not-allowed`, `ip-not-on-allowlist`, or
+`resolved-address-denied` in `Boundary-Reason`.
+
+The HTTP/1.1 head is parsed by the boundary itself, not by
+`net/http.ReadRequest`, because that reader discards the `Host` field before
+it can be compared with the CONNECT authority. The boundary requires a
+request line of exactly three single-space-separated fields with a token
+method, HTTP/1.0 or HTTP/1.1, at most one `Host` field (required for
+HTTP/1.1), header names without whitespace before the colon, a head of at
+most 64 KiB, and for CONNECT an authority of host and numeric port with no
+userinfo, path, or query whose `Host` field names the same destination after
+case, trailing-dot, and IP-text normalization. `Content-Length` and
+`Transfer-Encoding` are ignored on CONNECT; bytes after the head are tunnel
+data and reach the upstream only after a 200. Malformed requests receive
+400 (`malformed-request-line`, `malformed-header`, `duplicate-host`,
+`missing-host`, `malformed-target`, `malformed-port`, `authority-mismatch`,
+`malformed-upgrade`, `malformed-template`), an unsupported version 505, an
+oversized head 431, a non-CONNECT method 405, and policy denials 403. Policy
+hostnames are validated as dot-separated labels of letters, digits, hyphens,
+and underscores; a fuzzer found that `..` normalized to `.` was previously
+accepted as a name.
+
+Resource limits are `-max-connections` (accepted connections or HTTP/2
+sessions, default 1024; further connections receive 503 `busy` before their
+request head is read), `-max-streams` (concurrent streams per HTTP/2 session,
+default 256), a 15-second request-head deadline, and `-idle-timeout` (default
+1h; a tunnel with no data in either direction is closed, 0 disables). Client
+EOF is propagated to the upstream as a half-close.
+
+Each decision is one JSON object on standard output with `ts`, `listener`,
+`sandbox`, `policy`, `wire`, `transport`, `destination` as requested,
+`address` as dialed, `peer` (mTLS identity when present), `decision`
+(`allow`, `block`, `fail`), and `reason`. Guest-supplied values are JSON
+strings and cannot add fields or lines. The Python demo retains its
+hostname-only allowlist as a sample policy and dials names directly; it has
+no resolved-address or port check.
 
 The Go boundary rejects incomplete TLS flag combinations before listening.
 `-tls-client-ca` requires both `-tls-cert` and `-tls-key` and enables required,
@@ -932,8 +982,9 @@ the command applies a global destination policy, not per-identity authorization.
 
 One process with one listener can serve the baseline's fixed sandbox policy.
 This does not make the example a complete secure deployment: the runtime must
-provide exclusive socket exposure and lifecycle control, and the boundary
-still needs the validation, address, port, and resource controls listed above.
+provide exclusive socket exposure and lifecycle control, revocation is
+process termination without draining, and HTTP/2 stream validation relies on
+`golang.org/x/net/http2`.
 Sharing this listener between unrelated sandboxes would give them the same
 policy; adding an identity header would not separate them.
 
@@ -957,9 +1008,29 @@ A hands-on, runnable demonstration of a zero-network autonomous ReAct agent runn
 | Envoy | HTTP/1.1 and HTTP/2 TCP CONNECT | Live test with the repository's clients on September 15, 2026, using the v1.32 image over loopback TCP. UDP, IPC identity, and workload authorization were not tested. |
 | kgateway | Route-level CONNECT termination through `TrafficPolicy.httpUpgrade` with `connect.terminate: true` | API source, translator, and upstream tests inspected at revision `634b53c`. No local interoperability run; release availability and complete boundary behavior are unverified. |
 | Apache HTTP Server 2.4 | CONNECT tunneling through `mod_proxy_connect`, with destination-port restrictions | Official documentation checked. No local interoperability run. |
+| Codex CLI `codex-network-proxy` | HTTP CONNECT and SOCKS5 forward proxy on host loopback with domain allow/deny lists (`*.example.com`, `**.example.com`), a read-only "limited" mode enforced by TLS termination with a proxy-held CA, and local/private address rejection | Source and README read on September 16, 2026 (`codex-rs/network-proxy`, `codex-rs/linux-sandbox` at `49305d7`). No local interoperability run. |
 
-The [example configuration](tun2connect/examples/envoy-boundary.yaml) and
-[interop test](tun2connect/test_envoy.sh) reproduce that result. A gateway that
+The Codex CLI arrangement is the second column of Section 3.1. Its Linux
+sandbox has two layers. Bubblewrap runs the command with `--unshare-net`; a
+helper binds a loopback TCP listener inside that namespace, passes it over a
+Unix socket to a bridge process on the host, rewrites the proxy environment
+variables to that listener, and the bridge relays each accepted connection to
+the proxy after sending a per-command attribution token. A seccomp filter on
+the command then denies `ptrace`, `process_vm_readv`/`writev`, and `io_uring`,
+and in proxy mode permits `socket()` only for `AF_INET` and `AF_INET6`, so the
+command cannot open Unix sockets (only `socketpair`) unless the policy grants
+them; with networking disabled it denies `connect`, `bind`, `listen`,
+`accept`, `sendto`, and every socket family except `AF_UNIX`. The namespace
+removes external egress; the filter closes the paths a namespace does not
+cover, which this specification lists as runtime responsibilities in Section
+4.3. Only clients that honor the proxy variables reach the proxy. Its
+documentation states that hostnames resolving to local or private addresses
+are rejected by a best-effort lookup and that DNS rebinding is not fully
+prevented; the reference boundary here dials the address it checked. Whether
+this repository's clients interoperate with that proxy has not been tested.
+
+The Envoy [example configuration](tun2connect/examples/envoy-boundary.yaml) and
+[interop test](tun2connect/test_envoy.sh) reproduce the Envoy result. A gateway that
 uses the same proxy internally still needs its own configuration and
 interoperability validation.
 
@@ -967,6 +1038,7 @@ Implementation references:
 
 - kgateway: [API definition](https://github.com/kgateway-dev/kgateway/blob/634b53c502168b5a05bd8dd111e5d6b6c6113b9f/api/v1alpha1/kgateway/traffic_policy_types.go), [translator](https://github.com/kgateway-dev/kgateway/blob/634b53c502168b5a05bd8dd111e5d6b6c6113b9f/pkg/kgateway/extensions2/plugins/trafficpolicy/http_upgrade.go), and [upstream tests](https://github.com/kgateway-dev/kgateway/blob/634b53c502168b5a05bd8dd111e5d6b6c6113b9f/pkg/kgateway/extensions2/plugins/trafficpolicy/http_upgrade_test.go). Enabling a listener upgrade alone forwards CONNECT without terminating it.
 - Apache: [mod_proxy_connect](https://httpd.apache.org/docs/2.4/mod/mod_proxy_connect.html).
+- Codex CLI: [network-proxy README](https://github.com/openai/codex/blob/main/codex-rs/network-proxy/README.md), [bubblewrap network modes](https://github.com/openai/codex/blob/main/codex-rs/linux-sandbox/src/bwrap.rs), [proxy routing bridge](https://github.com/openai/codex/blob/main/codex-rs/linux-sandbox/src/proxy_routing.rs), and [seccomp network filter](https://github.com/openai/codex/blob/main/codex-rs/linux-sandbox/src/landlock.rs).
 
 ---
 
@@ -1003,17 +1075,17 @@ ingress checks apply only when those extensions are used.
 | Mutual authentication | Valid client succeeds; anonymous, wrong issuer, wrong server identity, invalid validity period, wrong key usage, wrong key, and wrong ALPN fail before tunnel delivery | [mTLS tests](tun2connect/pkg/tun2connect/connect_tls_test.go); authorized-tenant identity mapping remains unimplemented |
 | Authentication configuration | Incomplete certificate/key settings or client CA without TLS fail at startup | [Reference boundary tests](tun2connect/cmd/connect-proxy/main_test.go) |
 | Transport integrity | Modify a protected TLS record; the tunnel fails without echoing modified application data | TLS record-corruption test in the mTLS suite |
-| Destination authorization | Named and literal IPv4/IPv6 allow/deny cases over TCP and UDP | Engine, boundary, and live namespace tests; hostname requests are resolved and address-checked by the reference boundary; no per-port policy |
-| CONNECT parser safety | Conflicting authorities, malformed ports, duplicate framing, unsupported extended protocols, URI encoding, fragmented heads | Numeric port range, stalled request head, malformed template, and unsupported `:protocol` tests; complete negative corpus and fuzzing required |
+| Destination authorization | Named and literal IPv4/IPv6 allow/deny cases over TCP and UDP | Engine, boundary, and live namespace tests; hostname requests are resolved and address-checked by the reference boundary; per-port rules tested on names, literals, prefixes, and the wildcard, and live in the Firecracker scenario |
+| CONNECT parser safety | Conflicting authorities, malformed ports, duplicate framing, unsupported extended protocols, URI encoding, fragmented heads | [Negative corpus](tun2connect/cmd/connect-proxy/corpus_test.go): missing, duplicate, and conflicting `Host`; no, zero, out-of-range, and named ports; userinfo, path, query, absolute-form, empty and unbracketed IPv6 authorities; HTTP/2.0 and HTTP/0.9 request lines; extra spaces, tab in method, whitespace before a header colon, oversized head; trailing bytes on a denied request; bad upgrade tokens and templates. Each asserts the status, reason, and upstream dial count. Fuzz targets for the head parser, authorization, policy parsers, template, capsule reader, and DNS handler run with [test_fuzz.sh](tun2connect/test_fuzz.sh); HTTP/2 framing is not fuzzed here |
 | Payload separation | Send nested CONNECT and forged identity-looking bytes inside an authorized tunnel; verify unchanged opaque delivery and no new authority | Reference boundary test over HTTP/1.1 and HTTP/2 with a real upstream socket |
 | DNS/address safety | Rebinding, mixed permitted/forbidden A/AAAA results, mapped addresses, retries, redirects, static mappings | Reference boundary tests with a substituted resolver: loopback, private, link-local/metadata, mapped, NAT64, shared, reserved, multicast, and mixed answers are denied or filtered and the checked address is dialed; gateway redirect and retry tests required |
 | Optional FD registration | Wrong registrant, wrong descriptor type/count, truncation, inherited copies, stale generation, restart | Not implemented; not required by the local model |
 | Tenant separation | A cannot use B's endpoint, policy, key, signing service, or ingress route | Endpoint and policy separation shown for two Firecracker VMs; keys, signing services, and ingress route binding not implemented |
 | Credentials | No key in guest, logs, errors, or redirects; every reused request reauthorized | Demo injection unit tests only; production gateway checks required |
-| Failure and revocation | Proxy loss, missing policy, channel closure, retained FDs, policy update, certificate expiry, draining | Refusal and namespace shutdown tests; controller revocation and draining not implemented |
-| Resource limits | Slow heads, oversized capsules, stream floods, DNS growth, stalled peers, UDP amplification | Request-head deadline, capsule bounds, synthetic-name limit, and selected relay/lifecycle tests; multi-tenant overload tests required |
+| Failure and revocation | Proxy loss, missing policy, channel closure, retained FDs, policy update, certificate expiry, draining | Firecracker scenario: killing one VM's boundary during a rate-limited download ends the transfer partway (curl exit 55 after about 6 MB), the old socket refuses connections, the other VM's boundary keeps enforcing, and a replacement boundary on the same path with an empty policy decides the guest's next request (audit shows the new policy version). Refusal and namespace shutdown tests. Draining, certificate expiry, and controller-driven policy update are not implemented |
+| Resource limits | Slow heads, oversized capsules, stream floods, DNS growth, stalled peers, UDP amplification | Request-head deadline, connection budget (503 before the head is read, slot released on close), tunnel idle timeout on HTTP/1.1 and HTTP/2, HTTP/2 stream cap, capsule bounds, synthetic-name limit; multi-tenant overload tests required |
 | Software integrity | Wrong signer/digest, modified policy, stale update, replayed attestation, wrong session key | Not implemented; depends on deployment verifier |
-| Ingress | Caller auth, authorized service only, stale route rejection, port restrictions, namespace return path | Demo and Firecracker deliveries reach the guest loopback listener; caller authentication, port restriction, and stale-route rejection are not implemented; namespace reverse channel is not implemented |
+| Ingress | Caller auth, authorized service only, stale route rejection, port restrictions, namespace return path | Demo and Firecracker deliveries reach the guest loopback listener; the launcher joins streams only to its pinned port (unit test and Firecracker scenario); caller authentication and stale-route rejection are not implemented; namespace reverse channel is not implemented |
 
 Live namespace tests exercise Linux veth redirection, not a VM hypervisor or
 confidential-computing boundary. The Firecracker scenario exercises the KVM and
@@ -1027,6 +1099,13 @@ Run the authentication, integrity, payload, and literal-destination checks:
 go -C tun2connect test -race -count=1 ./pkg/tun2connect ./cmd/connect-proxy
 ```
 
+Run the fuzz targets for a bounded time each (regression inputs under
+`testdata/fuzz` are replayed by ordinary `go test`):
+
+```bash
+FUZZTIME=1m tun2connect/test_fuzz.sh
+```
+
 These tests create temporary test certificates and local sockets. They do not
 exercise a production issuer, software attestation service, or tenant controller.
 
@@ -1038,22 +1117,30 @@ filesystem with the launcher as `/sbin/init`. Neither VM has a network device.
 Each VM has its own `uds_path`, and its boundary is one `connect-proxy`
 process listening on `<uds_path>_1024`, which is where Firecracker delivers
 guest connections to CID 2 port 1024. VM A's policy permits
-`test.example.com`, statically mapped to a host loopback HTTPS server; VM B's
-policy is empty. The guest workload runs `curl` through the TUN adapter and
-`socat` directly on the vsock channel.
+`test.example.com` on port 9443 only, statically mapped to a host loopback
+HTTPS server; VM B's policy is empty. The guest workload runs `curl` through
+the TUN adapter and `socat` directly on the vsock channel.
 
 | Check | VM A (permitted) | VM B (empty policy) |
 | --- | --- | --- |
-| `curl https://test.example.com:9443/ping` through the adapter | 200; audit records the dial to the checked address | Connection refused; audit `BLOCK not-on-allowlist` |
+| `curl https://test.example.com:9443/ping` through the adapter | 200; audit records the dial to the checked address | Connection refused; audit `not-on-allowlist` |
 | `curl https://denied.example:9443/ping` | Refused | Refused |
-| `curl https://192.0.2.10:9443/ping` (literal, unlisted) | Refused; audit `BLOCK ip-not-on-allowlist` | Refused |
+| `curl http://test.example.com:80/ping` (allowed name, unlisted port) | Refused; audit `port-not-allowed` | Refused |
+| `curl https://192.0.2.10:9443/ping` (literal, unlisted) | Refused; audit `ip-not-on-allowlist` | Refused |
 | Raw `CONNECT denied.example:443` with `Sandbox-Id: forged-admin` on vsock port 1024 | `403 Forbidden` | `403 Forbidden` |
 | Raw connect to vsock port 1025 (never bound on the host) | Reset by the VMM | Reset by the VMM |
 | Host delivers `GET /index.html` through `<uds_path>` → guest vsock 5000 → loopback 8081 | 200, guest body | 200, guest body |
+| Same handshake naming loopback port 22 | `ERR port not permitted` from the launcher | `ERR port not permitted` |
+| Boundary process killed during a 2 MB/s download of a 4 GiB body | Transfer ends after a few megabytes with a curl error; the old socket path refuses connections | Unaffected: a raw `CONNECT` to VM B's socket still receives `403` |
+| Replacement boundary started on the same path with an empty policy and a new `-policy-version` | Guest's next `curl` to the previously allowed name is refused; the replacement's audit records the block under the new version | Refused as before |
+
+Every boundary record carries the `-sandbox` and `-policy-version` values the
+script bound to that VM's listener; the test checks that no record is missing
+them.
 
 The test passes on Firecracker v1.16.1 with guest kernel 6.18.41 from the
 Firecracker CI artifacts. It does not test guest attestation, snapshot and
-restore, other VMMs, revocation of live tunnels, or resource exhaustion.
+restore, other VMMs, draining, or resource exhaustion.
 
 ## 9. Normative References
 

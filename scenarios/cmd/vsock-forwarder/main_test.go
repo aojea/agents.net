@@ -13,10 +13,10 @@ import (
 
 func TestParseVsockAddr(t *testing.T) {
 	tests := []struct {
-		input       string
-		expectedCID uint32
+		input        string
+		expectedCID  uint32
 		expectedPort uint32
-		expectErr   bool
+		expectErr    bool
 	}{
 		{"1:10088", 1, 10088, false},
 		{"vsock://2:9000", 2, 9000, false},

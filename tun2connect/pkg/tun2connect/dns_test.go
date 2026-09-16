@@ -128,7 +128,7 @@ func TestReservedTopOfPoolIsNeverAllocated(t *testing.T) {
 	}
 }
 
-func buildQuery(t *testing.T, name string, qtype dnsmessage.Type) []byte {
+func buildQuery(t testing.TB, name string, qtype dnsmessage.Type) []byte {
 	t.Helper()
 	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{ID: 42, RecursionDesired: true})
 	if err := b.StartQuestions(); err != nil {
@@ -201,4 +201,61 @@ func TestHandleQueryOtherTypesGetNoAnswer(t *testing.T) {
 	if len(answers) != 0 {
 		t.Fatalf("TXT must not be answered, got %d answers", len(answers))
 	}
+}
+
+// FuzzHandleQuery feeds arbitrary bytes to the guest-facing DNS handler.
+// It must never panic; a response must echo the query ID, be a response
+// to the same question, and answer A/AAAA only from the synthetic pools.
+func FuzzHandleQuery(f *testing.F) {
+	f.Add(buildQuery(f, "model.example.", dnsmessage.TypeA))
+	f.Add(buildQuery(f, "model.example.", dnsmessage.TypeAAAA))
+	f.Add(buildQuery(f, "exfil.example.", dnsmessage.TypeTXT))
+	f.Add(buildQuery(f, ".", dnsmessage.TypeA))
+	f.Add([]byte{})
+	f.Add(make([]byte, 12))
+	f.Fuzz(func(t *testing.T, query []byte) {
+		d := NewVirtualDNS()
+		response, err := d.HandleQuery(query)
+		if err != nil {
+			return
+		}
+		var q, r dnsmessage.Parser
+		qh, err := q.Start(query)
+		if err != nil {
+			t.Fatalf("response %x to an unparsable query", response)
+		}
+		question, err := q.Question()
+		if err != nil {
+			t.Fatalf("response %x to a query without a question", response)
+		}
+		rh, err := r.Start(response)
+		if err != nil || !rh.Response || rh.ID != qh.ID {
+			t.Fatalf("bad response header %+v (%v) for query %+v", rh, err, qh)
+		}
+		echoed, err := r.Question()
+		if err != nil || echoed.Name.String() != question.Name.String() || echoed.Type != question.Type {
+			t.Fatalf("question not echoed: %+v vs %+v (%v)", echoed, question, err)
+		}
+		if err := r.SkipAllQuestions(); err != nil {
+			t.Fatal(err)
+		}
+		answers, err := r.AllAnswers()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, answer := range answers {
+			switch body := answer.Body.(type) {
+			case *dnsmessage.AResource:
+				if addr := netip.AddrFrom4(body.A); !v4Pool.Contains(addr) || v4Reserved.Contains(addr) {
+					t.Fatalf("A answer %v outside the synthetic pool", addr)
+				}
+			case *dnsmessage.AAAAResource:
+				if addr := netip.AddrFrom16(body.AAAA); !v6Pool.Contains(addr) || v6Reserved.Contains(addr) {
+					t.Fatalf("AAAA answer %v outside the synthetic pool", addr)
+				}
+			default:
+				t.Fatalf("unexpected answer type %T", body)
+			}
+		}
+	})
 }

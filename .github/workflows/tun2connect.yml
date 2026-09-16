@@ -73,6 +73,14 @@ jobs:
       - name: Vet
         run: go vet ./...
 
+      - name: gofmt
+        working-directory: .
+        run: |
+          unformatted=$(gofmt -l tun2connect scenarios)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed:"; echo "$unformatted"; exit 1
+          fi
+
       # The Envoy interop test skips itself here (no ENVOY_CONNECT_* set);
       # the envoy-interop job below is where it runs for real.
       - name: Test
@@ -81,7 +89,31 @@ jobs:
       - name: Namespace redirect integration
         env:
           NETNS_PROXY_INTEGRATION: '1'
-        run: go test -race -count=1 -v ./pkg/netnsproxy -run '^TestNamespaceIntegration$'
+        run: |
+          # Ubuntu 24.04 runners confine unprivileged user namespaces with
+          # AppArmor; the test creates one with unshare -Urn.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          go test -race -count=1 -v ./pkg/netnsproxy -run '^TestNamespaceIntegration$'
+
+  fuzz:
+    name: Fuzz guest-facing parsers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tun2connect/go.mod
+          cache-dependency-path: tun2connect/go.sum
+
+      # Regression inputs under testdata/fuzz are replayed by the ordinary
+      # test job; this runs each target for a bounded time looking for new ones.
+      - name: Fuzz
+        env:
+          FUZZTIME: 45s
+        run: ./test_fuzz.sh
 
   envoy-interop:
     name: Envoy boundary e2e

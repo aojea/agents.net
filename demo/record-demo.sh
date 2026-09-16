@@ -75,7 +75,7 @@ AGENT_ID=$(docker run -d --rm \
   -v "${PWD}/demo/tun2connect:/tun2connect:ro" \
   --entrypoint /tun2connect \
   agentsnet-demo \
-  run --ingress-socket /var/run/agents.net/ingress-proxy.sock \
+  run --ingress-socket /var/run/agents.net/ingress-proxy.sock --ingress-port 8081 \
   /var/run/agents.net/egress-proxy.sock \
   python3 -c "import os, threading, time; from http.server import BaseHTTPRequestHandler, HTTPServer; p = int(os.environ.get('AGENT_INGRESS_PORT', 8081)); (lambda s: threading.Thread(target=s.serve_forever, daemon=True).start())(HTTPServer(('127.0.0.1', p), type('H', (BaseHTTPRequestHandler,), {'do_POST': lambda self: (self.send_response(200), self.end_headers(), self.wfile.write(b'Webhook processed securely by zero-network agent'))}))); time.sleep(60)")
 

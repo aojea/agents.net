@@ -24,7 +24,7 @@ mkdir -p /tmp/etc && cp -a /etc/. /tmp/etc/ && mount --bind /tmp/etc /etc
 
 echo "init: starting launcher (boundary vsock://2:${BOUNDARY_PORT:-1024})" > /dev/console
 tun2connect run \
-    -ingress-socket "vsock://${INGRESS_PORT:-5000}" \
+    -ingress-socket "vsock://${INGRESS_PORT:-5000}" -ingress-port "${GUEST_HTTP_PORT:-8081}" \
     "vsock://2:${BOUNDARY_PORT:-1024}" \
     /bin/sh /mnt/config/guest-test.sh > /dev/console 2>&1
 echo "init: launcher exited with status $?" > /dev/console

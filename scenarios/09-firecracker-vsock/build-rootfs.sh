@@ -41,6 +41,24 @@ echo "=== Creating ${OUT} (${ROOTFS_MB} MiB) ==="
 rm -f "${OUT}"
 truncate -s "${ROOTFS_MB}M" "${OUT}"
 # -d accepts a tarball with e2fsprogs >= 1.47.1 built with libarchive; it
-# preserves the ownership and modes recorded by docker export.
-mke2fs -q -t ext4 -L guest-rootfs -d "${WORK}/rootfs.tar" "${OUT}"
+# preserves the ownership and modes recorded by docker export without
+# root. Older e2fsprogs (Ubuntu 24.04 ships 1.47.0) only take a directory,
+# and extracting the tar with root ownership intact needs root, so fall
+# back to passwordless sudo where available (CI runners).
+if ! mke2fs -q -t ext4 -L guest-rootfs -d "${WORK}/rootfs.tar" "${OUT}" 2> "${WORK}/mke2fs.err"; then
+    if ! sudo -n true 2>/dev/null; then
+        cat "${WORK}/mke2fs.err" >&2
+        echo "mke2fs could not populate from the tarball and sudo is unavailable;" >&2
+        echo "install e2fsprogs >= 1.47.1 with libarchive support" >&2
+        exit 1
+    fi
+    echo "mke2fs lacks tarball support; extracting with sudo"
+    mkdir "${WORK}/root"
+    sudo tar -C "${WORK}/root" -xf "${WORK}/rootfs.tar"
+    rm -f "${OUT}"
+    truncate -s "${ROOTFS_MB}M" "${OUT}"
+    sudo mke2fs -q -t ext4 -L guest-rootfs -d "${WORK}/root" "${OUT}"
+    sudo chown "$(id -u):$(id -g)" "${OUT}"
+    sudo rm -rf "${WORK}/root"
+fi
 ls -l "${OUT}"

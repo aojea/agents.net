@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -8,6 +10,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -17,6 +20,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -55,6 +59,43 @@ func boundaryClient(t *testing.T, protocol string) tun2connect.Dialer {
 		return &tun2connect.BoundaryClientH2{DialBoundary: dial}
 	}
 	return &tun2connect.BoundaryClient{DialBoundary: dial}
+}
+
+// setPolicy installs -allow, -allow-ip, and -resolve values for one test
+// through the same parsers main uses, restoring the previous policy after.
+func setPolicy(t *testing.T, allow, allowIP, resolve string) {
+	t.Helper()
+	previousNames, previousIPs, previousStatic := allowed, allowedIPs, static
+	t.Cleanup(func() { allowed, allowedIPs, static = previousNames, previousIPs, previousStatic })
+	var err error
+	if allowed, err = parseAllow(allow); err != nil {
+		t.Fatal(err)
+	}
+	if allowedIPs, err = parseIPAllowlist(allowIP); err != nil {
+		t.Fatal(err)
+	}
+	if static, err = parseStatic(resolve); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func setResolver(t *testing.T, lookup func(ctx context.Context, network, host string) ([]netip.Addr, error)) {
+	t.Helper()
+	previous := lookupNetIP
+	t.Cleanup(func() { lookupNetIP = previous })
+	lookupNetIP = lookup
+}
+
+// captureAudit redirects audit records to a buffer for the test.
+func captureAudit(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	auditMu.Lock()
+	previous := auditOut
+	buffer := &bytes.Buffer{}
+	auditOut = buffer
+	auditMu.Unlock()
+	t.Cleanup(func() { auditMu.Lock(); auditOut = previous; auditMu.Unlock() })
+	return buffer
 }
 
 func TestBoundaryTLSConfig(t *testing.T) {
@@ -130,9 +171,7 @@ func testTLSFiles(t *testing.T) (string, string) {
 }
 
 func TestTunnelPayloadDoesNotGrantAuthority(t *testing.T) {
-	previousIPs := allowedIPs
-	t.Cleanup(func() { allowedIPs = previousIPs })
-	allowedIPs = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
+	setPolicy(t, "", "127.0.0.1/32", "")
 	for _, protocol := range []string{"h1", "h2"} {
 		t.Run(protocol, func(t *testing.T) {
 			upstream, err := net.Listen("tcp", "127.0.0.1:0")
@@ -182,26 +221,15 @@ func TestTunnelPayloadDoesNotGrantAuthority(t *testing.T) {
 }
 
 func TestIPAllowlist(t *testing.T) {
-	previousIPs, previousAll, previousNames, previousLookup := allowedIPs, allowAll, allowed, lookupNetIP
-	t.Cleanup(func() {
-		allowedIPs, allowAll, allowed, lookupNetIP = previousIPs, previousAll, previousNames, previousLookup
-	})
-	lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	setResolver(t, func(ctx context.Context, network, host string) ([]netip.Addr, error) {
 		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
-	}
+	})
 	ctx := context.Background()
-	allowed = map[string]bool{"api.example": true}
-	allowAll = true
-	allowedIPs = nil
+	setPolicy(t, "api.example,*", "", "")
 	if _, reason, _ := authorize(ctx, "127.0.0.1", "443"); reason == "" {
 		t.Fatal("hostname wildcard must not authorize literal addresses")
 	}
-	allowAll = false
-	var err error
-	allowedIPs, err = parseIPAllowlist("192.0.2.1, 198.51.100.19/24, 2001:db8::/64, ::ffff:203.0.113.0/120")
-	if err != nil {
-		t.Fatal(err)
-	}
+	setPolicy(t, "api.example", "192.0.2.1, 198.51.100.19/24, 2001:db8::/64, ::ffff:203.0.113.0/120", "")
 	for _, test := range []struct {
 		host string
 		port string
@@ -228,23 +256,70 @@ func TestIPAllowlist(t *testing.T) {
 			}
 		})
 	}
-	for _, entry := range []string{"example.com", "*", "192.0.2.1/33", "2001:db8::/129", "::ffff:192.0.2.0/80", "fe80::1%eth0"} {
+	for _, entry := range []string{"example.com", "*", "192.0.2.1/33", "2001:db8::/129", "::ffff:192.0.2.0/80", "fe80::1%eth0", "192.0.2.1:0", "192.0.2.1:https", "[2001:db8::1", "[2001:db8::1]x"} {
 		if _, err := parseIPAllowlist(entry); err == nil {
 			t.Errorf("invalid IP policy accepted: %s", entry)
 		}
 	}
 }
 
+// TestPortPolicy checks that a :port suffix on -allow and -allow-ip
+// entries restricts the destination port, on names, literals, and the
+// wildcard, and that an entry without a port keeps every port open.
+func TestPortPolicy(t *testing.T) {
+	setResolver(t, func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
+	})
+	setPolicy(t, "api.example:443, api.example:8443, any.example, *:80",
+		"192.0.2.1:443, 198.51.100.0/24:22, [2001:db8::1]:443, [2001:db8:1::/64]:53, 203.0.113.7", "")
+	ctx := context.Background()
+	for _, test := range []struct {
+		host, port, reason string
+	}{
+		{"api.example", "443", ""}, {"api.example", "8443", ""}, {"api.example", "80", ""},
+		{"api.example", "22", "port-not-allowed"},
+		{"any.example", "22", ""}, {"any.example", "1", ""},
+		{"other.example", "80", ""}, {"other.example", "443", "port-not-allowed"},
+		{"192.0.2.1", "443", ""}, {"192.0.2.1", "80", "port-not-allowed"},
+		{"198.51.100.9", "22", ""}, {"198.51.100.9", "23", "port-not-allowed"},
+		{"2001:db8::1", "443", ""}, {"2001:db8::1", "444", "port-not-allowed"},
+		{"2001:db8:1::5", "53", ""}, {"2001:db8:1::5", "443", "port-not-allowed"},
+		{"203.0.113.7", "1", ""}, {"203.0.113.7", "65535", ""},
+		{"203.0.113.8", "443", "ip-not-on-allowlist"},
+	} {
+		t.Run(test.host+":"+test.port, func(t *testing.T) {
+			_, reason, err := authorize(ctx, test.host, test.port)
+			if err != nil || reason != test.reason {
+				t.Fatalf("authorize = %q, %v; want %q", reason, err, test.reason)
+			}
+		})
+	}
+	// A listed non-public address used as a resolved-address exception is
+	// also port-scoped.
+	setResolver(t, func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+		return []netip.Addr{netip.MustParseAddr("10.1.2.3")}, nil
+	})
+	setPolicy(t, "internal.example", "10.1.2.0/24:9443", "")
+	if _, reason, _ := authorize(ctx, "internal.example", "9443"); reason != "" {
+		t.Fatalf("listed port: %q", reason)
+	}
+	if _, reason, _ := authorize(ctx, "internal.example", "443"); reason != "resolved-address-denied" {
+		t.Fatalf("unlisted port on a private address: %q", reason)
+	}
+	for _, entry := range []string{"api.example:0", "api.example:65536", "api.example:https", ":443", "192.0.2.1", "[api.example]:443x", "..", "a..b", "a b.example", "ex*ample.com", "-" + strings.Repeat("a", 63) + ".example"} {
+		if _, err := parseAllow(entry); err == nil {
+			t.Errorf("invalid -allow entry accepted: %q", entry)
+		}
+	}
+	if _, err := parseAllow("xn--bcher-kva.example, my_service.internal:8080, a-b.c"); err != nil {
+		t.Fatalf("valid names rejected: %v", err)
+	}
+}
+
 // TestResolvedAddressPolicy checks that an allowed hostname only yields
 // public or explicitly listed addresses, whatever its DNS answers say.
 func TestResolvedAddressPolicy(t *testing.T) {
-	previousIPs, previousAll, previousNames, previousLookup := allowedIPs, allowAll, allowed, lookupNetIP
-	t.Cleanup(func() {
-		allowedIPs, allowAll, allowed, lookupNetIP = previousIPs, previousAll, previousNames, previousLookup
-	})
-	allowAll = true
-	allowed = map[string]bool{}
-	allowedIPs = []netip.Prefix{netip.MustParsePrefix("10.1.2.0/24")}
+	setPolicy(t, "*", "10.1.2.0/24", "")
 	ctx := context.Background()
 	answers := map[string][]string{
 		"public.example":    {"93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"},
@@ -271,6 +346,7 @@ func TestResolvedAddressPolicy(t *testing.T) {
 		}
 		return addresses, nil
 	}
+	t.Cleanup(func() { lookupNetIP = net.DefaultResolver.LookupNetIP })
 	for host, want := range map[string][]string{
 		"public.example":    {"93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"},
 		"metadata.example":  nil,
@@ -314,8 +390,6 @@ func TestResolvedAddressPolicy(t *testing.T) {
 // TestHostnameDialsCheckedAddress sends a hostname CONNECT and checks the
 // boundary dials the resolved address it checked rather than the name.
 func TestHostnameDialsCheckedAddress(t *testing.T) {
-	previousIPs, previousNames, previousLookup := allowedIPs, allowed, lookupNetIP
-	t.Cleanup(func() { allowedIPs, allowed, lookupNetIP = previousIPs, previousNames, previousLookup })
 	upstream, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -333,17 +407,16 @@ func TestHostnameDialsCheckedAddress(t *testing.T) {
 		}
 	}()
 	port := uint16(upstream.Addr().(*net.TCPAddr).Port)
-	allowed = map[string]bool{"echo.example": true, "rebound.example": true}
-	lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	setResolver(t, func(ctx context.Context, network, host string) ([]netip.Addr, error) {
 		return []netip.Addr{netip.MustParseAddr("127.0.0.1")}, nil
-	}
+	})
 	for _, protocol := range []string{"h1", "h2"} {
 		t.Run(protocol, func(t *testing.T) {
 			client := boundaryClient(t, protocol)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			// Loopback is not public: without -allow-ip the resolved address is denied.
-			allowedIPs = nil
+			setPolicy(t, "echo.example,rebound.example", "", "")
 			_, err := client.DialTCP(ctx, "rebound.example", port)
 			var refusal *tun2connect.DialError
 			if !errors.As(err, &refusal) || refusal.StatusCode != http.StatusForbidden || refusal.Reason != "resolved-address-denied" {
@@ -352,7 +425,7 @@ func TestHostnameDialsCheckedAddress(t *testing.T) {
 			if connections.Load() != 0 {
 				t.Fatal("denied name produced an upstream connection")
 			}
-			allowedIPs = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
+			setPolicy(t, "echo.example,rebound.example", "127.0.0.1/32", "")
 			conn, err := client.DialTCP(ctx, "echo.example", port)
 			if err != nil {
 				t.Fatal(err)
@@ -375,26 +448,18 @@ func TestHostnameDialsCheckedAddress(t *testing.T) {
 // TestStaticMappingIsStillAddressChecked checks that -resolve replaces DNS
 // for a name but does not bypass address policy.
 func TestStaticMappingIsStillAddressChecked(t *testing.T) {
-	previousIPs, previousNames, previousStatic, previousLookup := allowedIPs, allowed, static, lookupNetIP
-	t.Cleanup(func() {
-		allowedIPs, allowed, static, lookupNetIP = previousIPs, previousNames, previousStatic, previousLookup
-	})
 	var lookups atomic.Int32
-	lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
+	setResolver(t, func(ctx context.Context, network, host string) ([]netip.Addr, error) {
 		lookups.Add(1)
 		return nil, errors.New("DNS must not be consulted for a mapped name")
-	}
-	var err error
-	if static, err = parseStatic(" target.internal=127.0.0.1+::1 , Public.Example.=93.184.216.34"); err != nil {
-		t.Fatal(err)
-	}
-	allowed = map[string]bool{"target.internal": true, "public.example": true}
+	})
+	const mappings = " target.internal=127.0.0.1+::1 , Public.Example.=93.184.216.34"
 	ctx := context.Background()
-	allowedIPs = nil
+	setPolicy(t, "target.internal,public.example", "", mappings)
 	if _, reason, err := authorize(ctx, "target.internal", "9099"); err != nil || reason != "resolved-address-denied" {
 		t.Fatalf("loopback mapping without -allow-ip: %q, %v", reason, err)
 	}
-	allowedIPs = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32")}
+	setPolicy(t, "target.internal,public.example", "127.0.0.1/32", mappings)
 	addresses, reason, err := authorize(ctx, "target.internal.", "9099")
 	if err != nil || reason != "" || len(addresses) != 1 || addresses[0] != netip.MustParseAddr("127.0.0.1") {
 		t.Fatalf("mapped and listed: %v %q %v", addresses, reason, err)
@@ -414,9 +479,9 @@ func TestStaticMappingIsStillAddressChecked(t *testing.T) {
 }
 
 func TestRequestHeadDeadline(t *testing.T) {
-	previous := headTimeout
-	t.Cleanup(func() { headTimeout = previous })
-	headTimeout = 50 * time.Millisecond
+	previous := headTimeout.Load()
+	t.Cleanup(func() { headTimeout.Store(previous) })
+	headTimeout.Store(50 * time.Millisecond)
 	client, server := net.Pipe()
 	defer client.Close()
 	done := make(chan struct{})
@@ -433,9 +498,7 @@ func TestRequestHeadDeadline(t *testing.T) {
 }
 
 func TestLiteralTCPThroughBoundary(t *testing.T) {
-	previousIPs := allowedIPs
-	t.Cleanup(func() { allowedIPs = previousIPs })
-	allowedIPs = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32"), netip.MustParsePrefix("::1/128")}
+	setPolicy(t, "", "127.0.0.1/32, ::1/128", "")
 	for _, host := range []string{"127.0.0.1", "::1"} {
 		t.Run(host, func(t *testing.T) {
 			upstream, err := net.Listen("tcp", net.JoinHostPort(host, "0"))
@@ -483,9 +546,9 @@ func TestLiteralTCPThroughBoundary(t *testing.T) {
 }
 
 func TestLiteralUDPThroughBoundary(t *testing.T) {
-	previousIPs, previousUDP := allowedIPs, enableUDP
-	t.Cleanup(func() { allowedIPs, enableUDP = previousIPs, previousUDP })
-	allowedIPs = []netip.Prefix{netip.MustParsePrefix("127.0.0.1/32"), netip.MustParsePrefix("::1/128")}
+	previousUDP := enableUDP
+	t.Cleanup(func() { enableUDP = previousUDP })
+	setPolicy(t, "", "127.0.0.1/32, ::1/128", "")
 	enableUDP = true
 	for _, host := range []string{"127.0.0.1", "::1"} {
 		t.Run(host, func(t *testing.T) {
@@ -529,6 +592,181 @@ func TestLiteralUDPThroughBoundary(t *testing.T) {
 						t.Fatalf("unlisted UDP IP should be denied: %v", err)
 					}
 				})
+			}
+		})
+	}
+}
+
+// echoListener returns a TCP echo server and a counter of accepted connections.
+func echoListener(t *testing.T) (net.Listener, *atomic.Int32) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	var connections atomic.Int32
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			connections.Add(1)
+			go func() { defer conn.Close(); io.Copy(conn, conn) }()
+		}
+	}()
+	return ln, &connections
+}
+
+// TestAuditRecordsAreStructured checks that each decision is one JSON
+// object carrying the listener-bound identity and that guest-controlled
+// text cannot break the record apart.
+func TestAuditRecordsAreStructured(t *testing.T) {
+	previousSandbox, previousPolicy, previousListener := sandboxID, policyVersion, listenerName
+	t.Cleanup(func() { sandboxID, policyVersion, listenerName = previousSandbox, previousPolicy, previousListener })
+	sandboxID, policyVersion, listenerName = "sandbox-a", "v7", "unix:///run/a.sock"
+	setPolicy(t, "", "127.0.0.1/32", "")
+	output := captureAudit(t)
+	upstream, _ := echoListener(t)
+	port := uint16(upstream.Addr().(*net.TCPAddr).Port)
+	client := boundaryClient(t, "h1")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := client.DialTCP(ctx, "127.0.0.1", port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close()
+	// Commas, semicolons, and equals signs are legal in an HTTP authority
+	// and would split or spoof fields in a space- or comma-delimited log.
+	// Quotes and control characters are rejected by the HTTP parser and
+	// never reach the record.
+	hostile := "evil,decision=allow;address=203.0.113.1.example"
+	if _, err := client.DialTCP(ctx, hostile, 443); err == nil {
+		t.Fatal("hostile name was allowed")
+	}
+	// Records are written when the decision is made; the allow record may
+	// still be in flight when DialTCP returns, so wait briefly.
+	var lines []string
+	for range 50 {
+		lines = strings.Split(strings.TrimSpace(output.String()), "\n")
+		if len(lines) >= 2 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(lines) != 2 {
+		t.Fatalf("want 2 records, got %d: %q", len(lines), output.String())
+	}
+	var records []auditRecord
+	for _, line := range lines {
+		var record auditRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatalf("record is not one JSON object: %q: %v", line, err)
+		}
+		if record.Sandbox != "sandbox-a" || record.Policy != "v7" || record.Listener != "unix:///run/a.sock" || record.Wire != "h1" || record.Transport != "tcp" || record.Time == "" {
+			t.Fatalf("missing listener-bound fields: %+v", record)
+		}
+		records = append(records, record)
+	}
+	if records[0].Decision != "allow" || records[0].Address != upstream.Addr().String() || records[0].Destination != net.JoinHostPort("127.0.0.1", strconv.Itoa(int(port))) {
+		t.Fatalf("allow record: %+v", records[0])
+	}
+	if records[1].Decision != "block" || records[1].Reason != "not-on-allowlist" || records[1].Destination != hostile+":443" {
+		t.Fatalf("block record did not preserve the hostile destination as data: %+v", records[1])
+	}
+}
+
+// TestConnectionBudget checks that connections over -max-connections are
+// refused with 503 before their request head is read and that a slot is
+// released when its connection ends.
+func TestConnectionBudget(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "b.sock")
+	ln, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go serveListener(ln, false, 1, 1)
+	captureAudit(t)
+
+	first, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := net.Dial("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	second.SetReadDeadline(time.Now().Add(5 * time.Second))
+	response, err := http.ReadResponse(bufio.NewReader(second), nil)
+	if err != nil || response.StatusCode != http.StatusServiceUnavailable || response.Header.Get("Boundary-Reason") != "busy" {
+		t.Fatalf("second connection: %v, %v", response, err)
+	}
+	first.Close()
+	// The slot is released asynchronously; retry until a third connection
+	// is served (405 for a non-CONNECT request proves it reached serve).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		third, err := net.Dial("unix", socket)
+		if err != nil {
+			t.Fatal(err)
+		}
+		third.SetDeadline(time.Now().Add(5 * time.Second))
+		io.WriteString(third, "GET / HTTP/1.1\r\nHost: boundary\r\n\r\n")
+		response, err := http.ReadResponse(bufio.NewReader(third), nil)
+		third.Close()
+		if err == nil && response.StatusCode == http.StatusMethodNotAllowed {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("slot never released: %v, %v", response, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestIdleTunnelIsClosed checks that a tunnel with no traffic in either
+// direction is closed after -idle-timeout on both wires, while an active
+// tunnel survives.
+func TestIdleTunnelIsClosed(t *testing.T) {
+	previous := idleTimeout.Load()
+	t.Cleanup(func() { idleTimeout.Store(previous) })
+	idleTimeout.Store(100 * time.Millisecond)
+	setPolicy(t, "", "127.0.0.1/32", "")
+	upstream, _ := echoListener(t)
+	port := uint16(upstream.Addr().(*net.TCPAddr).Port)
+	for _, protocol := range []string{"h1", "h2"} {
+		t.Run(protocol, func(t *testing.T) {
+			client := boundaryClient(t, protocol)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			conn, err := client.DialTCP(ctx, "127.0.0.1", port)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			buffer := make([]byte, 1)
+			// Traffic every 40ms keeps a 100ms idle tunnel open.
+			for range 5 {
+				if _, err := conn.Write([]byte("k")); err != nil {
+					t.Fatal(err)
+				}
+				conn.SetReadDeadline(time.Now().Add(time.Second))
+				if _, err := io.ReadFull(conn, buffer); err != nil {
+					t.Fatalf("active tunnel was closed: %v", err)
+				}
+				time.Sleep(40 * time.Millisecond)
+			}
+			conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			start := time.Now()
+			if _, err := conn.Read(buffer); err == nil {
+				t.Fatal("idle tunnel delivered data")
+			} else if errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("idle tunnel still open after %s", time.Since(start))
 			}
 		})
 	}

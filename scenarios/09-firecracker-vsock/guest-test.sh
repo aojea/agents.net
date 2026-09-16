@@ -25,6 +25,8 @@ cat /etc/resolv.conf
 
 probe allow-name  "https://test.example.com:${PORT}/ping"
 probe deny-name   "https://denied.example:${PORT}/ping"
+# The allowed name on a port the policy does not list.
+probe deny-port   "http://test.example.com:80/ping"
 # A literal address never named by DNS reaches the boundary as an IP
 # CONNECT and needs -allow-ip; 192.0.2.10 is not listed.
 probe deny-ip     "https://192.0.2.10:${PORT}/ping"
@@ -45,4 +47,16 @@ mkdir -p /tmp/www && echo "hello-from-guest" > /tmp/www/index.html
 httpd -p 127.0.0.1:8081 -h /tmp/www || echo "RESULT httpd failed"
 echo "RESULT ingress-ready port=8081"
 sleep "${INGRESS_WAIT:-8}"
+
+# Revocation: start a long, rate-limited download so a tunnel is in flight,
+# then the host kills this VM's boundary. The transfer must end without
+# completing, and a later request must not find any alternate path.
+echo "RESULT revoke-start"
+stats="$(curl -s -o /dev/null -w '%{size_download} %{http_code}' --limit-rate 2M --max-time 60 \
+    --cacert "$CERT" "https://test.example.com:${PORT}/stream?mb=4096")"
+rc=$?
+echo "RESULT revoke curl-exit=$rc bytes=${stats%% *} http=${stats##* }"
+# Give the host time to start the replacement boundary with a new policy.
+sleep "${REVOKE_WAIT:-4}"
+probe after-revoke "https://test.example.com:${PORT}/ping"
 echo "RESULT done"
