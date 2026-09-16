@@ -1,0 +1,94 @@
+name: Firecracker CI
+
+# Scenario 09: two Firecracker microVMs on KVM. GitHub's Linux runners
+# expose /dev/kvm (nested virtualization); the runner user needs a udev
+# rule to open it. The job downloads a pinned Firecracker release and the
+# pinned CI guest kernel; the guest rootfs is built from alpine via
+# docker export and populated with mke2fs, falling back to sudo where
+# e2fsprogs predates tarball support.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'scenarios/09-firecracker-vsock/**'
+      - 'scenarios/cmd/target-server/**'
+      - 'tun2connect/**'
+      - '.github/workflows/firecracker.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'scenarios/09-firecracker-vsock/**'
+      - 'scenarios/cmd/target-server/**'
+      - 'tun2connect/**'
+      - '.github/workflows/firecracker.yml'
+
+env:
+  FIRECRACKER_VERSION: v1.16.1
+  FIRECRACKER_SHA256: 382a02a869e4d6d5cb14c40577f9545e8458021ea8b0b2d3fc10ec14d9c242e6
+
+jobs:
+  two-sandboxes:
+    name: Two microVMs, per-VM boundaries, revocation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: tun2connect/go.mod
+          cache-dependency-path: |
+            tun2connect/go.sum
+            scenarios/go.sum
+
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+          test -r /dev/kvm -a -w /dev/kvm
+
+      - name: Install Firecracker
+        run: |
+          curl -fsSL --retry 3 -o firecracker.tgz \
+            "https://github.com/firecracker-microvm/firecracker/releases/download/${FIRECRACKER_VERSION}/firecracker-${FIRECRACKER_VERSION}-x86_64.tgz"
+          echo "${FIRECRACKER_SHA256}  firecracker.tgz" | sha256sum -c -
+          tar xzf firecracker.tgz --wildcards "*/firecracker-${FIRECRACKER_VERSION}-x86_64" -O > firecracker
+          chmod +x firecracker
+          sudo mv firecracker /usr/local/bin/firecracker
+          firecracker --version
+
+      - name: Tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q e2fsprogs jq python3
+          mke2fs -V 2>&1 | head -1
+
+      - name: Cache guest kernel
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/agents.net
+          key: firecracker-guest-kernel-6.18.41
+
+      - name: Run scenario 09
+        run: ./scenarios/09-firecracker-vsock/run.sh
+
+      - name: Keep artifacts on failure
+        if: failure()
+        run: |
+          mkdir -p artifacts
+          cp -r /tmp/scenarios/09/*.console /tmp/scenarios/09/*.audit* /tmp/scenarios/09/*.log artifacts/ 2>/dev/null || true
+          ls -la artifacts
+
+      - name: Upload artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-09-run
+          path: artifacts/
+          if-no-files-found: ignore

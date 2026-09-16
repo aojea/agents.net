@@ -18,16 +18,19 @@ the table below describes the actual implementation.
 | 06 | [Bridge with TAP creation](06-microvm-tap-netns/run.sh) | Docker bridge; an extra TAP is created but not used for the transfer | Traffic through TAP, a VM NIC, or isolation of host-kernel code |
 | 07 | [Forwarder and local VSOCK](07-microvm-vsock-boundary/run.sh) | Namespace TCP loopback proxy forwarded to VSOCK CID 1 | Native VM socket interception or elimination of all TCP packetization |
 | 08 | [Host TAP permission probe](08-microvm-tap-host/run.sh) | Attempts host TAP creation and reports permissions | Throughput, scaling, or a security violation |
-| 09 | [Firecracker vsock](09-firecracker-vsock/run.sh) | Two Firecracker microVMs (KVM, no network device), in-guest TUN launcher as init, boundary per VM on Firecracker's `<uds>_<port>` socket, disjoint policies, forged raw CONNECT, unbound port, ingress into guest loopback | Guest attestation, other VMMs, performance, or resistance to a hypervisor escape |
+| 09 | [Firecracker vsock](09-firecracker-vsock/run.sh) | Two Firecracker microVMs (KVM, no network device), in-guest TUN launcher as init, boundary per VM on Firecracker's `<uds>_<port>` socket, disjoint port-scoped policies, forged raw CONNECT, unbound port, ingress into the pinned guest loopback port, boundary kill mid-transfer with a replacement policy | Guest attestation, other VMMs, performance, draining, or resistance to a hypervisor escape |
 
 Scenarios 04 and 07 predate 09 and use VSOCK CID 1 loopback inside namespaces;
 they are retained as historical measurements. Scenario 09 boots real guests and
 is the executed evidence for the VM channel described in the specification.
 It requires `firecracker` on `PATH`, read/write access to `/dev/kvm`,
-`mke2fs` 1.47.1 or later with libarchive support, Docker for the rootfs build,
-`jq` for the audit assertions,
-and downloads the Firecracker CI guest kernel (digest pinned in the driver)
-into `~/.cache/agents.net`. It is not part of `benchmark.sh`:
+Docker for the rootfs build, `jq` for the audit assertions, and `mke2fs`
+1.47.1 or later with libarchive support (older `mke2fs` works when
+passwordless `sudo` is available, as on CI runners). It downloads the
+Firecracker CI guest kernel (digest pinned in the driver)
+into `~/.cache/agents.net`. It is not part of `benchmark.sh`; it runs in the
+[Firecracker workflow](../.github/workflows/firecracker.yml) on GitHub-hosted
+runners:
 
 ```bash
 ./scenarios/09-firecracker-vsock/run.sh

@@ -880,7 +880,7 @@ requirements.
 | Resolved-address policy for hostnames | Implemented in the Go boundary: names are resolved by the boundary, non-public results are denied unless listed, and the checked address is dialed without a second resolution |
 | Per-port policy, complete CONNECT validation | Per-port rules on names, literals, and the wildcard; HTTP/1.1 head parsed by the boundary with request-line, version, Host/authority, userinfo/path, port, header-name, and size checks; a 34-case negative corpus and fuzz targets for the head, policy, template, capsule, and DNS parsers |
 | Multiple identities on one listener | Optional extension, not implemented; unnecessary for dedicated endpoints |
-| Connection/resource budgets, revocation lifecycle, complete decision audit | Go boundary: connection and HTTP/2 stream budgets, tunnel idle timeout, request-head deadline, one JSON record per decision with listener-bound sandbox identity and policy version; bounded synthetic-name memory with no address reuse; namespace session/queue limits. Revocation of live tunnels is stop/restart only |
+| Connection/resource budgets, revocation lifecycle, complete decision audit | Go boundary: connection and HTTP/2 stream budgets, tunnel idle timeout, request-head deadline, one JSON record per decision with listener-bound sandbox identity and policy version; bounded synthetic-name memory with no address reuse; namespace session/queue limits. Revocation is stop/restart of the per-sandbox boundary process, exercised in the Firecracker scenario (Section 8.2); no draining or hot handoff |
 | Controller-registered connected FDs | Optional extension; registration and handoff are not implemented |
 | Software signature verification and launch attestation | Deployment requirements where selected; no verifier is implemented here |
 | Authenticated production ingress | Not implemented; demo and Firecracker reverse stream only, without caller authentication. The launcher pins the one loopback port ingress may reach |
@@ -971,9 +971,9 @@ the command applies a global destination policy, not per-identity authorization.
 
 One process with one listener can serve the baseline's fixed sandbox policy.
 This does not make the example a complete secure deployment: the runtime must
-provide exclusive socket exposure and lifecycle control, and the boundary
-still lacks revocation of live tunnels other than by stopping the process,
-and HTTP/2 stream validation relies on `golang.org/x/net/http2`.
+provide exclusive socket exposure and lifecycle control, revocation is
+process termination without draining, and HTTP/2 stream validation relies on
+`golang.org/x/net/http2`.
 Sharing this listener between unrelated sandboxes would give them the same
 policy; adding an identity header would not separate them.
 
@@ -1050,7 +1050,7 @@ ingress checks apply only when those extensions are used.
 | Optional FD registration | Wrong registrant, wrong descriptor type/count, truncation, inherited copies, stale generation, restart | Not implemented; not required by the local model |
 | Tenant separation | A cannot use B's endpoint, policy, key, signing service, or ingress route | Endpoint and policy separation shown for two Firecracker VMs; keys, signing services, and ingress route binding not implemented |
 | Credentials | No key in guest, logs, errors, or redirects; every reused request reauthorized | Demo injection unit tests only; production gateway checks required |
-| Failure and revocation | Proxy loss, missing policy, channel closure, retained FDs, policy update, certificate expiry, draining | Refusal and namespace shutdown tests; controller revocation and draining not implemented |
+| Failure and revocation | Proxy loss, missing policy, channel closure, retained FDs, policy update, certificate expiry, draining | Firecracker scenario: killing one VM's boundary during a rate-limited download ends the transfer partway (curl exit 55 after about 6 MB), the old socket refuses connections, the other VM's boundary keeps enforcing, and a replacement boundary on the same path with an empty policy decides the guest's next request (audit shows the new policy version). Refusal and namespace shutdown tests. Draining, certificate expiry, and controller-driven policy update are not implemented |
 | Resource limits | Slow heads, oversized capsules, stream floods, DNS growth, stalled peers, UDP amplification | Request-head deadline, connection budget (503 before the head is read, slot released on close), tunnel idle timeout on HTTP/1.1 and HTTP/2, HTTP/2 stream cap, capsule bounds, synthetic-name limit; multi-tenant overload tests required |
 | Software integrity | Wrong signer/digest, modified policy, stale update, replayed attestation, wrong session key | Not implemented; depends on deployment verifier |
 | Ingress | Caller auth, authorized service only, stale route rejection, port restrictions, namespace return path | Demo and Firecracker deliveries reach the guest loopback listener; the launcher joins streams only to its pinned port (unit test and Firecracker scenario); caller authentication and stale-route rejection are not implemented; namespace reverse channel is not implemented |
@@ -1099,14 +1099,28 @@ the TUN adapter and `socat` directly on the vsock channel.
 | Raw connect to vsock port 1025 (never bound on the host) | Reset by the VMM | Reset by the VMM |
 | Host delivers `GET /index.html` through `<uds_path>` → guest vsock 5000 → loopback 8081 | 200, guest body | 200, guest body |
 | Same handshake naming loopback port 22 | `ERR port not permitted` from the launcher | `ERR port not permitted` |
+| Boundary process killed during a 2 MB/s download of a 4 GiB body | Transfer ends after a few megabytes with a curl error; the old socket path refuses connections | Unaffected: a raw `CONNECT` to VM B's socket still receives `403` |
+| Replacement boundary started on the same path with an empty policy and a new `-policy-version` | Guest's next `curl` to the previously allowed name is refused; the replacement's audit records the block under the new version | Refused as before |
 
 Every boundary record carries the `-sandbox` and `-policy-version` values the
 script bound to that VM's listener; the test checks that no record is missing
 them.
 
 The test passes on Firecracker v1.16.1 with guest kernel 6.18.41 from the
-Firecracker CI artifacts. It does not test guest attestation, snapshot and
-restore, other VMMs, revocation of live tunnels, or resource exhaustion.
+Firecracker CI artifacts, locally and in the
+[Firecracker workflow](.github/workflows/firecracker.yml) on GitHub-hosted
+runners with KVM. It does not test guest attestation, snapshot and restore,
+other VMMs, draining, or resource exhaustion.
+
+### 8.3 Continuous Integration
+
+[.github/workflows](.github/workflows) runs on pushes and pull requests to
+`main`: build, `go vet`, `gofmt`, and the race-enabled test suites of both Go
+modules including the live namespace integration test; the fuzz targets for
+45 seconds each; the Envoy interoperability presubmit; the Docker demo
+presubmit; and the Firecracker scenario. Hosted runs are evidence for the
+checks they execute, not a substitute for the deployment review described in
+Section 8.1.
 
 ## 9. Normative References
 
