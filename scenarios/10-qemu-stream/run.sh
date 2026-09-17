@@ -8,6 +8,10 @@ wait_for() {
     local file="$1" pattern="$2"
     for ((attempt=0; attempt<900; attempt++)); do
         if [[ -f "$file" ]] && grep -q "$pattern" "$file"; then return; fi
+        if [[ "$file" == *.console && -f "${file%.console}.supervisor" ]]; then
+            tail -n 80 "$file" "${file%.console}.exit" "${file%.console}.adapter.log" >&2 || true
+            fail "VM exited before $pattern in $file"
+        fi
         sleep 0.1
     done
     fail "timed out waiting for $pattern in $file"
@@ -122,10 +126,10 @@ supervise_vm() {
     children+=("$adapter_pid")
     echo "$adapter_pid" >"${RUN_DIR}/${vm}.adapter.pid"
     wait_for "${RUN_DIR}/${vm}.adapter.log" 'qemuproxy ready'
-    unshare -Urn qemu-system-x86_64 -machine microvm -enable-kvm -cpu host -m 128 -smp 1 \
+    unshare -Urn qemu-system-x86_64 -machine microvm,pit=off,pic=off,rtc=off -enable-kvm -cpu host -m 128 -smp 1 \
         -nodefaults -no-user-config -display none -monitor none -serial stdio -no-reboot \
         -kernel "$KERNEL" -initrd "${RUN_DIR}/initramfs" \
-        -append 'console=ttyS0 reboot=t panic=1 quiet rdinit=/init' \
+        -append 'console=ttyS0 earlyprintk=serial,ttyS0,115200 reboot=t panic=1 quiet rdinit=/init' \
         -netdev "stream,id=net0,server=off,addr.type=unix,addr.path=${RUN_DIR}/${vm}.packets/nic.sock" \
         -device 'virtio-net-device,netdev=net0,mac=02:00:00:00:00:02,host_mtu=1500,mq=off,csum=off,gso=off,guest_csum=off,guest_tso4=off,guest_tso6=off,guest_ecn=off,guest_ufo=off,host_tso4=off,host_tso6=off,host_ecn=off,host_ufo=off' \
         <"${RUN_DIR}/${vm}.input" >"${RUN_DIR}/${vm}.console" 2>&1 &

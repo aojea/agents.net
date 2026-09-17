@@ -69,6 +69,13 @@ and accessible only to the assigned QEMU and adapter. The command creates a
 connection ends. Socket mode alone does not isolate processes sharing a UID.
 There is no reconnection or listener reuse within a VM generation.
 
+With the pinned Firecracker guest kernel, use
+`-machine microvm,pit=off,pic=off,rtc=off`. Leaving legacy interrupt devices
+enabled can cause an early guest exception before its normal serial console
+starts. The scenario enables early serial output and reports a terminated VM
+immediately, including its console and adapter logs, rather than waiting for
+the guest marker timeout.
+
 Attach this networking fragment to an otherwise configured QEMU `microvm`:
 
 ```bash
