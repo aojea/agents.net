@@ -19,6 +19,7 @@ the table below describes the actual implementation.
 | 07 | [Forwarder and local VSOCK](07-microvm-vsock-boundary/run.sh) | Namespace TCP loopback proxy forwarded to VSOCK CID 1 | Native VM socket interception or elimination of all TCP packetization |
 | 08 | [Host TAP permission probe](08-microvm-tap-host/run.sh) | Attempts host TAP creation and reports permissions | Throughput, scaling, or a security violation |
 | 09 | [Firecracker vsock](09-firecracker-vsock/run.sh) | Two Firecracker microVMs (KVM, no network device), in-guest TUN launcher as init, boundary per VM on Firecracker's `<uds>_<port>` socket, disjoint port-scoped policies, forged raw CONNECT, unbound port, ingress into the pinned guest loopback port, boundary kill mid-transfer with a replacement policy | Guest attestation, other VMMs, performance, draining, or resistance to a hypervisor escape |
+| 10 | [QEMU stream](10-qemu-stream/README.md) | Two QEMU microVMs (KVM, virtio-net), separate confined userspace packet adapters, dedicated CONNECT boundaries, IPv4/IPv6 TCP and DNS, disjoint policies, revocation, adapter-loss supervision | Ingress, DHCP, live UDP, snapshot/migration, performance, or portable conformance |
 
 Scenarios 04 and 07 predate 09 and use VSOCK CID 1 loopback inside namespaces;
 they are retained as historical measurements. Scenario 09 boots real guests and

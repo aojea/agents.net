@@ -4,8 +4,9 @@
 
 `agents.net` defines a network interface between a sandbox and an external
 policy-enforcing proxy. Applications use ordinary sockets. An adapter, either
-inside the sandbox or in a dedicated network namespace, converts supported
-connections into HTTP `CONNECT` requests. Both adapters deliver requests through
+inside the sandbox, in a dedicated network namespace, or in an isolated VMM
+packet backend, converts supported connections into HTTP `CONNECT` requests.
+Adapters deliver requests through
 a dedicated boundary socket. The boundary applies that socket's assigned policy
 before opening an upstream connection. The sandbox has no direct external
 network path.
@@ -32,7 +33,7 @@ examples, and test coverage; they are informative.
 This specification uses the following terms:
 
 - **Sandbox:** An isolated, untrusted workload with no direct external network access. Its only networking is through one of the adapter paths below.
-- **Adapter:** The component that translates application traffic into CONNECT requests. It runs inside the sandbox with a TUN interface, or outside it in a dedicated network namespace terminating its veth or TAP. It has no authority to grant access.
+- **Adapter:** The component that translates application traffic into CONNECT requests. It runs inside the sandbox with a TUN interface, or outside it terminating its NIC through a dedicated network namespace or isolated userspace packet backend. It has no authority to grant access.
 - **Boundary socket:** A dedicated, access-controlled endpoint assigned to one sandbox lifetime and policy. In the local model it is a pathname Unix stream socket.
 - **Boundary proxy:** The external proxy that authorizes requests and opens upstream connections.
 - **Controller:** The trusted runtime or launcher that creates the sandbox, adapter environment, socket access, and policy binding. This is a responsibility, not a requirement for a separate control-plane service.
@@ -49,8 +50,9 @@ For each supported connection, the adapter sends the destination hostname or
 IP address and port to the boundary proxy. The proxy authorizes the request,
 resolves hostnames when needed, and connects to an allowed address. Denied
 requests fail at the tunnel handshake.
-There are two adapter paths. They implement the same boundary interface and
-have the same destination-policy requirements.
+The following diagram shows the TUN and namespace adapter paths. An isolated
+userspace VMM packet backend is another placement (Section 5.4); all use the
+same boundary interface and destination-policy requirements.
 
 ```mermaid
 flowchart LR
@@ -855,6 +857,31 @@ this test.
 
 ---
 
+### 5.4 QEMU Userspace Packet Backend
+
+A VM NIC can terminate at an isolated userspace adapter without a host TAP or
+guest TUN. The reference `qemuproxy` command accepts QEMU's `-netdev stream`
+Ethernet framing over a dedicated pathname Unix socket. It uses gVisor netstack
+and the shared DNS-aware forwarder to generate HTTP/1.1 CONNECT requests on a
+different, dedicated boundary socket. Application data, including HTTP GET or
+nested CONNECT bytes, remains unchanged tunnel payload. The adapter does not
+select authority by inspecting application headers.
+
+Each adapter requires the filesystem, process, and network confinement described
+in Section 4.3. QEMU must have no alternative external network backend. The
+packet channel has one VM lifetime and does not reconnect; the controller stops
+the VM when its adapter fails. Restart, snapshot, or restore must not attach a
+fresh synthetic DNS state to a guest retaining old mappings.
+
+The reference uses static gateway addresses, a 1500-byte MTU, disabled offloads,
+bounded packet queues and combined session limits. It needs no guest networking
+daemon. The [QEMU integration](scenarios/10-qemu-stream/README.md) documents
+configuration, restrictions, and executed two-VM IPv4/IPv6 tests. This is an
+external QEMU-compatible backend, not an in-process QEMU patch. Ingress, DHCP,
+snapshot/restore and migration are not implemented for this path.
+
+---
+
 ## 6. Alternatives
 
 | Approach | Best fit | Trade-off |
@@ -896,7 +923,8 @@ requirements.
 | Software signature verification and launch attestation | Deployment requirements where selected; no verifier is implemented here |
 | Authenticated production ingress | Not implemented; demo and Firecracker reverse stream only, without caller authentication. The launcher pins the one loopback port ingress may reach |
 | Firecracker VM channel | Executed: two microVMs with no NIC, in-guest TUN over vsock, one boundary listener per VM on Firecracker's per-VM Unix socket prefix, disjoint policies, ingress into guest loopback (Section 8.2) |
-| Native runtime interception, other VMMs, attestation | Future work; Cloud Hypervisor and QEMU host `AF_VSOCK` channels are not tested |
+| QEMU packet backend | Executed: two KVM microVMs with virtio-net and isolated Unix-stream packet adapters, IPv4/IPv6 TCP and DNS, disjoint policies, boundary revocation, and adapter-loss supervision (Section 5.4) |
+| Native runtime interception, other VMMs, attestation | Future work; Cloud Hypervisor's Firecracker-style Unix-backed VSOCK and QEMU host `AF_VSOCK` channels are not tested |
 
 ### 7.1 Standard Wire Implementation: [tun2connect/](tun2connect/)
 
