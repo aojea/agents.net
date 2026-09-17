@@ -91,8 +91,8 @@ chmod +x "${RUN_DIR}/root/init"
 pushd "${RUN_DIR}/root" >/dev/null
 find . -print0 | cpio --null -o --format=newc --owner=0:0 >"${RUN_DIR}/initramfs" 2>"${RUN_DIR}/cpio.log"
 popd >/dev/null
-CGO_ENABLED=0 go -C "${REPO_ROOT}/tun2connect" build -o "${RUN_DIR}/bin/qemuproxy" ./cmd/qemuproxy
-CGO_ENABLED=0 go -C "${REPO_ROOT}/tun2connect" build -o "${RUN_DIR}/bin/connect-proxy" ./cmd/connect-proxy
+CGO_ENABLED=0 go -C "${REPO_ROOT}/sdk" build -o "${RUN_DIR}/bin/qemuproxy" ./cmd/qemuproxy
+CGO_ENABLED=0 go -C "${REPO_ROOT}/sdk" build -o "${RUN_DIR}/bin/connect-proxy" ./cmd/connect-proxy
 go -C "${REPO_ROOT}/scenarios" build -o "${RUN_DIR}/bin/target-server" ./cmd/target-server
 for vm in vm-a vm-b; do
     mkdir -m 700 "${RUN_DIR}/${vm}.packets" "${RUN_DIR}/${vm}.boundary"

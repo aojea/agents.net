@@ -19,9 +19,9 @@ echo "=== 2. Generating Demo CA Certificates ==="
 echo "=== 3. Building the Launcher (tun2connect) ==="
 # Always rebuild: a stale binary would test yesterday's launcher.
 if command -v go >/dev/null 2>&1; then
-    CGO_ENABLED=0 go -C tun2connect build -o "${LAUNCHER}" ./cmd/tun2connect
+    CGO_ENABLED=0 go -C sdk build -o "${LAUNCHER}" ./cmd/tun2connect
 else
-    docker run --rm -v "${REPO_ROOT}":/src -w /src/tun2connect \
+    docker run --rm -v "${REPO_ROOT}":/src -w /src/sdk \
       -e CGO_ENABLED=0 golang:1.26 \
       go build -o /src/demo/tun2connect ./cmd/tun2connect
 fi

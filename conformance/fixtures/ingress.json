@@ -1,0 +1,57 @@
+{
+  "agents_net_conformance": "0.1",
+  "role": "ingress",
+  "environment": {
+    "describe": "The adapter under test pins loopback port 8081 for sandbox A. The harness plays the ingress gateway on A's ingress channel and runs a loopback HTTP server on 8081 and another on 8082 inside A."
+  },
+  "cases": [
+    {
+      "id": "I-ING-01",
+      "group": "ingress-gateway",
+      "title": "HTTP CONNECT to the pinned loopback port is accepted and the stream is relayed",
+      "spec": ["ingress §1", "ingress §2"],
+      "request": {"raw": "CONNECT 127.0.0.1:8081 HTTP/1.1\r\nHost: 127.0.0.1:8081\r\n\r\nGET /index.html HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"},
+      "expect": {"status": 200, "relayed_response_from": 8081, "audit": {"direction": "ingress", "decision": "allow", "destination": "127.0.0.1:8081"}}
+    },
+    {
+      "id": "I-ING-02",
+      "group": "ingress-gateway",
+      "title": "CONNECT to another loopback port is refused and no local connection is made",
+      "spec": ["ingress §1", "ingress §2"],
+      "request": {"raw": "CONNECT 127.0.0.1:8082 HTTP/1.1\r\nHost: 127.0.0.1:8082\r\n\r\n"},
+      "expect": {"status": 403, "reason": "port-not-permitted", "local_connections_to_8082": 0}
+    },
+    {
+      "id": "I-ING-03",
+      "group": "ingress-gateway",
+      "title": "CONNECT to a non-loopback address is refused",
+      "spec": ["ingress §2"],
+      "request": {"raw": "CONNECT 10.0.0.1:8081 HTTP/1.1\r\nHost: 10.0.0.1:8081\r\n\r\n"},
+      "expect": {"status": 403, "reason": "port-not-permitted"}
+    },
+    {
+      "id": "I-ING-04",
+      "group": "ingress-gateway",
+      "title": "A first line that is not an HTTP/1.1 CONNECT request line is refused",
+      "spec": ["ingress §2"],
+      "request": {"raw": "CONNECT 8081\n"},
+      "expect": {"status": 400, "reason": "malformed-request-line", "local_connections_to_8081": 0}
+    },
+    {
+      "id": "I-ING-05",
+      "group": "ingress-gateway",
+      "title": "A route for a revoked sandbox generation does not reach its replacement",
+      "spec": ["lifecycle §2", "ingress §1"],
+      "procedure": "Bind an external route to A; revoke A; start A' on the same identity; deliver a request on the old route.",
+      "expect": {"delivery": "rejected at the gateway", "a_prime_received": 0}
+    },
+    {
+      "id": "I-ING-06",
+      "group": "ingress-gateway",
+      "title": "An unauthenticated external caller is rejected before any reverse connection",
+      "spec": ["ingress §1(1)"],
+      "procedure": "Send a request without credentials to the gateway's public route.",
+      "expect": {"gateway_status": [401, 403], "reverse_connections": 0}
+    }
+  ]
+}

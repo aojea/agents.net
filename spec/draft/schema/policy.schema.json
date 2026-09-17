@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agents.net/schema/policy/1",
+  "title": "agents.net policy descriptor",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["agents_net_policy", "version", "default", "rules"],
+  "properties": {
+    "agents_net_policy": {"const": 1},
+    "version": {"type": "string", "minLength": 1, "maxLength": 256},
+    "sandbox": {"type": "string", "minLength": 1, "maxLength": 256},
+    "default": {"const": "deny"},
+    "rules": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/rule"}
+    },
+    "resolved_addresses": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/addressException"}
+    },
+    "features": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "udp": {"type": "boolean", "default": false},
+        "h2": {"type": "boolean", "default": false}
+      }
+    }
+  },
+  "$defs": {
+    "port": {
+      "oneOf": [
+        {"type": "integer", "minimum": 1, "maximum": 65535},
+        {"type": "string", "pattern": "^[0-9]{1,5}(-[0-9]{1,5})?$"}
+      ]
+    },
+    "ports": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/port"}
+    },
+    "transports": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"enum": ["tcp", "udp"]}
+    },
+    "hostname": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 253,
+      "pattern": "^([a-z0-9_-]{1,63}\\.)*[a-z0-9_-]{1,63}$"
+    },
+    "ipAddress": {
+      "type": "string",
+      "anyOf": [{"format": "ipv4"}, {"format": "ipv6"}]
+    },
+    "cidr": {
+      "type": "string",
+      "pattern": "^[0-9a-fA-F:.]+/[0-9]{1,3}$"
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 64},
+        "name": {
+          "oneOf": [{"const": "*"}, {"$ref": "#/$defs/hostname"}]
+        },
+        "suffix": {"$ref": "#/$defs/hostname"},
+        "ip": {"$ref": "#/$defs/ipAddress"},
+        "cidr": {"$ref": "#/$defs/cidr"},
+        "ports": {"$ref": "#/$defs/ports"},
+        "transports": {"$ref": "#/$defs/transports"},
+        "resolve": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"$ref": "#/$defs/ipAddress"}
+        }
+      },
+      "oneOf": [
+        {"required": ["name"]},
+        {"required": ["suffix"]},
+        {"required": ["ip"]},
+        {"required": ["cidr"]}
+      ],
+      "dependentSchemas": {
+        "resolve": {"required": ["name"], "not": {"properties": {"name": {"const": "*"}}}}
+      }
+    },
+    "addressException": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cidr"],
+      "properties": {
+        "cidr": {"$ref": "#/$defs/cidr"},
+        "ports": {"$ref": "#/$defs/ports"}
+      }
+    }
+  }
+}

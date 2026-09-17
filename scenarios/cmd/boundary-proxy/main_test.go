@@ -159,8 +159,8 @@ func TestBoundaryProxyCONNECTAndAuthorization(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("expected 403, got %d", resp.StatusCode)
 	}
-	if resp.Header.Get("Boundary-Reason") != "not-on-allowlist" {
-		t.Errorf("expected Boundary-Reason: not-on-allowlist, got %q", resp.Header.Get("Boundary-Reason"))
+	if got := resp.Header.Get("Proxy-Status"); !strings.Contains(got, "reason=not-on-allowlist") {
+		t.Errorf("expected Proxy-Status with reason=not-on-allowlist, got %q", got)
 	}
 
 	// 3. Test Allowed Host with Handshake -> 200 OK Tunnel

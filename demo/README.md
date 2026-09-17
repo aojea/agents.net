@@ -2,9 +2,9 @@
 
 Bootstrap a Zero-Network Sandbox from scratch, one command at a time.
 
-This tutorial walks through the [agents.net](../README.md) reference implementation end to end. By the end you will have run a real, unmodified agent harness inside a container with **`--network none`**, confined by a launcher injected at `docker run` time, and watched every flow it makes cross a single Unix socket as a named HTTP `CONNECT` tunnel -- [the spec's standard wire](../README.md#21-egress-boundary-interface-enforced) -- where it is checked against policy and audited on the host. A bonus section at the end swaps the boundary for other CONNECT-terminating implementations, including an unmodified Envoy.
+This tutorial walks through the [agents.net](../README.md) reference implementation ([sdk/](../sdk/README.md)) end to end. By the end you will have run a real, unmodified agent harness inside a container with **`--network none`**, confined by a launcher injected at `docker run` time, and watched every flow it makes cross a single Unix socket as a named HTTP `CONNECT` tunnel -- [the spec's egress wire](../spec/draft/wire.md) -- where it is checked against policy and audited on the host. A bonus section at the end swaps the boundary for other CONNECT-terminating implementations, including an unmodified Envoy.
 
-Read the [agents.net specification](../README.md) first for the *why* (the sandbox definition, the egress boundary interface, the TLS inspection models, the ingress interface, the security model, and the decision matrix). This doc is the *how*.
+Read the [agents.net specification](../spec/draft/index.md) first for the *why* (the sandbox definition, the egress boundary interface, the TLS inspection models, the ingress interface, the security model, and the decision matrix). This doc is the *how*.
 
 Everything here runs against a free, local model server ([Ollama](https://ollama.com)) by default, so you can work through the whole tutorial without a paid API key or a dependency on any single model provider. A final section shows how to point the exact same image at a real hosted provider instead, using the same credential-injection tier rather than a key baked into the image -- with no rebuild and no change to the run command.
 
@@ -33,7 +33,7 @@ flowchart LR
     proxy -- "ALLOW-LOCAL<br/>(symbolic host: ollama)" --> ollama
     proxy -- "ALLOW-PASSTHROUGH<br/>(registry.npmjs.org)" --> real1[("real internet<br/>no inspection")]
     proxy -- "ALLOW-INJECT, opt-in<br/>(api.openai.com)" --> real2[("real internet<br/>+ real Bearer token")]
-    proxy -- "403 + Boundary-Reason<br/>(everything else)" --> nowhere["refused + logged<br/>(agent sees ECONNREFUSED)"]
+    proxy -- "403 + Proxy-Status<br/>(everything else)" --> nowhere["refused + logged<br/>(agent sees ECONNREFUSED)"]
     ext["External Client (curl)"] -- "POST http://localhost:9000/webhook" --> proxy
 ```
 
@@ -83,7 +83,7 @@ The host boundary terminates TLS locally for its fake-response tier, so it needs
 
 This creates:
 
-- `demo/certs/agent-ca.pem` / `agent-ca.key` — the demo root CA. The [Dockerfile](Dockerfile) bakes `agent-ca.pem` into the sandbox image's system trust store at build time (the trust-store coordination from the spec's [TLS inspection models](../README.md#23-tls-inspection--verification-models)), so run this lab **before** Lab 5.
+- `demo/certs/agent-ca.pem` / `agent-ca.key` — the demo root CA. The [Dockerfile](Dockerfile) bakes `agent-ca.pem` into the sandbox image's system trust store at build time (the trust-store coordination from the spec's [TLS inspection models](../spec/draft/gateway.md#1-tls-inspection-and-verification-models)), so run this lab **before** Lab 5.
 - `demo/certs/agent-mitm.pem` / `agent-mitm.key` — a single leaf certificate with a `SAN` entry per host the boundary needs to terminate TLS for (`example.com` by default). The leaf never enters the image -- it lives host-side only, which is why adding TLS-inspected hosts later needs no rebuild.
 
 A single cert with multiple exact `SAN` entries is used instead of a wildcard: `*.example.com` matches one subdomain label and never the bare apex `example.com` itself. Since this is a private demo CA (not bound by public CA/Browser-Forum wildcard rules), listing exact hostnames is simpler and fully general -- pass extra hostnames as arguments to cover more, e.g. `./demo/gen_certs.sh api.openai.com` (needed later, only for the cloud-migration bonus).
@@ -98,16 +98,16 @@ Expected output includes `DNS:example.com`.
 
 ## Lab 3: Build the Launcher
 
-The launcher is this repo's [tun2connect](../tun2connect/) in its `run` mode: a dependency-free static binary that becomes PID 1, terminates the sandbox's TCP in userspace (gVisor), answers DNS with invented addresses, and opens one named HTTP `CONNECT` tunnel per flow on the boundary socket. Build it once:
+The launcher is this repo's [tun2connect](../sdk/) in its `run` mode: a dependency-free static binary that becomes PID 1, terminates the sandbox's TCP in userspace (gVisor), answers DNS with invented addresses, and opens one named HTTP `CONNECT` tunnel per flow on the boundary socket. Build it once:
 
 ```bash
-CGO_ENABLED=0 go -C tun2connect build -o "$PWD/demo/tun2connect" ./cmd/tun2connect
+CGO_ENABLED=0 go -C sdk build -o "$PWD/demo/tun2connect" ./cmd/tun2connect
 ```
 
 (No Go toolchain on the host? Build it hermetically in a container instead:)
 
 ```bash
-docker run --rm -v "$PWD":/src -w /src/tun2connect -e CGO_ENABLED=0 \
+docker run --rm -v "$PWD":/src -w /src/sdk -e CGO_ENABLED=0 \
   golang:1.26 go build -o /src/demo/tun2connect ./cmd/tun2connect
 ```
 
@@ -133,9 +133,9 @@ following tiers:
 | **Credential-inject**, opt-in | `api.openai.com` | TLS terminated locally, the agent's `Authorization` header (empty, placeholder, or garbage) is stripped and replaced with the real `Bearer <token>`, then genuinely relayed upstream with the real system trust store. Empty/unconfigured by default -- see the cloud-migration section at the end of this tutorial. | `AGENT_PROXY_TOKENS="host=ENV_VAR_NAME,..."` |
 
 Anything not on the four lists is refused with `403 Forbidden` and a
-`Boundary-Reason` header and logged. The guest sees a connection failure. This
+`Proxy-Status` field carrying the reason, and logged. The guest sees a connection failure. This
 demo policy denies IP literals; that is not a protocol or adapter restriction.
-The [Go boundary](../tun2connect/cmd/connect-proxy/main.go) accepts explicitly
+The [Go boundary](../sdk/cmd/connect-proxy/main.go) accepts explicitly
 authorized addresses and CIDRs through `-allow-ip`, and unlike this demo it
 also resolves allowed hostnames itself and refuses non-public results.
 
@@ -176,7 +176,7 @@ Every connection attempt fails immediately: no `eth0`, no route, no resolver. Th
 
 ## Lab 6: Run the Agent Behind the Injected Launcher
 
-Now run it for real. The launcher is injected at run time (the spec's recommended **entrypoint injection**): the binary is bind-mounted read-only, `--entrypoint` wraps the image's command, and three flags provide what the [egress boundary interface](../README.md#21-egress-boundary-interface-enforced) needs -- no network, a tun device, and the socket directory:
+Now run it for real. The launcher is injected at run time (the spec's recommended **entrypoint injection**): the binary is bind-mounted read-only, `--entrypoint` wraps the image's command, and three flags provide what the [egress boundary interface](../spec/draft/wire.md#1-egress-boundary-interface) needs -- no network, a tun device, and the socket directory:
 
 ```bash
 docker run --rm \
@@ -214,7 +214,7 @@ Reading it line by line:
 
 - **`ALLOW-LOCAL ollama:11434`** -- the harness's model call, relayed to the operator's Ollama. The name `ollama` arrived intact through virtual DNS; only the boundary knows the real address.
 - **`ALLOW-FAKE example.com:443`** -- the demo's task target, TLS terminated locally and answered with a canned response, never touching the real internet.
-- **`BLOCK secret-vault.example:443`** -- deny-by-default at work: refused with `403` and a `Boundary-Reason`, seen by the agent as a connection error, and recorded here. Each flow gets one decision and one log line.
+- **`BLOCK secret-vault.example:443`** -- deny-by-default at work: refused with `403` and a `Proxy-Status` reason, seen by the agent as a connection error, and recorded here. Each flow gets one decision and one log line.
 
 Because the launched command is just a normal non-interactive invocation, the same image can be reused with a different prompt by changing the trailing arguments, no rebuild required.
 
@@ -262,7 +262,7 @@ The startup banner now shows the host with a non-secret fingerprint (`sha256:...
 
 ## Implementation Examples
 
-The [specification](../README.md#21-egress-boundary-interface-enforced) uses HTTP
+The [specification](../spec/draft/wire.md) uses HTTP
 CONNECT between the guest adapter and the boundary. The following examples use
 different implementations of that interface. Each deployment still needs its
 own channel access controls, workload identity, and destination policy.
@@ -272,7 +272,7 @@ own channel access controls, workload identity, and destination policy.
 `connect-proxy` is the Go sibling of `host_proxy.py`: deny-by-default on names, addresses, and ports, one JSON audit record per decision. Because curl speaks CONNECT to HTTP proxies, you can watch the ACL work without a sandbox:
 
 ```bash
-go -C tun2connect build -o /tmp/connect-proxy ./cmd/connect-proxy
+go -C sdk build -o /tmp/connect-proxy ./cmd/connect-proxy
 /tmp/connect-proxy -listen tcp://127.0.0.1:18080 -allow example.com:443 -sandbox lab-a &
 
 curl --proxy http://127.0.0.1:18080 https://example.com -o /dev/null -w '%{http_code}\n'   # 200
@@ -294,7 +294,7 @@ The audit records mirror Lab 7's decisions, made on the same policy input -- the
 
 ### Lab B: Envoy CONNECT Example
 
-The [example configuration](../tun2connect/examples/envoy-boundary.yaml) enables
+The [example configuration](../sdk/examples/envoy-boundary.yaml) enables
 HTTP/1.1 and HTTP/2 TCP CONNECT in Envoy. It listens on loopback and has no
 workload authorization policy. This is a transport interoperability example,
 not a production boundary configuration.
@@ -302,7 +302,7 @@ not a production boundary configuration.
 ```bash
 docker run -d --name envoy-connect --network host \
   envoyproxy/envoy:v1.32-latest \
-  --config-yaml "$(cat tun2connect/examples/envoy-boundary.yaml)"
+  --config-yaml "$(cat sdk/examples/envoy-boundary.yaml)"
 
 # h1 CONNECT through Envoy (an https:// target makes curl use CONNECT):
 curl --proxy http://127.0.0.1:10000 https://example.com -o /dev/null -w '%{http_code}\n'   # 200
@@ -311,7 +311,7 @@ curl -s 127.0.0.1:19901/stats | grep downstream_cx_upgrades_total
 ```
 
 Port `10001` accepts HTTP/2 CONNECT with prior knowledge. The
-[interop test](../tun2connect/test_envoy.sh) exercises both listeners with the
+[interop test](../sdk/test_envoy.sh) exercises both listeners with the
 repository's clients. It does not test UDP, IPC transports, workload identity,
 or gateway controllers that configure Envoy.
 

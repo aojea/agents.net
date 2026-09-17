@@ -1,6 +1,6 @@
 # Boundary Networking Experiments
 
-These are component experiments supporting the [agents.net contract](../README.md),
+These are component experiments supporting the [agents.net specification](../spec/draft/index.md),
 not a complete comparison of production isolation architectures.
 The specification defines the target security and interoperability requirements
 and records the implementation gaps. Directory names are retained for compatibility;
@@ -86,17 +86,26 @@ experiments, not a hardened multi-user benchmark service. The scenario
 [boundary helper](cmd/boundary-proxy/main.go) allows every hostname by default,
 makes its socket world-connectable, and dials names without checking resolved
 addresses; it exists to measure the data path and is not the reference
-boundary described in the main specification. The historical
+boundary described in [sdk/README.md](../sdk/README.md). The historical
 route-flush and CID scripts are limited smoke tests, not security certification.
 
 ## Local Validation
 
 ```bash
-go test -race -count=1 ./tun2connect/... ./scenarios/...
+go test -race -count=1 ./sdk/... ./scenarios/...
 python3 -m unittest discover -s demo -p test_host_proxy.py
 python3 -m unittest discover -s scenarios/common -p 'test_*.py'
 ```
 
 These checks do not start VMs or run the privileged benchmark drivers. Live
 Envoy and Docker demonstration tests have separate prerequisite-dependent
-scripts described in the main specification.
+scripts described in [sdk/README.md](../sdk/README.md) and [demo/README.md](../demo/README.md).
+
+The [conformance suite](../conformance/README.md) runs its HTTP/1.1
+boundary fixtures against the reference boundary through a driver script and
+needs only Go, Python 3, and loopback networking:
+
+```bash
+python3 conformance/harness/run_boundary.py \
+    --driver conformance/harness/drivers/connect-proxy.sh --keep-going
+```

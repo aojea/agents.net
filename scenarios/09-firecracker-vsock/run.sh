@@ -61,7 +61,7 @@ if [ ! -f "${ROOTFS}" ] || [ "${REBUILD_ROOTFS:-0}" = 1 ]; then
     "${SCRIPT_DIR}/build-rootfs.sh" "${ROOTFS}"
 fi
 mkdir -p "${BIN_DIR}"
-go -C "${REPO_ROOT}/tun2connect" build -o "${BIN_DIR}/connect-proxy" ./cmd/connect-proxy
+go -C "${REPO_ROOT}/sdk" build -o "${BIN_DIR}/connect-proxy" ./cmd/connect-proxy
 go -C "${REPO_ROOT}/scenarios" build -o "${BIN_DIR}/target-server" ./cmd/target-server
 
 rm -rf "${RUN_DIR}"

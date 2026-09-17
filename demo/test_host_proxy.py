@@ -34,6 +34,8 @@ def read_response_head(sock: socket.socket):
     for line in lines[1:]:
         name, _, value = line.partition(":")
         headers[name.strip().lower()] = value.strip()
+    if "proxy-status" in headers:
+        headers["reason"] = host_proxy.proxy_status_reason(headers["proxy-status"])
     return status, headers
 
 
@@ -85,32 +87,33 @@ class BoundaryTestCase(unittest.TestCase):
         client = self.connect()
         status, headers = connect_request(client, "evil.example:443")
         self.assertEqual(status, 403)
-        self.assertEqual(headers.get("boundary-reason"), "not-on-allowlist")
+        self.assertEqual(headers.get("reason"), "not-on-allowlist")
+        self.assertIn("error=http_request_denied", headers.get("proxy-status", ""))
 
     def test_ipv4_literal_is_refused(self):
         client = self.connect()
         status, headers = connect_request(client, "1.2.3.4:443")
         self.assertEqual(status, 403)
-        self.assertEqual(headers.get("boundary-reason"), "ip-literal")
+        self.assertEqual(headers.get("reason"), "ip-literal")
 
     def test_ipv6_literal_is_refused(self):
         client = self.connect()
         status, headers = connect_request(client, "[2001:db8::1]:443")
         self.assertEqual(status, 403)
-        self.assertEqual(headers.get("boundary-reason"), "ip-literal")
+        self.assertEqual(headers.get("reason"), "ip-literal")
 
     def test_non_connect_method_is_refused_with_405(self):
         client = self.connect()
         client.sendall(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
         status, headers = read_response_head(client)
         self.assertEqual(status, 405)
-        self.assertEqual(headers.get("boundary-reason"), "connect-only")
+        self.assertEqual(headers.get("reason"), "connect-only")
 
     def test_missing_port_is_refused(self):
         client = self.connect()
         status, headers = connect_request(client, "example.com")
         self.assertEqual(status, 403)
-        self.assertEqual(headers.get("boundary-reason"), "malformed-target")
+        self.assertEqual(headers.get("reason"), "malformed-target")
 
     def test_host_names_are_case_insensitive(self):
         client = self.connect()
@@ -176,7 +179,7 @@ class BoundaryTestCase(unittest.TestCase):
         client = self.connect()
         status, headers = connect_request(client, "deadollama:11434")
         self.assertEqual(status, 502)
-        self.assertEqual(headers.get("boundary-reason"), "upstream-refused")
+        self.assertEqual(headers.get("reason"), "upstream-refused")
 
 
 class ConfigTestCase(unittest.TestCase):

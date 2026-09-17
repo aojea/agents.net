@@ -12,10 +12,11 @@ glance:
     destination in the authority (`CONNECT api.example.com:443`). A known
     DNS mapping preserves the name; otherwise the adapter sends an IP address.
 2. Policy is deny-by-default on that name. Anything not on the allow-list
-   is refused with `403 Forbidden` and a `Boundary-Reason` header, which
-   the guest stack turns into an ordinary ECONNREFUSED -- and the attempt
-    is logged. This demo's sample policy denies IP literals. The Go reference
-    boundary supports explicit address and CIDR allowlists.
+   is refused with `403 Forbidden` and a `Proxy-Status` field (RFC 9209)
+   carrying the reason, which the guest stack turns into an ordinary
+   ECONNREFUSED -- and the attempt is logged. This demo's sample policy
+   denies IP literals. The Go reference boundary supports explicit address
+   and CIDR allowlists.
 3. Every flow -- relayed, injected, answered, or refused -- is written to
    an audit log, the auditing/DLP hook called out in the spec's TLS
    inspection models.
@@ -240,14 +241,38 @@ def audit(decision: str, target: str, detail: str = "") -> None:
 # ---------------------------------------------------------------------------
 # HTTP CONNECT codec (RFC 9110 section 9.3.6). CONNECT only -- the
 # deliberate minimum: the only way out is a named TCP tunnel. Refusals are
-# `403 Forbidden` with a `Boundary-Reason` header, upstream failures `502`.
+# `403 Forbidden` with a `Proxy-Status` field (RFC 9209) naming the error
+# type and reason token, upstream failures `502`.
 # ---------------------------------------------------------------------------
+
+# RFC 9209 proxy error type for each reason token this boundary emits.
+PROXY_ERROR_TYPES = {
+    "not-on-allowlist": "http_request_denied",
+    "ip-literal": "destination_ip_prohibited",
+    "missing-mitm-cert": "proxy_configuration_error",
+    "upstream-refused": "connection_refused",
+    "upstream-unreachable": "destination_unavailable",
+}
+
+
+def proxy_status(reason: str) -> str:
+    error = PROXY_ERROR_TYPES.get(reason, "http_request_error")
+    return f"boundary; error={error}; reason={reason}"
+
+
+def proxy_status_reason(value: str) -> str:
+    """Return the reason parameter of the first Proxy-Status member."""
+    for param in value.split(",")[0].split(";")[1:]:
+        key, _, val = param.strip().partition("=")
+        if key == "reason":
+            return val.strip('"')
+    return ""
 
 
 def send_response(sock: socket.socket, status: str, reason: str = "") -> None:
     head = f"HTTP/1.1 {status}\r\n"
     if reason:
-        head += f"Boundary-Reason: {reason}\r\n"
+        head += f"Proxy-Status: {proxy_status(reason)}\r\n"
     head += "Content-Length: 0\r\n\r\n"
     try:
         sock.sendall(head.encode("latin1"))

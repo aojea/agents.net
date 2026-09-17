@@ -52,7 +52,7 @@ Failures always retain them. The script prints the artifact directory.
 Build the adapter:
 
 ```bash
-go -C tun2connect build -o /tmp/qemuproxy ./cmd/qemuproxy
+go -C sdk build -o /tmp/qemuproxy ./cmd/qemuproxy
 ```
 
 In a controller-prepared, restricted adapter environment, start it with:
