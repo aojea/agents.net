@@ -1,10 +1,12 @@
 package tun2connect
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/netip"
 	"sync"
 	"testing"
@@ -285,6 +287,48 @@ func TestEngineBoundaryRefusalBecomesConnectError(t *testing.T) {
 	defer cancel()
 	if _, err := gonet.DialContextTCP(ctx, n.guest, fullAddr(addr, 443), ipv4.ProtocolNumber); err == nil {
 		t.Fatal("a 403 from the boundary must surface as a failed connect")
+	}
+}
+
+func TestEngineCloseCancelsBoundaryHandshake(t *testing.T) {
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	boundary := fakeBoundary(func(req *http.Request, reader *bufio.Reader, conn net.Conn) {
+		close(started)
+		io.Copy(io.Discard, reader)
+		close(finished)
+	})
+	network := newTestNetWithDialer(t, boundary)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	dialDone := make(chan error, 1)
+	go func() {
+		conn, err := gonet.DialContextTCP(ctx, network.guest,
+			fullAddr(netip.MustParseAddr("203.0.113.10"), 443), ipv4.ProtocolNumber)
+		if conn != nil {
+			conn.Close()
+		}
+		dialDone <- err
+	}()
+	select {
+	case <-started:
+	case <-ctx.Done():
+		t.Fatal("CONNECT did not start")
+	}
+	closed := make(chan struct{})
+	go func() { network.eng.Close(); close(closed) }()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("engine did not cancel pending boundary handshake")
+	}
+	select {
+	case <-finished:
+	case <-ctx.Done():
+		t.Fatal("boundary connection survived engine close")
+	}
+	if err := <-dialDone; err == nil {
+		t.Fatal("guest connection succeeded during shutdown")
 	}
 }
 

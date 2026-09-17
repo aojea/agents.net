@@ -38,6 +38,8 @@ func (c *BoundaryClient) roundTrip(ctx context.Context, req *http.Request) (net.
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
 	if d, ok := ctx.Deadline(); ok {
 		conn.SetDeadline(d)
 	}
