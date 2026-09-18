@@ -136,7 +136,8 @@ Anything not on the four lists is refused with `403 Forbidden` and a
 `Proxy-Status` field carrying the reason, and logged. The guest sees a connection failure. This
 demo policy denies IP literals; that is not a protocol or adapter restriction.
 The [Go boundary](../sdk/cmd/connect-proxy/main.go) accepts explicitly
-authorized addresses and CIDRs through `-allow-ip`, and unlike this demo it
+authorized addresses and CIDRs through `ip` and `cidr` rules in its
+[policy descriptor](../spec/draft/policy.md), and unlike this demo it
 also resolves allowed hostnames itself and refuses non-public results.
 
 Start the boundary on the host. For the local-only demo in this tutorial, no credentials are needed at all:
@@ -269,28 +270,33 @@ own channel access controls, workload identity, and destination policy.
 
 ### Lab A: the reference boundary, no root required
 
-`connect-proxy` is the Go sibling of `host_proxy.py`: deny-by-default on names, addresses, and ports, one JSON audit record per decision. Because curl speaks CONNECT to HTTP proxies, you can watch the ACL work without a sandbox:
+`connect-proxy` is the Go sibling of `host_proxy.py`: deny-by-default on names, addresses, ports, and transports from a [policy descriptor](../spec/draft/policy.md), one JSON audit record per decision. Because curl speaks CONNECT to HTTP proxies, you can watch the policy work without a sandbox:
 
 ```bash
 go -C sdk build -o /tmp/connect-proxy ./cmd/connect-proxy
-/tmp/connect-proxy -listen tcp://127.0.0.1:18080 -allow example.com:443 -sandbox lab-a &
+cat > /tmp/lab-a.json <<'EOF'
+{"agents_net_policy": 1, "version": "lab-a-1", "sandbox": "lab-a", "default": "deny",
+ "rules": [{"id": "example", "name": "example.com", "ports": [443]}]}
+EOF
+/tmp/connect-proxy -listen tcp://127.0.0.1:18080 -policy /tmp/lab-a.json &
 
 curl --proxy http://127.0.0.1:18080 https://example.com -o /dev/null -w '%{http_code}\n'   # 200
 curl --proxy http://127.0.0.1:18080 https://evil.example                                    # CONNECT tunnel failed, response 403
 curl --proxy http://127.0.0.1:18080 http://example.com:8080/                                # 403: port-not-allowed
 ```
 
-The audit records mirror Lab 7's decisions, made on the same policy input -- the name and port in the CONNECT authority. The boundary resolves the allowed name itself, records the address it checked and dialed, and denies names that resolve to loopback, private, or link-local addresses unless `-allow-ip` lists them. Each record carries the listener-bound sandbox identity and policy version the controller passed on the command line, never anything the guest sent:
+The audit records mirror Lab 7's decisions, made on the same policy input -- the name and port in the CONNECT authority. The boundary resolves the allowed name itself, records the address it checked and dialed, and denies names that resolve to loopback, private, or link-local addresses unless the descriptor lists them in `resolved_addresses` or as literals. Each record carries the sandbox label and policy version from the descriptor the controller installed, never anything the guest sent:
 
 ```json
-{"ts":"2026-09-16T16:20:31Z","listener":"tcp://127.0.0.1:18080","sandbox":"lab-a","wire":"h1","transport":"tcp","destination":"example.com:443","address":"93.184.216.34:443","decision":"allow"}
-{"ts":"2026-09-16T16:20:33Z","listener":"tcp://127.0.0.1:18080","sandbox":"lab-a","wire":"h1","transport":"tcp","destination":"evil.example:443","decision":"block","reason":"not-on-allowlist"}
-{"ts":"2026-09-16T16:20:35Z","listener":"tcp://127.0.0.1:18080","sandbox":"lab-a","wire":"h1","transport":"tcp","destination":"example.com:8080","decision":"block","reason":"port-not-allowed"}
+{"ts":"2026-09-16T16:20:31Z","listener":"tcp://127.0.0.1:18080","sandbox":"lab-a","policy":"lab-a-1","wire":"h1","transport":"tcp","destination":"example.com:443","address":"93.184.216.34:443","rule":"example","decision":"allow"}
+{"ts":"2026-09-16T16:20:33Z","listener":"tcp://127.0.0.1:18080","sandbox":"lab-a","policy":"lab-a-1","wire":"h1","transport":"tcp","destination":"evil.example:443","decision":"block","reason":"not-on-allowlist"}
+{"ts":"2026-09-16T16:20:35Z","listener":"tcp://127.0.0.1:18080","sandbox":"lab-a","policy":"lab-a-1","wire":"h1","transport":"tcp","destination":"example.com:8080","decision":"block","reason":"port-not-allowed"}
 ```
 
-`-h2` enables HTTP/2 CONNECT streams; `-udp` enables UDP proxying using
-`connect-udp` (RFC 9298). `-max-connections`, `-max-streams`, and
-`-idle-timeout` bound the resources one sandbox can hold.
+`-h2` enables HTTP/2 CONNECT streams; `"features": {"udp": true}` in the
+descriptor enables UDP proxying using `connect-udp` (RFC 9298).
+`-max-connections`, `-max-streams`, and `-idle-timeout` bound the resources
+one sandbox can hold.
 
 ### Lab B: Envoy CONNECT Example
 

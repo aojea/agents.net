@@ -196,18 +196,15 @@ python3 conformance/harness/run_boundary.py \
 ```
 
 The [reference driver](harness/drivers/connect-proxy.sh) builds
-`connect-proxy` on first use (or uses `$CONNECT_PROXY`), translates the
-descriptor into `-allow`, `-allow-ip`, `-resolve`, `-sandbox`,
-`-policy-version`, `-udp`, `-max-connections`, and exits 3 for suffix rules,
-port ranges, and per-rule transports. Another implementation conforms to the
-same contract with its own driver; nothing else in the harness is specific
-to the reference.
+`connect-proxy` on first use (or uses `$CONNECT_PROXY`) and starts it with
+`-policy <descriptor>`; the hints `max_connections`, `max_streams`, `wire`,
+`generation`, and `tls` map to the corresponding flags. Another
+implementation conforms to the same contract with its own driver; nothing
+else in the harness is specific to the reference.
 
-Result at this revision of the reference: 48 pass, 4 fail, 7 not automated
-in the `boundary-core` group. The failures are the reference gaps listed in
-[docs/review-2026-09.md §5](../docs/review-2026-09.md#5-verified-defects-and-gaps-in-the-reference):
-no audit record for 405 refusals (B-CORE-24, 25, 28) and one address list
-for literals and resolution results (B-CORE-45).
+Result at this revision of the reference: every automated `boundary-core`
+case passes (52); the `dns` cases and B-CORE-49 are not automated by
+harness 0.1.
 
 ## 8. Reporting
 

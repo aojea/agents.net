@@ -48,11 +48,8 @@ func TestRequestHeadCorpus(t *testing.T) {
 	upstream, connections := echoListener(t)
 	port := strconv.Itoa(upstream.Addr().(*net.TCPAddr).Port)
 	target := "127.0.0.1:" + port
-	setPolicy(t, "", "127.0.0.1:"+port, "")
+	setPolicy(t, policyJSON(`{"ip":"127.0.0.1","ports":[`+port+`]}`, ""))
 	captureAudit(t)
-	previousUDP := enableUDP
-	t.Cleanup(func() { enableUDP = previousUDP })
-	enableUDP = false
 
 	const after = "after-head"
 	cases := []struct {
@@ -193,9 +190,11 @@ func FuzzAuthorize(f *testing.F) {
 	f.Fuzz(func(t *testing.T, host, port string) {
 		// Every name is allowed; the resolver returns a mix of public and
 		// non-public answers. No literal is listed.
-		allowed = map[string]*portSet{"*": {any: true}}
-		allowedIPs = nil
-		static = nil
+		p, err := loadDescriptor([]byte(policyJSON(`{"name":"*"}`, "")), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		current.Store(p)
 		lookupNetIP = func(ctx context.Context, network, host string) ([]netip.Addr, error) {
 			return []netip.Addr{
 				netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("10.0.0.1"),
@@ -224,45 +223,49 @@ func FuzzAuthorize(f *testing.F) {
 	})
 }
 
-func FuzzPolicyParsers(f *testing.F) {
+func FuzzDescriptor(f *testing.F) {
 	for _, seed := range []string{
-		"api.example:443, *:80, name", "192.0.2.1:443, [2001:db8::/64]:443, 10.0.0.0/8, ::ffff:203.0.113.0/120",
-		"a=1.2.3.4+::1, b.=5.6.7.8", "[", "]:", ":", "*", "1.2.3.4", "a:b:c", "[::1]", "[::1]:x", ",,,",
+		policyJSON(`{"name":"api.example","ports":[443]},{"name":"*","ports":["80"]},{"suffix":"apps.example"}`, ""),
+		policyJSON(`{"ip":"192.0.2.1","ports":[443]},{"cidr":"2001:db8::/64","ports":["443","8000-8099"],"transports":["tcp","udp"]}`, `,"features":{"udp":true}`),
+		policyJSON(`{"name":"a.example","resolve":["1.2.3.4","::1"]}`, `,"resolved_addresses":[{"cidr":"10.0.0.0/8","ports":[443]}]`),
+		`{"agents_net_policy":1,"version":"v","sandbox":"s","default":"deny","rules":[]}`,
+		"{", "[]", "", "null", policyJSON(`{"name":"192.0.2.1"}`, ""), policyJSON(`{"ports":[0]}`, ""),
 	} {
 		f.Add(seed)
 	}
-	f.Fuzz(func(t *testing.T, value string) {
-		rest, port, hasPort, err := splitPort(value)
-		if err == nil && hasPort && (port == 0) {
-			t.Fatalf("splitPort(%q) accepted port zero", value)
+	f.Fuzz(func(t *testing.T, data string) {
+		p, err := loadDescriptor([]byte(data), "")
+		if err != nil {
+			return
 		}
-		if err == nil && !hasPort && !strings.HasPrefix(value, "[") && rest != value {
-			t.Fatalf("splitPort(%q) changed a portless entry to %q", value, rest)
+		if p.version == "" || p.sandbox == "" {
+			t.Fatal("descriptor without version or sandbox accepted")
 		}
-		if names, err := parseAllow(value); err == nil {
-			for name, ports := range names {
-				if name != "*" && !validName(name) {
-					t.Fatalf("invalid name %q accepted", name)
-				}
-				if _, isIP := netip.ParseAddr(name); isIP == nil {
-					t.Fatalf("address %q accepted as a name", name)
-				}
-				if !ports.any && len(ports.ports) == 0 {
-					t.Fatalf("name %q permits no port", name)
-				}
+		for name, rules := range p.names {
+			if !validName(name) || len(rules) == 0 {
+				t.Fatalf("invalid name %q accepted", name)
+			}
+			if _, isIP := netip.ParseAddr(name); isIP == nil {
+				t.Fatalf("address %q accepted as a name", name)
 			}
 		}
-		if rules, err := parseIPAllowlist(value); err == nil {
-			for _, rule := range rules {
-				if !rule.prefix.IsValid() || rule.prefix.Addr().Is4In6() || rule.prefix.Addr().Zone() != "" {
-					t.Fatalf("invalid rule %+v", rule)
-				}
+		for _, s := range p.suffixes {
+			if !validName(s.suffix) {
+				t.Fatalf("invalid suffix %q accepted", s.suffix)
 			}
 		}
-		if mappings, err := parseStatic(value); err == nil {
-			for name, addresses := range mappings {
-				if !validName(name) || len(addresses) == 0 {
-					t.Fatalf("invalid mapping %q -> %v", name, addresses)
+		for _, r := range append(append([]*rule(nil), p.literals...), p.exceptions...) {
+			if !r.prefix.IsValid() || r.prefix.Addr().Is4In6() || r.prefix.Addr().Zone() != "" {
+				t.Fatalf("invalid prefix %v", r.prefix)
+			}
+		}
+		for _, r := range append(append(append([]*rule(nil), p.literals...), p.wildcard...), p.exceptions...) {
+			if !r.ports.any && len(r.ports.ranges) == 0 {
+				t.Fatal("rule permits no port")
+			}
+			for _, rg := range r.ports.ranges {
+				if rg[0] == 0 || rg[0] > rg[1] {
+					t.Fatalf("bad port range %v", rg)
 				}
 			}
 		}

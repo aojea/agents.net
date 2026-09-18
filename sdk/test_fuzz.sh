@@ -14,7 +14,7 @@ FUZZTIME="${FUZZTIME:-20s}"
 TARGETS=(
     ./cmd/connect-proxy:FuzzReadHead
     ./cmd/connect-proxy:FuzzAuthorize
-    ./cmd/connect-proxy:FuzzPolicyParsers
+    ./cmd/connect-proxy:FuzzDescriptor
     ./cmd/connect-proxy:FuzzMasqueTarget
     ./pkg/tun2connect:FuzzReadDatagram
     ./pkg/tun2connect:FuzzHandleQuery

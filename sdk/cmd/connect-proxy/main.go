@@ -1,10 +1,11 @@
-// Command connect-proxy is a minimal reference boundary: CONNECT for
-// TCP and connect-udp (RFC 9298) for UDP, applying deny-by-default
-// policy on destination names, IP addresses, and ports, with one JSON
-// audit record per decision.
+// Command connect-proxy is the reference boundary: CONNECT for TCP and
+// connect-udp (RFC 9298) for UDP, applying a deny-by-default policy
+// descriptor (spec/draft/policy.md) on destination names, addresses,
+// ports, and transports, with one JSON audit record per decision.
 // Hostnames are resolved by the boundary and only public or explicitly
 // listed resolved addresses are dialed, so an allowed name cannot reach
-// loopback, private, link-local, or metadata addresses.
+// loopback, private, link-local, or metadata addresses. Failures carry an
+// RFC 9209 Proxy-Status field with the reason token.
 // -h2 switches from HTTP/1.1 (one connection per flow) to a single
 // multiplexed cleartext HTTP/2 session (prior knowledge, HBONE-shaped):
 // TCP flows are CONNECT streams, UDP sessions extended CONNECT streams.
@@ -12,7 +13,7 @@
 // It pairs with cmd/tun2connect for the full demo, and is curl-testable
 // alone (curl uses CONNECT through an HTTP proxy):
 //
-//	connect-proxy -listen tcp://127.0.0.1:8080 -allow example.com:443
+//	connect-proxy -listen tcp://127.0.0.1:8080 -policy policy.json
 //	curl --proxy http://127.0.0.1:8080 https://example.com
 package main
 
@@ -33,7 +34,6 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -99,77 +99,21 @@ func boundaryTLSConfig(certPath, keyPath, clientCAPath string) (*tls.Config, err
 	return config, nil
 }
 
-// portSet is the set of ports a policy entry permits; any covers every port.
-type portSet struct {
-	any   bool
-	ports map[uint16]bool
-}
-
-func (p *portSet) permits(port uint16) bool { return p.any || p.ports[port] }
-
-func (p *portSet) add(port uint16, hasPort bool) {
-	if !hasPort {
-		p.any = true
-		return
-	}
-	if p.ports == nil {
-		p.ports = map[uint16]bool{}
-	}
-	p.ports[port] = true
-}
-
-type ipRule struct {
-	prefix netip.Prefix
-	ports  portSet
-}
-
-var (
-	// allowed maps a lowercase hostname, or "*" for every name, to its ports.
-	allowed    = map[string]*portSet{}
-	allowedIPs []ipRule
-	enableUDP  bool
-	// static maps a hostname to fixed addresses used instead of DNS.
-	static = map[string][]netip.Addr{}
-	// lookupNetIP resolves permitted hostnames; tests substitute it.
-	lookupNetIP = net.DefaultResolver.LookupNetIP
-)
-
-// nonPublic lists special-purpose ranges that netip's classifiers do not
-// cover. Together with loopback, private, link-local, multicast, and
-// unspecified addresses they are denied for resolved hostnames unless
-// -allow-ip names them.
-var nonPublic = []netip.Prefix{
-	netip.MustParsePrefix("0.0.0.0/8"),
-	netip.MustParsePrefix("100.64.0.0/10"),
-	netip.MustParsePrefix("192.0.0.0/24"),
-	netip.MustParsePrefix("192.0.2.0/24"),
-	netip.MustParsePrefix("198.18.0.0/15"),
-	netip.MustParsePrefix("198.51.100.0/24"),
-	netip.MustParsePrefix("203.0.113.0/24"),
-	netip.MustParsePrefix("240.0.0.0/4"),
-	netip.MustParsePrefix("64:ff9b::/96"),
-	netip.MustParsePrefix("64:ff9b:1::/48"),
-	netip.MustParsePrefix("100::/64"),
-	netip.MustParsePrefix("2001::/23"),
-	netip.MustParsePrefix("2001:db8::/32"),
-	netip.MustParsePrefix("2002::/16"),
-	netip.MustParsePrefix("3fff::/20"),
-	netip.MustParsePrefix("5f00::/16"),
-	netip.MustParsePrefix("fec0::/10"),
-}
-
-// auditRecord is one JSON line per decision. Guest-supplied fields are
-// JSON-encoded, so they cannot inject line breaks or additional fields.
+// auditRecord is one JSON line per decision (spec/draft/audit.md).
+// Guest-supplied fields are JSON-encoded, so they cannot inject line
+// breaks or additional fields.
 type auditRecord struct {
 	Time        string `json:"ts"`
 	Listener    string `json:"listener,omitempty"`
 	Sandbox     string `json:"sandbox,omitempty"`
+	Generation  string `json:"generation,omitempty"`
 	Policy      string `json:"policy,omitempty"`
 	Wire        string `json:"wire,omitempty"`
 	Transport   string `json:"transport,omitempty"`
 	Destination string `json:"destination,omitempty"`
 	Address     string `json:"address,omitempty"`
 	Peer        string `json:"peer,omitempty"`
+	Rule        string `json:"rule,omitempty"`
 	Decision    string `json:"decision"`
 	Reason      string `json:"reason,omitempty"`
 }
@@ -177,16 +121,17 @@ type auditRecord struct {
 var (
 	auditMu  sync.Mutex
 	auditOut io.Writer = os.Stdout
-	// Listener-bound identity: the controller assigns one sandbox and
-	// policy to this listener, so every record carries them.
-	listenerName  string
-	sandboxID     string
-	policyVersion string
+	// listenerName labels records with the listener the controller bound
+	// this process to; identity and policy version come from the policy.
+	listenerName string
 )
 
 func audit(r auditRecord) {
 	r.Time = time.Now().UTC().Format(time.RFC3339Nano)
-	r.Listener, r.Sandbox, r.Policy = listenerName, sandboxID, policyVersion
+	r.Listener = listenerName
+	if p := current.Load(); p != nil {
+		r.Sandbox, r.Policy, r.Generation = p.sandbox, p.version, p.generation
+	}
 	line, err := json.Marshal(r)
 	if err != nil {
 		return
@@ -194,267 +139,6 @@ func audit(r auditRecord) {
 	auditMu.Lock()
 	defer auditMu.Unlock()
 	auditOut.Write(append(line, '\n'))
-}
-
-// listedAddress reports whether -allow-ip permits address on port, and
-// whether any -allow-ip prefix covers the address at all.
-func listedAddress(address netip.Addr, port uint16) (permitted, known bool) {
-	for _, rule := range allowedIPs {
-		if !rule.prefix.Contains(address) {
-			continue
-		}
-		known = true
-		if rule.ports.permits(port) {
-			return true, true
-		}
-	}
-	return false, known
-}
-
-// namePermitted reports whether -allow permits host on port, and whether
-// the host (or the wildcard) appears in -allow at all.
-func namePermitted(host string, port uint16) (permitted, known bool) {
-	for _, key := range []string{host, "*"} {
-		if ports, ok := allowed[key]; ok {
-			known = true
-			if ports.permits(port) {
-				return true, true
-			}
-		}
-	}
-	return false, known
-}
-
-func publicAddress(address netip.Addr) bool {
-	if !address.IsGlobalUnicast() || address.IsPrivate() {
-		return false
-	}
-	for _, prefix := range nonPublic {
-		if prefix.Contains(address) {
-			return false
-		}
-	}
-	return true
-}
-
-// authorize applies destination policy and returns the exact addresses the
-// boundary may dial. Literals must be listed in -allow-ip. Hostnames must
-// pass -allow and are resolved here; only public or explicitly listed
-// resolved addresses are kept, so an allowed name cannot reach loopback,
-// private, or metadata addresses by rebinding. Port restrictions on an
-// entry apply to the port requested. A non-empty reason is a policy
-// denial; a non-nil error is a resolution failure.
-func authorize(ctx context.Context, host, port string) (addresses []netip.Addr, reason string, err error) {
-	number, err := parsePort(port)
-	if err != nil {
-		return nil, "malformed-port", nil
-	}
-	host = strings.ToLower(host)
-	if address, err := netip.ParseAddr(host); err == nil {
-		if address.Zone() != "" {
-			return nil, "scoped-ip", nil
-		}
-		address = address.Unmap()
-		switch permitted, known := listedAddress(address, number); {
-		case permitted:
-			return []netip.Addr{address}, "", nil
-		case known:
-			return nil, "port-not-allowed", nil
-		default:
-			return nil, "ip-not-on-allowlist", nil
-		}
-	}
-	host = strings.TrimSuffix(host, ".")
-	switch permitted, known := namePermitted(host, number); {
-	case permitted:
-	case known:
-		return nil, "port-not-allowed", nil
-	default:
-		return nil, "not-on-allowlist", nil
-	}
-	resolved, mapped := static[host]
-	if !mapped {
-		if resolved, err = lookupNetIP(ctx, "ip", host); err != nil {
-			return nil, "", err
-		}
-	}
-	for _, address := range resolved {
-		address = address.Unmap()
-		if address.Zone() != "" {
-			continue
-		}
-		if permitted, _ := listedAddress(address, number); permitted || publicAddress(address) {
-			addresses = append(addresses, address)
-		}
-	}
-	if len(addresses) == 0 {
-		return nil, "resolved-address-denied", nil
-	}
-	return addresses, "", nil
-}
-
-// dialAuthorized connects to the first reachable checked address without
-// resolving the hostname again.
-func dialAuthorized(network string, addresses []netip.Addr, port string) (net.Conn, error) {
-	var err error
-	for _, address := range addresses {
-		var upstream net.Conn
-		upstream, err = net.DialTimeout(network, net.JoinHostPort(address.String(), port), dialTimeout)
-		if err == nil {
-			return upstream, nil
-		}
-	}
-	return nil, err
-}
-
-func parsePort(value string) (uint16, error) {
-	number, err := strconv.ParseUint(value, 10, 16)
-	if err != nil || number == 0 {
-		return 0, fmt.Errorf("invalid port %q", value)
-	}
-	return uint16(number), nil
-}
-
-// splitPort separates an optional ":port" suffix from a policy entry.
-// IPv6 addresses and prefixes carry a port only in bracket form,
-// "[2001:db8::/64]:443"; a bare entry with several colons has no port.
-func splitPort(entry string) (rest string, port uint16, hasPort bool, err error) {
-	if strings.HasPrefix(entry, "[") {
-		end := strings.IndexByte(entry, ']')
-		if end < 0 {
-			return "", 0, false, fmt.Errorf("unbalanced bracket in %q", entry)
-		}
-		rest, tail := entry[1:end], entry[end+1:]
-		if tail == "" {
-			return rest, 0, false, nil
-		}
-		if !strings.HasPrefix(tail, ":") {
-			return "", 0, false, fmt.Errorf("unexpected %q after bracket in %q", tail, entry)
-		}
-		port, err := parsePort(tail[1:])
-		return rest, port, err == nil, err
-	}
-	if strings.Count(entry, ":") != 1 {
-		return entry, 0, false, nil
-	}
-	rest, rawPort, _ := strings.Cut(entry, ":")
-	port, err = parsePort(rawPort)
-	return rest, port, err == nil, err
-}
-
-// validName accepts a normalized (lowercase, no trailing dot) hostname
-// policy entry: dot-separated non-empty labels of letters, digits,
-// hyphens, and underscores, within DNS length limits.
-func validName(name string) bool {
-	if name == "" || len(name) > 253 {
-		return false
-	}
-	for _, label := range strings.Split(name, ".") {
-		if label == "" || len(label) > 63 {
-			return false
-		}
-		for _, c := range label {
-			if !(c >= 'a' && c <= 'z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
-				return false
-			}
-		}
-	}
-	return true
-}
-
-// parseAllow reads "name[:port]" entries; "*" matches every name. An
-// entry without a port permits every port on that name.
-func parseAllow(value string) (map[string]*portSet, error) {
-	names := map[string]*portSet{}
-	for _, entry := range strings.Split(value, ",") {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		name, port, hasPort, err := splitPort(entry)
-		if err != nil {
-			return nil, fmt.Errorf("invalid -allow entry %q: %w", entry, err)
-		}
-		name = strings.TrimSuffix(strings.ToLower(name), ".")
-		if _, err := netip.ParseAddr(name); err == nil {
-			return nil, fmt.Errorf("invalid -allow entry %q: addresses belong in -allow-ip", entry)
-		}
-		if name != "*" && !validName(name) {
-			return nil, fmt.Errorf("invalid -allow entry %q: not a hostname", entry)
-		}
-		set := names[name]
-		if set == nil {
-			set = &portSet{}
-			names[name] = set
-		}
-		set.add(port, hasPort)
-	}
-	return names, nil
-}
-
-// parseIPAllowlist reads "ip[:port]", "cidr[:port]", "[ip6]:port", and
-// "[cidr6]:port" entries.
-func parseIPAllowlist(value string) ([]ipRule, error) {
-	var rules []ipRule
-	for _, entry := range strings.Split(value, ",") {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		rest, port, hasPort, err := splitPort(entry)
-		if err != nil {
-			return nil, fmt.Errorf("invalid -allow-ip entry %q: %w", entry, err)
-		}
-		var rule ipRule
-		rule.ports.add(port, hasPort)
-		if address, err := netip.ParseAddr(rest); err == nil && address.Zone() == "" {
-			address = address.Unmap()
-			rule.prefix = netip.PrefixFrom(address, address.BitLen())
-			rules = append(rules, rule)
-			continue
-		}
-		prefix, err := netip.ParsePrefix(rest)
-		if err != nil {
-			return nil, fmt.Errorf("invalid -allow-ip entry %q: %w", entry, err)
-		}
-		if prefix.Addr().Is4In6() {
-			if prefix.Bits() < 96 {
-				return nil, fmt.Errorf("invalid IPv4-mapped prefix %q", entry)
-			}
-			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96)
-		}
-		rule.prefix = prefix.Masked()
-		rules = append(rules, rule)
-	}
-	return rules, nil
-}
-
-// parseStatic reads "name=ip[+ip...]" entries. Mapped addresses are still
-// subject to address policy: a non-public mapping needs -allow-ip.
-func parseStatic(value string) (map[string][]netip.Addr, error) {
-	mappings := map[string][]netip.Addr{}
-	for _, entry := range strings.Split(value, ",") {
-		entry = strings.TrimSpace(entry)
-		if entry == "" {
-			continue
-		}
-		name, rawAddresses, found := strings.Cut(entry, "=")
-		name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
-		if !found || !validName(name) {
-			return nil, fmt.Errorf("invalid -resolve entry %q (want name=ip)", entry)
-		}
-		if _, err := netip.ParseAddr(name); err == nil {
-			return nil, fmt.Errorf("invalid -resolve entry %q: name is an address", entry)
-		}
-		for _, raw := range strings.Split(rawAddresses, "+") {
-			address, err := netip.ParseAddr(strings.TrimSpace(raw))
-			if err != nil || address.Zone() != "" {
-				return nil, fmt.Errorf("invalid -resolve address %q in %q", raw, entry)
-			}
-			mappings[name] = append(mappings[name], address.Unmap())
-		}
-	}
-	return mappings, nil
 }
 
 // responder writes a non-tunnel response on either wire.
@@ -509,40 +193,71 @@ func (r h2Responder) deny(status int, reason string) {
 // writes the refusal itself and returns nil when no tunnel may be opened.
 func connectUpstream(ctx context.Context, r responder, wire, network, host, port, peer string) net.Conn {
 	rec := auditRecord{Wire: wire, Transport: network, Destination: net.JoinHostPort(host, port), Peer: peer}
+	p := current.Load()
+	if p == nil {
+		rec.Decision, rec.Reason = "fail", "policy-unavailable"
+		audit(rec)
+		r.deny(http.StatusServiceUnavailable, "policy-unavailable")
+		return nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
 	defer cancel()
-	addresses, reason, err := authorize(ctx, host, port)
-	if reason == "" && err == nil && network == "udp" && !enableUDP {
-		reason = "udp-disabled"
-	}
-	switch {
-	case reason != "":
-		rec.Decision, rec.Reason = "block", reason
+	// features.udp false refuses every connect-udp request before rules.
+	if network == "udp" && !p.udp {
+		rec.Decision, rec.Reason = "block", "udp-disabled"
 		audit(rec)
-		r.deny(http.StatusForbidden, reason)
+		r.deny(http.StatusForbidden, "udp-disabled")
 		return nil
-	case err != nil:
+	}
+	v := p.authorize(ctx, host, port, network)
+	rec.Destination = v.destination
+	switch {
+	case v.reason != "":
+		rec.Decision, rec.Reason = "block", v.reason
+		audit(rec)
+		r.deny(v.status, v.reason)
+		return nil
+	case v.err != nil:
 		rec.Decision, rec.Reason = "fail", "resolve-failed"
 		audit(rec)
 		r.deny(http.StatusBadGateway, "resolve-failed")
 		return nil
 	}
-	upstream, err := dialAuthorized(network, addresses, port)
+	upstream, err := dialAuthorized(network, v.addresses, port)
 	if err != nil {
 		rec.Decision, rec.Reason = "fail", "dial-failed"
 		audit(rec)
 		r.deny(http.StatusBadGateway, "dial-failed")
 		return nil
 	}
-	rec.Decision, rec.Address = "allow", upstream.RemoteAddr().String()
+	rec.Decision, rec.Address, rec.Rule = "allow", upstream.RemoteAddr().String(), v.rule
 	audit(rec)
 	return upstream
 }
 
+// dialAuthorized connects to the first reachable checked address without
+// resolving the hostname again.
+func dialAuthorized(network string, addresses []netip.Addr, port string) (net.Conn, error) {
+	var err error
+	for _, address := range addresses {
+		var upstream net.Conn
+		upstream, err = net.DialTimeout(network, net.JoinHostPort(address.String(), port), dialTimeout)
+		if err == nil {
+			return upstream, nil
+		}
+	}
+	return nil, err
+}
+
 // malformed records and refuses a request that never reached policy.
 func malformed(r responder, wire, network, destination, peer, reason string) {
+	refuse(r, wire, network, destination, peer, http.StatusBadRequest, reason)
+}
+
+// refuse records a block decision and writes the refusal.
+func refuse(r responder, wire, network, destination, peer string, status int, reason string) {
 	audit(auditRecord{Wire: wire, Transport: network, Destination: destination, Peer: peer, Decision: "block", Reason: reason})
-	r.deny(http.StatusBadRequest, reason)
+	r.deny(status, reason)
 }
 
 type closeWriter interface{ CloseWrite() error }
@@ -858,7 +573,7 @@ func serve(conn net.Conn) {
 	case h.method == http.MethodGet && isUpgrade(h):
 		handleConnectUDP(conn, br, h, peer)
 	default:
-		h1Responder{conn}.deny(http.StatusMethodNotAllowed, "connect-only")
+		refuse(h1Responder{conn}, "h1", "", "", peer, http.StatusMethodNotAllowed, "connect-only")
 	}
 }
 
@@ -916,7 +631,7 @@ func sessionPeer(conn net.Conn) (string, error) {
 func serveH2(peer string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect {
-			h2Responder{w}.deny(http.StatusMethodNotAllowed, "connect-only")
+			refuse(h2Responder{w}, "h2", "", "", peer, http.StatusMethodNotAllowed, "connect-only")
 			return
 		}
 		f, _ := w.(http.Flusher)
@@ -1013,39 +728,29 @@ func serveListener(ln net.Listener, useH2 bool, maxConnections, maxStreams int) 
 
 func main() {
 	listen := flag.String("listen", "unix:///tmp/boundary.sock", "listen address (unix:///path or tcp://host:port)")
-	allow := flag.String("allow", "", "comma-separated destination names to allow, each optionally :port; '*' or '*:port' allows all names (default: deny everything). Resolved addresses must be public unless listed in -allow-ip")
-	allowIP := flag.String("allow-ip", "", "comma-separated IP addresses or CIDRs, each optionally :port ([v6]:port), to allow for literal destinations and for non-public resolved addresses (default: deny)")
-	resolve := flag.String("resolve", "", "comma-separated name=ip[+ip] static mappings used instead of DNS for those names; addresses still need -allow-ip unless public")
-	sandbox := flag.String("sandbox", "", "controller-assigned identity of the sandbox this listener serves, recorded in every audit record")
-	policy := flag.String("policy-version", "", "opaque policy version recorded in every audit record")
+	policyPath := flag.String("policy", "", "policy descriptor file (spec/draft/policy.md) bound to this listener; required")
+	generation := flag.String("generation", "", "controller-assigned sandbox generation recorded in every audit record")
 	maxConnections := flag.Int("max-connections", 1024, "maximum concurrently accepted client connections or HTTP/2 sessions; further connections receive 503")
 	maxStreams := flag.Int("max-streams", 256, "maximum concurrent streams per HTTP/2 session")
 	idle := flag.Duration("idle-timeout", time.Hour, "close tunnels that carry no data in either direction for this long; 0 disables")
-	udp := flag.Bool("udp", false, "serve connect-udp tunnels")
 	h2 := flag.Bool("h2", false, "speak multiplexed cleartext HTTP/2 (prior knowledge) instead of HTTP/1.1")
 	tlsCert := flag.String("tls-cert", "", "PEM server certificate; enables TLS (with -h2: the HBONE-style mTLS+h2 arrangement)")
 	tlsKey := flag.String("tls-key", "", "PEM server key")
 	clientCA := flag.String("tls-client-ca", "", "PEM CA bundle; when set, REQUIRE verified client certificates and audit their identity")
 	flag.Parse()
-	enableUDP = *udp
 	idleTimeout.Store(*idle)
-	listenerName, sandboxID, policyVersion = *listen, *sandbox, *policy
+	listenerName = *listen
 	if *maxConnections <= 0 || *maxStreams <= 0 {
 		log.Fatal("-max-connections and -max-streams must be positive")
 	}
-	var err error
-	allowed, err = parseAllow(*allow)
+	if *policyPath == "" {
+		log.Fatal("-policy is required: a boundary without a policy descriptor answers every request with policy-unavailable")
+	}
+	p, err := loadPolicyFile(*policyPath, *generation)
 	if err != nil {
 		log.Fatal(err)
 	}
-	allowedIPs, err = parseIPAllowlist(*allowIP)
-	if err != nil {
-		log.Fatal(err)
-	}
-	static, err = parseStatic(*resolve)
-	if err != nil {
-		log.Fatal(err)
-	}
+	current.Store(p)
 	tlsConfig, err := boundaryTLSConfig(*tlsCert, *tlsKey, *clientCA)
 	if err != nil {
 		log.Fatal(err)
@@ -1086,7 +791,7 @@ func main() {
 	if tlsConfig != nil {
 		ln = tls.NewListener(ln, tlsConfig)
 	}
-	log.Printf("boundary listening on %s (sandbox=%q policy=%q allow=%q allow-ip=%q resolve=%q udp=%v h2=%v tls=%v mtls=%v max-connections=%d max-streams=%d idle-timeout=%s)",
-		*listen, *sandbox, *policy, *allow, *allowIP, *resolve, *udp, *h2, *tlsCert != "", *clientCA != "", *maxConnections, *maxStreams, *idle)
+	log.Printf("boundary listening on %s (policy=%s sandbox=%q version=%q generation=%q udp=%v h2=%v tls=%v mtls=%v max-connections=%d max-streams=%d idle-timeout=%s)",
+		*listen, *policyPath, p.sandbox, p.version, p.generation, p.udp, *h2, *tlsCert != "", *clientCA != "", *maxConnections, *maxStreams, *idle)
 	log.Fatal(serveListener(ln, *h2, *maxConnections, *maxStreams))
 }

@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 # agents.net conformance driver for the reference boundary
-# (sdk/cmd/connect-proxy). Translates a policy descriptor into
-# command-line flags; exits 3 when the descriptor uses features the flags
-# cannot express (suffix rules, port ranges, per-rule transports).
+# (sdk/cmd/connect-proxy). The boundary loads the policy descriptor
+# directly; hints map to listener flags.
 #
 #   connect-proxy.sh start <policy.json> <listen-url> <audit-path> <hints.json>
 #   connect-proxy.sh stop
@@ -13,71 +12,23 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo="$(cd "$here/../../.." && pwd)"
 bin="${CONNECT_PROXY:-$state/connect-proxy}"
 
-translate() {
-	python3 - "$1" "$2" <<'PY'
+hint_flags() {
+	python3 - "$1" <<'PY'
 import json, sys
-
-policy = json.load(open(sys.argv[1]))
-hints = json.load(open(sys.argv[2])) if sys.argv[2] else {}
-
-def unsupported(msg):
-    sys.stderr.write("unsupported descriptor: " + msg + "\n")
-    sys.exit(3)
-
-def ports_of(rule):
-    ports = rule.get("ports")
-    if ports is None:
-        return [None]
-    out = []
-    for p in ports:
-        if isinstance(p, str) and "-" in p:
-            unsupported("port range " + p)
-        out.append(int(p))
-    return out
-
-def with_port(host, port):
-    if ":" in host and not host.startswith("["):
-        host = "[" + host + "]"
-    return host if port is None else "%s:%d" % (host, port)
-
-udp = bool(policy.get("features", {}).get("udp"))
-allow, allow_ip, resolve = [], [], []
-for rule in policy.get("rules", []):
-    transports = rule.get("transports", ["tcp"])
-    if udp and sorted(transports) != ["tcp", "udp"]:
-        unsupported("per-rule transport restriction with UDP enabled")
-    if "suffix" in rule:
-        unsupported("suffix rule " + rule["suffix"])
-    for port in ports_of(rule):
-        if "name" in rule:
-            allow.append(with_port(rule["name"], port))
-            for addr in rule.get("resolve", []):
-                allow_ip.append(with_port(addr, port))
-        elif "ip" in rule:
-            allow_ip.append(with_port(rule["ip"], port))
-        elif "cidr" in rule:
-            allow_ip.append(with_port(rule["cidr"], port))
-    if rule.get("resolve"):
-        resolve.append(rule["name"] + "=" + "+".join(rule["resolve"]))
-for exc in policy.get("resolved_addresses", []):
-    for port in ports_of(exc):
-        allow_ip.append(with_port(exc["cidr"], port))
-
-args = ["-sandbox", policy.get("sandbox", ""), "-policy-version", policy["version"]]
-if allow:
-    args += ["-allow", ",".join(allow)]
-if allow_ip:
-    args += ["-allow-ip", ",".join(allow_ip)]
-if resolve:
-    args += ["-resolve", ",".join(resolve)]
-if udp:
-    args.append("-udp")
+hints = json.load(open(sys.argv[1])) if sys.argv[1] else {}
+args = []
 if hints.get("wire") == "h2":
     args.append("-h2")
 if "max_connections" in hints:
     args += ["-max-connections", str(hints["max_connections"])]
 if "max_streams" in hints:
     args += ["-max-streams", str(hints["max_streams"])]
+if "generation" in hints:
+    args += ["-generation", str(hints["generation"])]
+tls = hints.get("tls") or {}
+for key, flag in (("cert", "-tls-cert"), ("key", "-tls-key"), ("client_ca", "-tls-client-ca")):
+    if key in tls:
+        args += [flag, tls[key]]
 sys.stdout.write("".join(a + "\0" for a in args))
 PY
 }
@@ -89,11 +40,8 @@ start)
 		go -C "$repo/sdk" build -o "$bin" ./cmd/connect-proxy
 	fi
 	args=()
-	if ! translate "$policy" "$hints" >"$state/flags"; then
-		exit 3
-	fi
-	while IFS= read -r -d '' arg; do args+=("$arg"); done <"$state/flags"
-	"$bin" -listen "$listen" "${args[@]}" >"$audit" 2>"$state/connect-proxy.log" &
+	while IFS= read -r -d '' arg; do args+=("$arg"); done < <(hint_flags "$hints")
+	"$bin" -listen "$listen" -policy "$policy" "${args[@]}" >"$audit" 2>"$state/connect-proxy.log" &
 	echo $! >"$state/pid"
 	host_port=${listen#tcp://}
 	host=${host_port%:*} port=${host_port##*:}
@@ -102,6 +50,7 @@ start)
 			exit 0
 		fi
 		if ! kill -0 "$(cat "$state/pid")" 2>/dev/null; then
+			# A rejected descriptor is a conformance failure, not an unsupported feature.
 			cat "$state/connect-proxy.log" >&2
 			exit 1
 		fi

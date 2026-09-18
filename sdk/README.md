@@ -190,39 +190,51 @@ A modular Go implementation (`github.com/aojea/agents.net/sdk`) of the HTTP CONN
 - [sdk/pkg/tun2connect/forwarder.go](../sdk/pkg/tun2connect/forwarder.go) - Shared DNS-aware dialing and TCP/UDP socket relays.
 - [sdk/pkg/netnsproxy/proxy_linux.go](../sdk/pkg/netnsproxy/proxy_linux.go) - Kernel socket adapter and namespace-local nftables setup.
 - [sdk/cmd/netnsproxy/main_linux.go](../sdk/cmd/netnsproxy/main_linux.go) - Namespace proxy command using a Unix boundary socket.
-- [sdk/cmd/connect-proxy/main.go](../sdk/cmd/connect-proxy/main.go) — Reference host boundary proxy with name, address, and port allowlisting, boundary-side resolution, HTTP/1.1 and multiplexed HTTP/2 support, UDP capsule tunneling, mTLS client certificate verification, connection and idle budgets, and JSON audit records.
+- [sdk/cmd/connect-proxy/main.go](../sdk/cmd/connect-proxy/main.go) — Reference boundary: loads a [policy descriptor](../spec/draft/policy.md), resolves names itself and dials only checked addresses, speaks HTTP/1.1 and multiplexed HTTP/2, tunnels UDP capsules, verifies mTLS client certificates, enforces connection and idle budgets, signals failures with `Proxy-Status`, and writes one JSON audit record per decision ([policy.go](../sdk/cmd/connect-proxy/policy.go) holds the descriptor loader and authorization).
 - [sdk/cmd/tun2connect/main.go](../sdk/cmd/tun2connect/main.go) — The in-guest side, in two modes: a standalone daemon, or (`run`) the injectable launcher that becomes PID 1, builds the TUN, and supervises the agent.
 
-The Go boundary uses `-allow` for hostnames and `-allow-ip` for literal addresses
-or CIDRs. Both lists are empty by default. Any entry may carry `:port`
-(`api.example.com:443`, `203.0.113.10:443`, `[2001:db8::/64]:443`, `*:443`);
-an entry without a port permits every port on that destination. `-allow '*'`
-permits all hostnames but does not grant literal-IP access. `-resolve
-name=ip[+ip]` substitutes fixed addresses for DNS on the named hosts; the
-addresses are still subject to the address policy below, so a private mapping
-also needs `-allow-ip`. `-sandbox` and `-policy-version` label every audit
-record with the identity and policy the controller bound to this listener.
-For example:
+The boundary takes its policy from one file, `-policy descriptor.json`, in
+the [descriptor format](../spec/draft/policy.md): allow rules on exact
+names, name suffixes, the `*` wildcard, literal addresses, and prefixes, each
+with optional ports (integers or `"a-b"` ranges), transports, and, for names,
+a static `resolve` list used instead of DNS. `sandbox` and `version` in the
+descriptor label every audit record; `-generation` adds the controller's
+generation label. `features.udp` enables connect-udp. There are no
+policy flags. For example:
 
 ```bash
+cat > /run/agents.net/sandbox-a/policy.json <<'EOF'
+{"agents_net_policy": 1, "version": "2026-09-17/1", "sandbox": "sandbox-a", "default": "deny",
+ "rules": [
+   {"id": "api", "name": "api.example.com", "ports": [443]},
+   {"id": "pkgs", "suffix": "pkg.github.com", "ports": [443]},
+   {"id": "db", "ip": "203.0.113.10", "ports": [5432]},
+   {"id": "v6", "cidr": "2001:db8::/64", "ports": [443], "transports": ["tcp", "udp"]}
+ ],
+ "features": {"udp": true}}
+EOF
 go -C sdk run ./cmd/connect-proxy \
-    -listen unix:///run/agents.net/sandbox-a/boundary.sock -sandbox sandbox-a \
-    -allow api.example.com:443 \
-    -allow-ip '203.0.113.10:443,[2001:db8::/64]:443' -udp
+    -listen unix:///run/agents.net/sandbox-a/boundary.sock \
+    -policy /run/agents.net/sandbox-a/policy.json -generation 1
 ```
 
-For hostname
-requests the boundary resolves the name itself and keeps only public unicast
-results; loopback, private, link-local, multicast, shared-address-space,
-NAT64, documentation, and other special-purpose ranges are denied unless
-`-allow-ip` lists them for that port. It dials the checked address, not the
-name, so a rebinding answer cannot change the destination after the check.
-`-allow '*'` therefore still cannot reach `localhost`, a metadata service, or a
-private network. Ports must be numeric and in the range 1-65535. Denials
-report `not-on-allowlist`, `port-not-allowed`, `ip-not-on-allowlist`, or
-`resolved-address-denied` as the `reason` parameter of `Proxy-Status`, for
-example `Proxy-Status: boundary; error=http_request_denied;
-reason=not-on-allowlist`.
+For hostname requests the boundary resolves the name itself and keeps only
+public unicast results; loopback, private, link-local, multicast,
+shared-address-space, NAT64, documentation, and other special-purpose ranges
+([wire.md §5.1](../spec/draft/wire.md#51-special-purpose-addresses)) are
+denied unless a `resolve` list, a literal rule for that port, or a
+`resolved_addresses` entry admits them. It dials the checked address, not
+the name, so a rebinding answer cannot change the destination after the
+check. `{"name": "*"}` therefore still cannot reach `localhost`, a metadata
+service, or a private network, and never authorizes a literal. Names are
+lowercased, stripped of a trailing dot, and converted to A-labels before
+matching. Ports must be numeric and in the range 1-65535. Denials report
+`not-on-allowlist`, `port-not-allowed`, `transport-not-allowed`,
+`ip-not-on-allowlist`, or `resolved-address-denied` as the `reason`
+parameter of `Proxy-Status`, for example
+`Proxy-Status: boundary; error=http_request_denied; reason=not-on-allowlist`.
+A listener without a loaded descriptor answers 503 `policy-unavailable`;
+the command refuses to start without `-policy`.
 
 The HTTP/1.1 head is parsed by the boundary itself, not by
 `net/http.ReadRequest`, because that reader discards the `Host` field before
@@ -238,10 +250,10 @@ data and reach the upstream only after a 200. Malformed requests receive
 400 (`malformed-request-line`, `malformed-header`, `duplicate-host`,
 `missing-host`, `malformed-target`, `malformed-port`, `authority-mismatch`,
 `malformed-upgrade`, `malformed-template`), an unsupported version 505, an
-oversized head 431, a non-CONNECT method 405, and policy denials 403. Policy
-hostnames are validated as dot-separated labels of letters, digits, hyphens,
-and underscores; a fuzzer found that `..` normalized to `.` was previously
-accepted as a name.
+oversized head 431, a non-CONNECT method 405, and policy denials 403. Names
+in requests and in the descriptor are validated as dot-separated labels of
+letters, digits, hyphens, and underscores after IDNA conversion; a fuzzer
+found that `..` normalized to `.` was previously accepted as a name.
 
 Resource limits are `-max-connections` (accepted connections or HTTP/2
 sessions, default 1024; further connections receive 503 `busy` before their
@@ -250,11 +262,14 @@ default 256), a 15-second request-head deadline, and `-idle-timeout` (default
 1h; a tunnel with no data in either direction is closed, 0 disables). Client
 EOF is propagated to the upstream as a half-close.
 
-Each decision is one JSON object on standard output with `ts`, `listener`,
-`sandbox`, `policy`, `wire`, `transport`, `destination` as requested,
-`address` as dialed, `peer` (mTLS identity when present), `decision`
-(`allow`, `block`, `fail`), and `reason`. Guest-supplied values are JSON
-strings and cannot add fields or lines. The Python demo retains its
+Each decision is one JSON object on standard output in the
+[audit record format](../spec/draft/audit.md): `ts`, `listener`, `sandbox`,
+`generation`, `policy`, `wire`, `transport`, `destination` as requested after
+normalization, `address` as dialed, `peer` (mTLS identity when present),
+`rule` (the `id` of the rule that allowed), `decision` (`allow`, `block`,
+`fail`), and `reason`. Every refused request is recorded, including
+non-CONNECT methods and connections refused for budget. Guest-supplied values
+are JSON strings and cannot add fields or lines. The Python demo retains its
 hostname-only allowlist as a sample policy and dials names directly; it has
 no resolved-address or port check.
 

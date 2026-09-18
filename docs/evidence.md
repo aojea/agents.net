@@ -92,11 +92,11 @@ the TUN adapter and `socat` directly on the vsock channel.
 | Host delivers `GET /index.html` through `<uds_path>` → guest vsock 5000 → loopback 8081 | 200, guest body | 200, guest body |
 | Same handshake naming loopback port 22 | `ERR port not permitted` from the launcher | `ERR port not permitted` |
 | Boundary process killed during a 2 MB/s download of a 4 GiB body | Transfer ends after a few megabytes with a curl error; the old socket path refuses connections | Unaffected: a raw `CONNECT` to VM B's socket still receives `403` |
-| Replacement boundary started on the same path with an empty policy and a new `-policy-version` | Guest's next `curl` to the previously allowed name is refused; the replacement's audit records the block under the new version | Refused as before |
+| Replacement boundary started on the same path with an empty policy descriptor and a new `version` | Guest's next `curl` to the previously allowed name is refused; the replacement's audit records the block under the new version | Refused as before |
 
-Every boundary record carries the `-sandbox` and `-policy-version` values the
-script bound to that VM's listener; the test checks that no record is missing
-them.
+Every boundary record carries the `sandbox` and `version` values of the
+descriptor the script installed on that VM's listener; the test checks that
+no record is missing them.
 
 The test passes on Firecracker v1.16.1 with guest kernel 6.18.41 from the
 Firecracker CI artifacts. It does not test guest attestation, snapshot and

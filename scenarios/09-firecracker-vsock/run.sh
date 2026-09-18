@@ -101,16 +101,18 @@ fc_put() {
         || fail "firecracker API PUT $2 failed"
 }
 
-# start_boundary NAME GENERATION POLICY-VERSION BOUNDARY_FLAGS...
+# start_boundary NAME GENERATION POLICY-VERSION [RULES-JSON]
 # The boundary listens exactly where Firecracker delivers guest connections
 # to CID 2 port ${BOUNDARY_PORT}. Nothing else is bound under this VM's
-# prefix. The sandbox identity in every audit record is this flag, bound to
-# the listener by the controller (this script). Sets BOUNDARY_PID.
+# prefix. The controller (this script) writes the policy descriptor whose
+# sandbox label and version appear in every audit record. Sets BOUNDARY_PID.
 start_boundary() {
-    local name="$1" generation="$2" version="$3"; shift 3
-    local uds="${RUN_DIR}/${name}.vsock"
+    local name="$1" generation="$2" version="$3" rules="${4:-}"
+    local uds="${RUN_DIR}/${name}.vsock" policy="${RUN_DIR}/${name}.policy${generation}.json"
+    printf '{"agents_net_policy":1,"version":"%s","sandbox":"%s","default":"deny","rules":[%s]}\n' \
+        "${version}" "${name}" "${rules}" > "${policy}"
     "${BIN_DIR}/connect-proxy" -listen "unix://${uds}_${BOUNDARY_PORT}" \
-        -sandbox "${name}" -policy-version "${version}" "$@" \
+        -policy "${policy}" -generation "${generation:-1}" \
         > "${RUN_DIR}/${name}.audit${generation}" 2> "${RUN_DIR}/${name}.boundary${generation}.log" &
     BOUNDARY_PID=$!
     PIDS+=("${BOUNDARY_PID}")
@@ -135,11 +137,11 @@ except OSError as e:
 EOF
 }
 
-# start_vm NAME CID BOUNDARY_FLAGS...
+# start_vm NAME CID [RULES-JSON]
 start_vm() {
-    local name="$1" cid="$2"; shift 2
+    local name="$1" cid="$2" rules="${3:-}"
     local uds="${RUN_DIR}/${name}.vsock" api="${RUN_DIR}/${name}.api"
-    start_boundary "${name}" "" "scenario-09" "$@"
+    start_boundary "${name}" "" "scenario-09" "${rules}"
 
     firecracker --api-sock "${api}" > "${RUN_DIR}/${name}.console" 2>&1 &
     PIDS+=($!)
@@ -183,8 +185,7 @@ result() { # NAME KEY -> value
 echo "=== 5. Boot two sandboxes with different policies ==="
 # vm-a may reach test.example.com on the target port only; the boundary
 # maps the name to the target address.
-start_vm vm-a 3 -allow "test.example.com:${TARGET_PORT}" \
-    -resolve "test.example.com=${TARGET_ADDR}" -allow-ip "${TARGET_ADDR}:${TARGET_PORT}"
+start_vm vm-a 3 "{\"id\":\"target\",\"name\":\"test.example.com\",\"ports\":[${TARGET_PORT}],\"resolve\":[\"${TARGET_ADDR}\"]}"
 VM_A_BOUNDARY_PID="${BOUNDARY_PID}"
 # vm-b has an empty policy: every destination is refused.
 start_vm vm-b 4
