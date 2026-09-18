@@ -79,6 +79,61 @@ func TestDialTCPRefusalIsDialError(t *testing.T) {
 	}
 }
 
+// TestDialTCPAcceptsAny2xxAndSkipsInterim: CONNECT succeeds on every 2xx
+// (RFC 9110 9.3.6) and 1xx interim responses are skipped (RFC 9110 15.2).
+func TestDialTCPAcceptsAny2xxAndSkipsInterim(t *testing.T) {
+	for _, test := range []struct {
+		name, head string
+		ok         bool
+	}{
+		{"202", "HTTP/1.1 202 Accepted\r\n\r\n", true},
+		{"200 after 100 Continue", "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\n\r\n", true},
+		{"200 after 103 Early Hints", "HTTP/1.1 103 Early Hints\r\nLink: </x>; rel=preload\r\n\r\nHTTP/1.1 200 OK\r\n\r\n", true},
+		{"403 after 100", "HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 403 Forbidden\r\nProxy-Status: boundary; error=http_request_denied; reason=not-on-allowlist\r\nContent-Length: 0\r\n\r\n", false},
+		{"301 is not success", "HTTP/1.1 301 Moved Permanently\r\nLocation: /\r\nContent-Length: 0\r\n\r\n", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			c := fakeBoundary(func(req *http.Request, br *bufio.Reader, conn net.Conn) {
+				io.WriteString(conn, test.head)
+				io.Copy(conn, br)
+			})
+			conn, err := c.DialTCP(context.Background(), "api.example", 443)
+			if !test.ok {
+				var de *DialError
+				if !errors.As(err, &de) {
+					t.Fatalf("want *DialError, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			conn.Write([]byte("ping"))
+			buf := make([]byte, 4)
+			if _, err := io.ReadFull(conn, buf); err != nil || string(buf) != "ping" {
+				t.Fatalf("echo = %q, %v", buf, err)
+			}
+		})
+	}
+}
+
+// An endless stream of interim responses is a failure, not a hang.
+func TestDialTCPBoundsInterimResponses(t *testing.T) {
+	c := fakeBoundary(func(req *http.Request, br *bufio.Reader, conn net.Conn) {
+		for i := 0; i < maxInterimResponses+2; i++ {
+			if _, err := io.WriteString(conn, "HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
+				return
+			}
+		}
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := c.DialTCP(ctx, "api.example", 443); err == nil {
+		t.Fatal("dial succeeded after unbounded interim responses")
+	}
+}
+
 func TestDialUDPUpgradeAndEcho(t *testing.T) {
 	var gotPath, gotUpgrade string
 	c := fakeBoundary(func(req *http.Request, br *bufio.Reader, conn net.Conn) {

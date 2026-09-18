@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/aojea/agents.net/sdk/pkg/tun2connect"
 )
 
 func TestBoundaryDialerSchemes(t *testing.T) {
@@ -52,7 +56,7 @@ func TestDialVSOCKInvalidAddresses(t *testing.T) {
 
 // TestIngressOnlyReachesPinnedPort runs the ingress handshake against two
 // loopback listeners and checks that only the pinned one is reachable,
-// whatever port the caller names.
+// whatever port the caller names, and that refusals carry Proxy-Status.
 func TestIngressOnlyReachesPinnedPort(t *testing.T) {
 	listen := func(banner string) uint16 {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -81,27 +85,44 @@ func TestIngressOnlyReachesPinnedPort(t *testing.T) {
 	defer ln.Close()
 	go serveIngress(ln, pinned)
 
-	handshake := func(line string) string {
+	handshake := func(head string) (status int, reason, rest string) {
 		conn, err := net.Dial("unix", socket)
 		if err != nil {
 			t.Fatal(err)
 		}
 		defer conn.Close()
 		conn.SetDeadline(time.Now().Add(5 * time.Second))
-		io.WriteString(conn, line)
-		reply, _ := io.ReadAll(conn)
-		return string(reply)
+		io.WriteString(conn, head)
+		br := bufio.NewReader(conn)
+		resp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			t.Fatalf("%q: %v", head, err)
+		}
+		remaining, _ := io.ReadAll(br)
+		return resp.StatusCode, tun2connect.ProxyStatusReason(resp.Header), string(remaining)
 	}
-	if got := handshake(fmt.Sprintf("CONNECT %d\n", pinned)); got != "OK\npinned\n" {
-		t.Fatalf("pinned port: %q", got)
+	connect := func(port uint16) string {
+		return fmt.Sprintf("CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", port, port)
 	}
-	if got := handshake(fmt.Sprintf("CONNECT %d\n", other)); got != "ERR port not permitted\n" {
-		t.Fatalf("other listening port must be unreachable: %q", got)
+	if status, reason, rest := handshake(connect(pinned)); status != 200 || reason != "" || rest != "pinned\n" {
+		t.Fatalf("pinned port: %d %q %q", status, reason, rest)
 	}
-	if got := handshake("CONNECT 22\n"); got != "ERR port not permitted\n" {
-		t.Fatalf("unlistened port: %q", got)
-	}
-	if got := handshake("GET / HTTP/1.1\n"); got != "ERR malformed handshake\n" {
-		t.Fatalf("malformed handshake: %q", got)
+	for _, test := range []struct {
+		name, head string
+		status     int
+		reason     string
+	}{
+		{"other listening port", connect(other), 403, "port-not-permitted"},
+		{"unlistened port", connect(22), 403, "port-not-permitted"},
+		{"non-loopback target", fmt.Sprintf("CONNECT 10.0.0.1:%d HTTP/1.1\r\nHost: 10.0.0.1:%d\r\n\r\n", pinned, pinned), 400, "malformed-target"},
+		{"Host names another port", fmt.Sprintf("CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", pinned, other), 400, "authority-mismatch"},
+		{"missing Host", fmt.Sprintf("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n", pinned), 400, "missing-host"},
+		{"GET", "GET / HTTP/1.1\r\nHost: x\r\n\r\n", 405, "connect-only"},
+		{"textual handshake", fmt.Sprintf("CONNECT %d\n", pinned), 400, "malformed-request-line"},
+		{"HTTP/2.0", fmt.Sprintf("CONNECT 127.0.0.1:%d HTTP/2.0\r\nHost: 127.0.0.1:%d\r\n\r\n", pinned, pinned), 505, "unsupported-version"},
+	} {
+		if status, reason, rest := handshake(test.head); status != test.status || reason != test.reason || rest != "" {
+			t.Errorf("%s: got %d %q %q, want %d %q", test.name, status, reason, rest, test.status, test.reason)
+		}
 	}
 }

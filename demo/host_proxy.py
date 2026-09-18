@@ -66,9 +66,9 @@ glance:
 
 It also serves the spec's ingress interface: a public TCP port on the host
 is reverse-proxied into the sandbox over a second Unix socket served by the
-launcher from inside, using the Firecracker hybrid-vsock handshake
-("CONNECT <port>\\n" -> "OK\\n"), so a microVM offers the identical
-protocol with no code change.
+launcher from inside, using the agents.net ingress handshake (HTTP
+`CONNECT 127.0.0.1:<port>` -> 200, spec/draft/ingress.md), so a microVM
+offers the identical protocol with no code change.
 
 This file is deliberately independent of any production implementation:
 it interoperates with the launcher purely through the boundary protocol,
@@ -571,22 +571,31 @@ def handle_ingress() -> None:
 
 
 def _dial_sandbox(port: int) -> socket.socket:
-    """The Firecracker hybrid-vsock handshake the launcher serves: connect,
-    send "CONNECT <port>", read "OK". An "ERR ..." line is a refusal."""
+    """The agents.net ingress handshake the launcher serves: connect, send
+    `CONNECT 127.0.0.1:<port> HTTP/1.1`, read a 2xx. Any other status is a
+    refusal whose Proxy-Status names the reason."""
     agent_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     agent_sock.settimeout(10)
     agent_sock.connect(INGRESS_UDS)
-    agent_sock.sendall(f"CONNECT {port}\n".encode())
-    line = b""
-    while not line.endswith(b"\n"):
+    target = f"127.0.0.1:{port}"
+    agent_sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
         chunk = agent_sock.recv(1)
         if not chunk:
             raise ConnectionError("launcher closed during ingress handshake")
-        line += chunk
-        if len(line) > 64:
+        head += chunk
+        if len(head) > 4096:
             raise ConnectionError("oversized ingress handshake reply")
-    if not line.startswith(b"OK"):
-        raise ConnectionError(f"ingress refused: {line.decode(errors='replace').strip()}")
+    lines = head.partition(b"\r\n\r\n")[0].decode("latin1").split("\r\n")
+    try:
+        status = int(lines[0].split(" ", 2)[1])
+    except (IndexError, ValueError):
+        raise ConnectionError(f"malformed ingress reply: {lines[0]!r}")
+    if not 200 <= status < 300:
+        proxy_status = next((l.partition(":")[2].strip() for l in lines[1:]
+                             if l.lower().startswith("proxy-status:")), "")
+        raise ConnectionError(f"ingress refused: {status} {proxy_status}")
     agent_sock.settimeout(None)
     return agent_sock
 

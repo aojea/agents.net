@@ -57,7 +57,15 @@ echo "${KERNEL_SHA256}  ${KERNEL}" | sha256sum -c - >/dev/null || fail "kernel d
 echo "kernel ${KERNEL} verified"
 
 echo "=== 2. Guest rootfs and host binaries ==="
-if [ ! -f "${ROOTFS}" ] || [ "${REBUILD_ROOTFS:-0}" = 1 ]; then
+# The rootfs embeds the launcher and guest scripts; a cached image older
+# than their sources would test stale code.
+rootfs_stale() {
+    [ ! -f "${ROOTFS}" ] || [ "${REBUILD_ROOTFS:-0}" = 1 ] ||
+        [ -n "$(find "${REPO_ROOT}/sdk/cmd/tun2connect" "${REPO_ROOT}/sdk/pkg" "${REPO_ROOT}/sdk/go.mod" \
+            "${SCRIPT_DIR}/init.sh" "${SCRIPT_DIR}/guest-test.sh" "${SCRIPT_DIR}/build-rootfs.sh" \
+            -newer "${ROOTFS}" -print -quit)" ]
+}
+if rootfs_stale; then
     "${SCRIPT_DIR}/build-rootfs.sh" "${ROOTFS}"
 fi
 mkdir -p "${BIN_DIR}"
@@ -205,7 +213,7 @@ for vm in vm-a vm-b; do
     if python3 "${SCRIPT_DIR}/ingress_probe.py" "${RUN_DIR}/${vm}.vsock" "${INGRESS_PORT}" 22 \
         > "${RUN_DIR}/${vm}.ingress-other" 2>&1; then
         echo "${vm}: ingress to an unpinned port SUCCEEDED"; FAILED=1
-    elif grep -q 'port not permitted' "${RUN_DIR}/${vm}.ingress-other"; then
+    elif grep -q 'reason=port-not-permitted' "${RUN_DIR}/${vm}.ingress-other"; then
         echo "${vm}: ingress to an unpinned port refused by the launcher"
     else
         echo "${vm}: unexpected unpinned-port result: $(cat "${RUN_DIR}/${vm}.ingress-other")"; FAILED=1

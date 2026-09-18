@@ -146,31 +146,9 @@ type responder interface {
 	deny(status int, reason string)
 }
 
-// proxyErrorType maps a reason token to its RFC 9209 proxy error type.
-func proxyErrorType(reason string) string {
-	switch reason {
-	case "not-on-allowlist", "port-not-allowed", "transport-not-allowed", "udp-disabled", "identity-unknown", "port-not-permitted":
-		return "http_request_denied"
-	case "ip-not-on-allowlist", "resolved-address-denied", "scoped-ip":
-		return "destination_ip_prohibited"
-	case "resolve-failed":
-		return "dns_error"
-	case "dial-failed":
-		return "destination_unavailable"
-	case "busy":
-		return "connection_limit_reached"
-	case "policy-unavailable":
-		return "proxy_configuration_error"
-	case "unsupported-version":
-		return "http_protocol_error"
-	}
-	return "http_request_error"
-}
-
-// proxyStatus is the Proxy-Status field value for a refusal: one member
-// naming the boundary, the RFC 9209 error type, and the reason token.
+// proxyStatus is the Proxy-Status field value for a refusal by this boundary.
 func proxyStatus(reason string) string {
-	return "boundary; error=" + proxyErrorType(reason) + "; reason=" + reason
+	return tun2connect.ProxyStatus("boundary", reason)
 }
 
 type h1Responder struct{ conn net.Conn }

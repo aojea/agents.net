@@ -90,7 +90,7 @@ the TUN adapter and `socat` directly on the vsock channel.
 | Raw `CONNECT denied.example:443` with `Sandbox-Id: forged-admin` on vsock port 1024 | `403 Forbidden` | `403 Forbidden` |
 | Raw connect to vsock port 1025 (never bound on the host) | Reset by the VMM | Reset by the VMM |
 | Host delivers `GET /index.html` through `<uds_path>` → guest vsock 5000 → loopback 8081 | 200, guest body | 200, guest body |
-| Same handshake naming loopback port 22 | `ERR port not permitted` from the launcher | `ERR port not permitted` |
+| Same handshake naming loopback port 22 | `403` with `reason=port-not-permitted` from the launcher | `403` with `reason=port-not-permitted` |
 | Boundary process killed during a 2 MB/s download of a 4 GiB body | Transfer ends after a few megabytes with a curl error; the old socket path refuses connections | Unaffected: a raw `CONNECT` to VM B's socket still receives `403` |
 | Replacement boundary started on the same path with an empty policy descriptor and a new `version` | Guest's next `curl` to the previously allowed name is refused; the replacement's audit records the block under the new version | Refused as before |
 

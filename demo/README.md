@@ -221,7 +221,7 @@ Because the launched command is just a normal non-interactive invocation, the sa
 
 ## Lab 8 (Optional): Ingress -- Deliver a Webhook Into the Sandbox
 
-Ingress uses a second Unix socket, served from *inside* the sandbox by the launcher. `--ingress-port` pins the one loopback port ingress streams may reach; the launcher refuses to start without it, and a handshake naming any other port is answered `ERR port not permitted`. Note that both flags must come **before** the boundary-socket argument: the launcher stops parsing flags at the first positional argument, so everything after it is passed to the agent untouched:
+Ingress uses a second Unix socket, served from *inside* the sandbox by the launcher. `--ingress-port` pins the one loopback port ingress streams may reach; the launcher refuses to start without it, and a `CONNECT` naming any other port is answered `403` with `Proxy-Status: ingress; error=http_request_denied; reason=port-not-permitted`. Note that both flags must come **before** the boundary-socket argument: the launcher stops parsing flags at the first positional argument, so everything after it is passed to the agent untouched:
 
 ```bash
 docker run --rm \
@@ -242,7 +242,7 @@ From another terminal, deliver a webhook through the boundary's public ingress g
 curl -s -X POST -d 'deploy finished' http://localhost:9000/webhook
 ```
 
-The boundary dials the sandbox's ingress socket, performs the reverse-channel handshake (`CONNECT 8081` then `OK` -- the same protocol Firecracker hybrid-vsock uses, so a microVM offers the identical channel), and the launcher joins the stream to the agent's loopback listener. The agent prints the delivered payload; the audit log records the `INGRESS` line.
+The boundary dials the sandbox's ingress socket, performs the [ingress handshake](../spec/draft/ingress.md#2-wire) (`CONNECT 127.0.0.1:8081 HTTP/1.1` answered `200`; a microVM offers the identical channel over vsock), and the launcher joins the stream to the agent's loopback listener. The agent prints the delivered payload; the audit log records the `INGRESS` line.
 
 *Permissions note:* the ingress socket file is created from inside the container by the launcher, which opens it to `0666` so the unprivileged `host_proxy.py` can dial it. If you swap in a launcher that doesn't, open it manually: `docker exec <container> chmod 666 /var/run/agents.net/ingress-proxy.sock`. (Rootless Podman avoids the question entirely: container-root is your own uid, so the socket comes out owned by you.)
 

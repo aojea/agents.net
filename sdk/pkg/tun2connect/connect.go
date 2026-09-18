@@ -53,7 +53,7 @@ func (c *BoundaryClient) roundTrip(ctx context.Context, req *http.Request) (net.
 		return nil, nil, nil, err
 	}
 	br := bufio.NewReader(conn)
-	resp, err := http.ReadResponse(br, req)
+	resp, err := readFinalResponse(br, req)
 	if err != nil {
 		conn.Close()
 		return nil, nil, nil, err
@@ -61,6 +61,26 @@ func (c *BoundaryClient) roundTrip(ctx context.Context, req *http.Request) (net.
 	conn.SetDeadline(time0)
 	return conn, br, resp, nil
 }
+
+// readFinalResponse skips 1xx interim responses (RFC 9110 15.2). 101 is
+// the final response of an upgrade and is returned.
+func readFinalResponse(br *bufio.Reader, req *http.Request) (*http.Response, error) {
+	for interim := 0; ; interim++ {
+		resp, err := http.ReadResponse(br, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 100 || resp.StatusCode >= 200 || resp.StatusCode == http.StatusSwitchingProtocols {
+			return resp, nil
+		}
+		if interim >= maxInterimResponses {
+			return nil, fmt.Errorf("boundary sent more than %d interim responses", maxInterimResponses)
+		}
+	}
+}
+
+// maxInterimResponses bounds how many 1xx responses precede the final one.
+const maxInterimResponses = 8
 
 // DialTCP opens CONNECT to a hostname or IP address and returns the raw tunnel.
 func (c *BoundaryClient) DialTCP(ctx context.Context, name string, port uint16) (net.Conn, error) {
@@ -75,7 +95,8 @@ func (c *BoundaryClient) DialTCP(ctx context.Context, name string, port uint16) 
 	if err != nil {
 		return nil, err
 	}
-	if resp.StatusCode != http.StatusOK {
+	// CONNECT success is any 2xx (RFC 9110 9.3.6).
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		conn.Close()
 		return nil, refusal(resp)
 	}
@@ -133,6 +154,35 @@ func ProxyStatusReason(h http.Header) string {
 		}
 	}
 	return ""
+}
+
+// ProxyStatus builds the Proxy-Status field value for a refusal: one
+// member naming the responder, the RFC 9209 error type for the reason
+// token, and the token itself (spec/draft/wire.md Section 4).
+func ProxyStatus(member, reason string) string {
+	return member + "; error=" + ProxyErrorType(reason) + "; reason=" + reason
+}
+
+// ProxyErrorType maps a registered reason token to its RFC 9209 proxy error
+// type (spec/draft/registries.md Section 2).
+func ProxyErrorType(reason string) string {
+	switch reason {
+	case "not-on-allowlist", "port-not-allowed", "transport-not-allowed", "udp-disabled", "identity-unknown", "port-not-permitted":
+		return "http_request_denied"
+	case "ip-not-on-allowlist", "resolved-address-denied", "scoped-ip":
+		return "destination_ip_prohibited"
+	case "resolve-failed":
+		return "dns_error"
+	case "dial-failed":
+		return "destination_unavailable"
+	case "busy":
+		return "connection_limit_reached"
+	case "policy-unavailable":
+		return "proxy_configuration_error"
+	case "unsupported-version":
+		return "http_protocol_error"
+	}
+	return "http_request_error"
 }
 
 // bufConn keeps bytes the response reader buffered past the header.

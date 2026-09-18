@@ -51,8 +51,10 @@ HTTP/1.1 200 OK
 
 ```
 
-Every ingress decision is recorded as an audit record with
-`direction: "ingress"` ([audit.md](audit.md)).
+The gateway records every delivery it attempts as an audit record with
+`direction: "ingress"` ([audit.md](audit.md)), including the adapter's
+status and reason; the adapter runs inside the sandbox and its own logging
+is not trusted evidence.
 
 ## 3. Gateway Obligations (`ingress-gateway`)
 
