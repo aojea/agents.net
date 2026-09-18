@@ -5,12 +5,12 @@
 
 This document defines the wire between an adapter and a boundary: request
 forms, authority validation, success and failure responses, address policy,
-and tunnel content rules. It is written to be publishable on its own as an
-HTTP CONNECT profile; it does not depend on any adapter mechanism, channel
-type, or isolation technology. Identity binding for the channel is defined in
-[identity.md](identity.md); the policy descriptor in [policy.md](policy.md);
-the audit record in [audit.md](audit.md); reason tokens and profiles in
-[registries.md](registries.md).
+and tunnel content rules. It is an HTTP CONNECT profile that can be published
+on its own, and it does not depend on any adapter mechanism, channel type, or
+isolation technology. Related definitions live in other documents: identity
+binding for the channel in [identity.md](identity.md), the policy descriptor
+in [policy.md](policy.md), the audit record in [audit.md](audit.md), and
+reason tokens and profiles in [registries.md](registries.md).
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in this
@@ -20,13 +20,13 @@ document are to be interpreted as described in BCP 14 (RFC 2119, RFC 8174).
 
 The Egress Boundary Interface defines how traffic leaves the sandbox:
 
-1. **TCP:** Supported external TCP flows MUST use HTTP CONNECT (RFC 9110 Section 9.3.6) with the destination hostname or IP address and an explicit port. HTTP/1.1 is the baseline; HTTP/2 multiplexing is optional. Tunnels carry arbitrary TCP byte streams, not raw IP packets.
-2. **Names and addresses:** Adapters MUST preserve a hostname when a mapping is available. Otherwise, they MUST forward the destination IP address without requiring a DNS lookup or inventing a hostname. Boundaries MUST support both forms and authorize them according to policy. IP literals MUST NOT be rejected solely because no hostname is available. IPv6 literals use brackets in the CONNECT authority.
-3. **Optional UDP:** UDP tunneling MUST be explicitly enabled at the adapter and boundary. RFC 9298 uses an HTTP/1.1 `GET` upgrade or HTTP/2 extended CONNECT with `:protocol: connect-udp`, carrying RFC 9297 capsules on a reliable stream. Disabled or unsupported capabilities MUST NOT fall back to direct networking.
-4. **Constrained channel:** The workload MUST reach the boundary through an access-controlled channel, such as a dedicated Unix socket or a restricted VSOCK service. The controller MUST exclude alternative external paths, other workloads' endpoints, and unauthorized host services. A TCP boundary listener is useful for component tests but alone is not sandbox confinement.
-5. **External authorization:** Before dialing, the boundary MUST authorize the workload identity, destination, port, and transport under current policy. Hostnames require name policy and checks on each resolved address; literals require IP or CIDR policy. The boundary MUST deny unknown identities and unavailable policy, and dial only checked addresses, including retries, without an unchecked second DNS resolution. Internal services MAY be authorized explicitly; private, loopback, and metadata access must not arise implicitly from a name allowlist.
-6. **Explicit refusal:** A denied CONNECT MUST return HTTP `403 Forbidden` with a `Proxy-Status` field (RFC 9209) whose single member carries an `error` parameter from the HTTP Proxy Error Types registry and a `reason` parameter holding a registered reason token (Section 4). Other failures use the same field with their own status class. The adapter MUST expose a connection failure without silently bypassing the boundary. TCP connect refusal, reset, and UDP error semantics differ; an HTTP status is not an application response inside the tunnel.
-7. **Failure and limits:** Boundary unavailability MUST NOT create an alternate network path. Setup, failure detection, and idle resource retention MUST be bounded. Implementations MUST document deadlines, connection and buffer quotas, and whether policy revocation terminates established streams. Fail-closed is an isolation property, not a promise of instantaneous failure detection.
+1. **TCP:** Supported external TCP flows MUST use HTTP CONNECT (RFC 9110 Section 9.3.6) with the destination hostname or IP address and an explicit port. HTTP/1.1 is the baseline, and HTTP/2 multiplexing is optional. A tunnel carries a TCP byte stream rather than raw IP packets.
+2. **Names and addresses:** Adapters MUST preserve a hostname when a mapping is available. When no hostname is known, they MUST forward the destination IP address as given, without performing a DNS lookup or inventing a hostname. Boundaries MUST support both forms and authorize them according to policy. IP literals MUST NOT be rejected solely because no hostname is available. IPv6 literals use brackets in the CONNECT authority.
+3. **Optional UDP:** UDP tunneling MUST be explicitly enabled at both the adapter and the boundary. It uses the RFC 9298 request forms (an HTTP/1.1 `GET` upgrade or HTTP/2 extended CONNECT with `:protocol: connect-udp`) and carries RFC 9297 capsules on a reliable stream. When a capability is disabled or unsupported, traffic MUST NOT fall back to direct networking.
+4. **Constrained channel:** The workload MUST reach the boundary through an access-controlled channel, such as a dedicated Unix socket or a restricted vsock service. The controller MUST exclude alternative external paths, other workloads' endpoints, and unauthorized host services. A boundary that listens on TCP is convenient for component tests, but a TCP listener by itself does not confine a sandbox.
+5. **External authorization:** Before dialing, the boundary MUST authorize the workload identity, destination, port, and transport under the current policy. A hostname is authorized by a name rule together with a check on each resolved address; an IP literal is authorized by an IP or CIDR rule. The boundary MUST deny unknown identities and requests for which no policy is available, and dial only addresses it has checked, including on retry, with no unchecked second DNS resolution. Internal services MAY be authorized explicitly; a name allowlist must not implicitly grant access to private, loopback, or metadata addresses.
+6. **Explicit refusal:** A denied CONNECT MUST return HTTP `403 Forbidden` with a `Proxy-Status` field (RFC 9209) whose single member carries an `error` parameter from the HTTP Proxy Error Types registry and a `reason` parameter holding a registered reason token (Section 4). Other failures use the same field with their own status class. The adapter MUST expose the failure to the application as a connection failure rather than silently bypassing the boundary. How that failure appears depends on the transport: a TCP connection is refused or reset, and UDP has its own error semantics. The HTTP status is not an application response inside the tunnel.
+7. **Failure and limits:** Boundary unavailability MUST NOT create an alternate network path. Setup, failure detection, and idle resource retention MUST be bounded. Implementations MUST document deadlines, connection and buffer quotas, and whether policy revocation terminates established streams. Failing closed is a property of the isolation: traffic has no path while the boundary is unavailable. It does not imply that the failure is detected instantly.
 
 The adapter's supported resolver behavior is part of its compatibility
 statement ([adapters.md](adapters.md)).
@@ -44,8 +44,9 @@ CONNECT [2001:db8::10]:443 HTTP/1.1
 Host: [2001:db8::10]:443
 ```
 
-Each request is independently authorized. An IP destination still uses the
-boundary channel; it does not give the workload a direct external network path.
+Each request is authorized independently. A request for an IP destination
+travels over the same boundary channel as any other and does not give the
+workload a direct external network path.
 
 ## 2. CONNECT Parsing and Authorization
 
@@ -53,17 +54,17 @@ The boundary MUST parse each request before opening an upstream socket or
 forwarding any guest payload. Implementations MUST use the parsed destination
 consistently for authorization, dialing, and audit.
 
-- Validate the method, HTTP version, authority, explicit numeric port in the range 1-65535, and IPv6 bracket syntax. Reject empty hosts, userinfo, control characters, and ambiguous address encodings. Unsupported scoped IPv6 addresses must fail explicitly.
-- For HTTP/1.1, validate the CONNECT request-target and Host field as the same destination. Reject conflicting or duplicate authorities and request framing that creates parser disagreement. Bytes buffered after the request head remain untrusted tunnel data and must not reach upstream before authorization.
-- For HTTP/2, enforce the CONNECT pseudo-header rules, including the absence of `:scheme` and `:path` for ordinary CONNECT. Extended CONNECT uses its own required fields and requires advertised support. Reject unsupported `:protocol` values.
-- For connect-udp, validate the configured URI template, decode each component exactly once, reject malformed encodings, and validate the resulting host and port. Apply the same workload and destination authorization as TCP.
-- Normalize names and addresses consistently, including case, trailing DNS dots, IDNA handling, and IPv4-mapped IPv6 addresses (Section 6). Do not infer authority from PTR records, TLS fingerprints, or guest-provided identity headers.
-- Strip or ignore guest tenant, credential-selection, routing-override, and impersonation headers. An authenticated upstream identity must be constructed from trusted state. Proxy authentication headers must not be forwarded as origin credentials.
-- Bind every stream to its channel identity. Multiplexing MUST NOT allow a request header to select another tenant. Workload-specific policy and resource limits apply to every stream, including reconnects and retries.
+- The boundary validates the method, the HTTP version, the authority, an explicit numeric port in the range 1-65535, and IPv6 bracket syntax. It rejects empty hosts, userinfo, control characters, and ambiguous address encodings. A scoped IPv6 address that the boundary does not support must fail explicitly.
+- For HTTP/1.1, the boundary validates that the CONNECT request-target and the Host field name the same destination. It rejects conflicting or duplicate authorities and request framing that would make two parsers disagree. Bytes buffered after the request head are untrusted tunnel data and must not reach upstream before authorization.
+- For HTTP/2, the boundary enforces the CONNECT pseudo-header rules, including the absence of `:scheme` and `:path` on ordinary CONNECT. Extended CONNECT has its own required fields and is accepted only after support for it has been advertised. Unsupported `:protocol` values are rejected.
+- For connect-udp, the boundary matches the request against the configured URI template, decodes each component exactly once, rejects malformed encodings, and validates the resulting host and port. Workload and destination authorization are the same as for TCP.
+- The boundary normalizes names and addresses consistently, covering case, trailing DNS dots, IDNA handling, and IPv4-mapped IPv6 addresses (Section 6). It does not infer the authority from PTR records, TLS fingerprints, or guest-provided identity headers.
+- The boundary strips or ignores guest-supplied tenant, credential-selection, routing-override, and impersonation headers. An authenticated upstream identity must be constructed from trusted state, and proxy authentication headers must not be forwarded as origin credentials.
+- Every stream is bound to its channel identity. Multiplexing MUST NOT allow a request header to select another tenant. Workload-specific policy and resource limits apply to every stream, including reconnects and retries.
 
-Only a successful tunnel response permits payload forwarding. Standard HTTP
-errors describe malformed requests, authentication requirements, policy
-denials, and upstream failures; they MUST NOT be treated as successful tunnel
+Payload forwarding begins only after a successful tunnel response. Standard
+HTTP error responses report malformed requests, authentication requirements,
+policy denials, and upstream failures; they MUST NOT be treated as tunnel
 establishment.
 
 ## 3. Success and Interim Responses
@@ -106,11 +107,11 @@ Content-Length: 0
 
 ## 5. Address Policy and Checked-Address Dialing
 
-The boundary resolves hostnames using its configured resolver. It MUST check
+The boundary resolves hostnames with its configured resolver. It MUST check
 every address it may dial, including alternate-family results and retries, and
 dial the checked address without another unchecked resolution. An allowed name
-can resolve to a forbidden address. Cached DNS answers are not cached
-authorization and must be checked against the applicable policy.
+can resolve to a forbidden address, and a cached DNS answer must be checked
+against the applicable policy in the same way as a fresh one.
 
 ### 5.1 Special-Purpose Addresses
 
@@ -122,31 +123,39 @@ ranges is special-purpose:
 
 The list covers local, private, link-local, metadata, multicast, broadcast,
 and documentation destinations for both address families. An address with a
-zone identifier is rejected with `scoped-ip`. A literal loopback address means
-the boundary's loopback, not the guest's.
+zone identifier is rejected with `scoped-ip`. A loopback literal refers to
+the boundary's own loopback interface, not the guest's.
 
 ### 5.2 Authorization Algorithm
 
 **Literal destinations** are authorized only by a rule whose `ip` or `cidr`
 contains the address and whose ports and transports match
 ([policy.md](policy.md)). The special-purpose table does not apply to
-literals; deny-by-default does. No match is `ip-not-on-allowlist`; a match
-with a non-matching port is `port-not-allowed`; a match with a non-matching
-transport is `transport-not-allowed`.
+literals, but a literal with no matching rule is denied like any other
+destination. When no rule contains the address, the reason is
+`ip-not-on-allowlist`. When a rule contains the address but its ports do not
+include the requested port, the reason is `port-not-allowed`; when its
+transports do not include the requested transport, the reason is
+`transport-not-allowed`.
 
-**Hostname destinations** are authorized in two steps. First the name is
-matched against name rules (Section 6); no match is `not-on-allowlist`, a
-match with a non-matching port is `port-not-allowed`, a match with a
-non-matching transport is `transport-not-allowed`. Second the boundary
-obtains the address set from the rule's `resolve` list, if present, or from
-its configured resolver. Each address is kept if it is listed in the rule's
-`resolve` list, or is authorized as a literal for that port by an `ip` or
-`cidr` rule, or matches an entry of `resolved_addresses` for that port, or is
-not special-purpose. If no address remains the request is denied with
-`resolved-address-denied`. Implementations MAY deny the request when any
-address was removed. A literal permission therefore also admits the same
-address as a resolution result; the converse does not hold:
-`resolved_addresses` never authorizes a literal.
+**Hostname destinations** are authorized in two steps. First, the name is
+matched against the name rules (Section 6). No match is `not-on-allowlist`.
+A match whose ports do not include the requested port is `port-not-allowed`,
+and a match whose transports do not include the requested transport is
+`transport-not-allowed`. Second, the boundary obtains the address set, from
+the rule's `resolve` list when one is present and otherwise from its
+configured resolver. An address is kept when at least one of the following
+holds:
+
+- it is listed in the rule's `resolve` list;
+- an `ip` or `cidr` rule authorizes it as a literal for that port;
+- an entry of `resolved_addresses` covers it for that port;
+- it is not special-purpose.
+
+If no address remains, the request is denied with `resolved-address-denied`.
+Implementations MAY deny the request when any address was removed. It follows
+that a literal permission also admits the same address as a resolution
+result, while an entry in `resolved_addresses` never authorizes a literal.
 
 ### 5.3 Dialing
 
@@ -156,20 +165,20 @@ MUST NOT resolve the name again for the same request, including on connection
 failure. When it forwards to a next-hop proxy, the next hop's address is the
 dialed address for the purposes of this section, and the next hop MUST apply
 this section before its own dial. The audit record's `address` is the address
-of the connection that was established, or absent.
+of the connection that was established, and is absent when none was.
 
-Static service mappings and proxy chains require authorization like any
-other destination. DNSSEC can authenticate signed DNS records; it does not
-establish permission to reach an address. Synthetic DNS in an adapter
-preserves a name for policy but is not an attestation of application intent;
-the adapter's synthetic ranges must not overlap required literal destinations
-([adapters.md](adapters.md)).
+Static service mappings and proxy chains are authorized like any other
+destination. DNSSEC authenticates signed DNS records but does not grant
+permission to reach an address. An adapter's synthetic DNS preserves a name
+for policy purposes; it does not attest to what the application intended, and
+the adapter's synthetic ranges must not overlap literal destinations the
+workload needs to reach ([adapters.md](adapters.md)).
 
 For opaque tunnels, upstream TLS or SSH authentication belongs to the client
-application. If an application gateway terminates TLS, it MUST independently
-validate the upstream certificate and expected service identity before sending
-credentials or sensitive data ([gateway.md](gateway.md)). It must not disable
-upstream verification to make interception work.
+application. An application gateway that terminates TLS MUST independently
+validate the upstream certificate and expected service identity before
+sending credentials or sensitive data ([gateway.md](gateway.md)), and it must
+not disable upstream verification to make interception work.
 
 ## 6. Name Normalization and Matching
 
@@ -224,52 +233,56 @@ It MUST NOT interpret payload bytes as new boundary control messages, tenant
 identity, channel registration, or credential requests. A payload that looks
 like another CONNECT request is data for the already-selected upstream.
 
-Traffic on port 443 is not necessarily TLS. Visible SNI and ALPN can support
-consistency checks, but do not authenticate the content or prevent all domain
-fronting. Encrypted ClientHello can hide the relevant name. An allowed server
-may itself provide a proxy, relay, DoH service, or storage endpoint. An opaque
-boundary cannot prevent these uses without additional policy or inspection.
+Traffic on port 443 is not necessarily TLS. When a ClientHello is visible,
+its SNI and ALPN values can support consistency checks, but they do not
+authenticate the content and do not prevent every form of domain fronting.
+Encrypted ClientHello can hide the relevant name altogether. An allowed
+server may itself offer a proxy, a relay, a DoH service, or a storage
+endpoint, and an opaque boundary cannot prevent such uses without additional
+policy or inspection.
 
-End-to-end TLS preserves confidentiality from the boundary. It also prevents
-the boundary from inspecting methods, URLs, credentials, prompts, and responses.
-Deployments MUST distinguish destination policy from application policy. They
-cannot claim both opaque end-to-end encryption and complete payload inspection
-on the same connection.
+End-to-end TLS keeps the payload confidential from the boundary, which
+therefore cannot inspect methods, URLs, credentials, prompts, or responses.
+Deployments MUST distinguish destination policy from application policy,
+since a single connection cannot offer both opaque end-to-end encryption and
+complete payload inspection.
 
-An inspecting gateway requires bounded protocol parsers and per-request
-authorization. It MUST handle connection reuse, HTTP/2 multiplexing, streaming,
-redirects, and protocol upgrades explicitly. Authorizing the first request is
-not sufficient for later requests on the same connection. Responses and tool
-outputs remain untrusted, including instructions received from an allowed
-service. Network authentication does not prevent prompt injection or make
-downloaded code safe.
+An inspecting gateway needs bounded protocol parsers and per-request
+authorization. It MUST handle connection reuse, HTTP/2 multiplexing,
+streaming, redirects, and protocol upgrades explicitly, because authorizing
+the first request on a connection does not authorize the requests that follow
+it. Responses and tool outputs remain untrusted even when they come from an
+allowed service, and that includes any instructions they contain.
+Authenticating the network peer does not prevent prompt injection and does
+not make downloaded code safe.
 
 ## 10. Security Considerations
 
 The boundary is the only component whose decisions the sandbox cannot
 influence, so every guest-controlled input it consumes is an attack surface:
 the request head, the connect-udp template, DNS answers for allowed names,
-and tunnel payload. Section 2 bounds the parser; Section 5 requires that the
-address dialed is the address checked, which defeats rebinding and mixed
-answers; Section 9 forbids interpreting payload as control messages. The
-special-purpose table in Section 5.1 exists because a name allowlist is not
-an address allowlist: a permitted name may resolve to a metadata service or
-loopback. An exception in `resolved_addresses` reopens exactly the range it
-names and nothing else, which is why such an exception MUST be contained in
-a special-purpose range ([policy.md](policy.md)).
+and the tunnel payload. Section 2 bounds the parser. Section 5 requires that
+the address dialed is the address checked, which defeats rebinding and mixed
+answers. Section 9 forbids interpreting payload as control messages. The
+special-purpose table in Section 5.1 exists because a permitted name may
+resolve to a metadata service or a loopback address, so a name allowlist does
+not by itself bound the addresses that can be reached. An exception in
+`resolved_addresses` reopens exactly the range it names and nothing else,
+which is why such an exception MUST be contained in a special-purpose range
+([policy.md](policy.md)).
 
-A denial is visible to the workload only as a connection failure; the
-reason token is for the gateway, the operator, and the audit record, not for
-the workload. The `details` parameter MUST NOT echo guest bytes because a
-response field is the only channel back to the workload other than the
-tunnel itself. Resource limits (connection budgets, stream budgets, head
-deadlines, idle timeouts) are part of the guarantee: an unbounded boundary
-can be held by one sandbox to the detriment of others.
+The workload sees a denial only as a connection failure. The reason token is
+meant for the gateway, the operator, and the audit record rather than for the
+workload. The `details` parameter MUST NOT echo guest bytes, because a
+response field is the only channel back to the workload other than the tunnel
+itself. Resource limits (connection budgets, stream budgets, head deadlines,
+idle timeouts) are part of the isolation the boundary provides: without them,
+one sandbox can hold the boundary's resources and starve the others.
 
-This profile authorizes destinations. It does not authenticate the upstream,
-inspect content, or constrain what an allowed service does; those are the
-subject of the optional gateway ([gateway.md](gateway.md)). The isolation
-that makes the boundary the only path is the runtime's responsibility
+This profile authorizes destinations. Authenticating the upstream, inspecting
+content, and constraining what an allowed service does are outside its scope
+and belong to the optional gateway ([gateway.md](gateway.md)). Making the
+boundary the only path out of the sandbox is the runtime's responsibility
 ([isolation.md](isolation.md)).
 
 ## 11. IANA Considerations

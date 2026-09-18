@@ -5,8 +5,9 @@
 **Schema:** [schema/audit.schema.json](schema/audit.schema.json)
 
 A boundary writes one JSON object per line for every decision. The record is
-the portable evidence that a request was decided under a given identity and
-policy; the conformance suite reads it to verify implementations.
+portable evidence that a request was decided under a given identity and
+policy. The conformance suite reads these records to verify an
+implementation.
 
 ## 1. Fields
 
@@ -32,15 +33,15 @@ policy; the conformance suite reads it to verify implementations.
 
 ## 2. Requirements
 
-Every value derived from the request MUST be a JSON string. The record MUST
-NOT contain credentials, tunnel payload, or policy contents other than
+Every value derived from the request MUST be a JSON string. The record
+MUST NOT contain credentials, tunnel payload, or policy contents other than
 `version` and `rule`. Audit failure MUST NOT change a decision. A record MUST
-be written for every request that reaches parsing, including malformed
-requests and requests refused for their method, for every connection refused
-for budget, and for every TLS handshake failure on a `boundary-tls` listener.
-`transport` and `destination` are present whenever the request head was
-parsed far enough to know them. Untrusted values are structurally encoded so
-that a request cannot add fields or lines.
+be written for every request that reaches parsing (including malformed
+requests and requests refused for their method), for every connection
+refused for budget, and for every TLS handshake failure on a `boundary-tls`
+listener. `transport` and `destination` are present whenever the request
+head was parsed far enough to determine them. Because untrusted values are
+encoded as JSON strings, a request cannot add fields or lines to the record.
 
 ```json
 {"ts":"2026-09-17T10:00:01.234567Z","listener":"unix:///run/agents.net/a/boundary.sock","sandbox":"sandbox-a","policy":"2026-09-17T10:00:00Z/3","wire":"h1","transport":"tcp","destination":"registry.npmjs.org:443","address":"203.0.113.42:443","rule":"npm","decision":"allow"}

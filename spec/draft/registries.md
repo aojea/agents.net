@@ -6,8 +6,9 @@
 ## 1. Roles and Profiles
 
 A conformance claim names a role and one or more profiles. Profiles marked
-"core" are prerequisites for the others in the same role. Each profile is
-verified by a group of the [conformance suite](../../conformance/README.md).
+"core" are prerequisites for the other profiles of the same role. The
+[conformance suite](../../conformance/README.md) verifies each profile with
+one group of cases.
 
 | Role | Profile | Summary | Defined in |
 | --- | --- | --- | --- |
@@ -25,15 +26,15 @@ verified by a group of the [conformance suite](../../conformance/README.md).
 | Controller | `controller-snapshot` | Generation binding for adapter state across snapshot and restore | [lifecycle.md §3](lifecycle.md#3-snapshot-and-restore-controller-snapshot) |
 | Ingress | `ingress-gateway` | Authenticated caller, route bound to one sandbox generation, HTTP CONNECT to the pinned loopback port | [ingress.md](ingress.md) |
 
-A profile is added to this table only together with conformance fixtures and
-at least one passing implementation.
+A profile is added to this table only when conformance fixtures exist for it
+and at least one implementation passes them.
 
 ## 2. Reason Tokens
 
-Reason tokens are the `reason` parameter of `Proxy-Status`
-([wire.md Section 4](wire.md#4-failure-signaling)) and the `reason` field of
-the audit record. Syntax: `[a-z0-9-]{1,32}`. New tokens are registered by a
-specification change to this table.
+A reason token is the value of the `reason` parameter of `Proxy-Status`
+([wire.md Section 4](wire.md#4-failure-signaling)) and of the `reason` field
+of the audit record. A token matches `[a-z0-9-]{1,32}`. A new token is
+registered by a specification change that adds it to this table.
 
 | Token | Status | RFC 9209 `error` | Meaning |
 | --- | --- | --- | --- |
@@ -77,7 +78,8 @@ specification change to this table.
 
 ## 4. Implementation Statement
 
-Published with every conformance result:
+An implementation statement is published with every conformance result and
+has the following fields.
 
 | Field | Content |
 | --- | --- |
@@ -95,6 +97,6 @@ Published with every conformance result:
 | `results` | Path and digest of the results file |
 | `environment` | OS, kernel, VMM, and versions used during the run |
 
-Capabilities are declared here, not negotiated in band: an unsupported
-request fails with the defined status and reason, and `SETTINGS_ENABLE_CONNECT_PROTOCOL`
-(RFC 8441) is the only in-band capability signal.
+Capabilities are declared in this statement rather than negotiated in band.
+An unsupported request fails with the defined status and reason. The only
+in-band capability signal is `SETTINGS_ENABLE_CONNECT_PROTOCOL` (RFC 8441).

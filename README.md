@@ -1,46 +1,55 @@
 # agents.net
 
-**Sandbox networking for autonomous agents: one wire, external policy, no bypass.**
+agents.net is a network interface between a sandbox and an external
+policy-enforcing proxy. It is meant for runtimes that execute autonomous
+agents.
 
 Version 1 (draft). Specification: [spec/draft](spec/draft/index.md).
 
 ## The Problem
 
-An agent runs untrusted code: the model's plan, the packages it installs, the
-tools it calls. It needs the network for exactly the services you allow (a
-model API, a package registry, your internal service) and nothing else. Today
-each sandbox product solves this differently, with product-specific policy,
-proxies clients can ignore, address-based firewalls that go stale behind CDNs,
-and no way to move a policy or an audit trail between providers.
+An agent runs untrusted code. The model writes the plan, and carrying it out
+means installing packages and calling tools. The agent still needs the network,
+but only to reach the few services you pick for it, such as a model API, a
+package registry, or a service of your own. Each sandbox product handles this
+in its own way today. Policy formats are product-specific, and proxies are
+advisory, so a client that ignores the proxy settings goes around them.
+Address-based firewalls go stale as soon as a service moves behind a CDN. A
+policy or an audit trail written for one provider does not carry over to
+another.
 
 ## The Answer
 
-Give the sandbox no network path. Put an adapter in front of it that turns
-every connection the workload makes into an HTTP `CONNECT` request naming the
-destination, and deliver those requests over a channel that belongs to that
-sandbox alone. A boundary outside the sandbox decides each request against the
-sandbox's policy, resolves the name itself, dials only the address it checked,
-and writes one audit record per decision.
+The sandbox gets no network path at all. An adapter sits in front of it and
+turns each connection the workload opens into an HTTP `CONNECT` request that
+names the destination. The adapter sends those requests over a boundary socket
+that belongs to this sandbox and no other. Outside the sandbox, a boundary
+proxy checks each request against the policy descriptor bound to that socket,
+resolves the name itself, dials only the address it checked, and writes one
+audit record per decision.
 
 ```text
 agent (ordinary sockets) -> adapter -> CONNECT api.example.com:443 -> boundary -> policy -> upstream
                                           no other path exists
 ```
 
-What this buys:
+Because there is no other route, the workload can't opt out. Ignoring
+`HTTP_PROXY` or replacing the adapter changes nothing. Policy is applied to
+the name the application asked for: the boundary sees `api.example.com`,
+resolves it, and dials the address it checked. Any TCP client works
+unmodified, since SSH, database drivers, raw sockets, and plain HTTP all end
+up as CONNECT tunnels.
 
-| Property | How |
-| --- | --- |
-| Enforcement the workload cannot opt out of | There is no route; ignoring `HTTP_PROXY` or replacing the adapter changes nothing |
-| Policy on the name the application asked for | The boundary sees `api.example.com`, resolves it, and dials the checked address |
-| Any TCP client, unmodified | SSH, database drivers, raw sockets, and HTTP all become CONNECT tunnels |
-| Any CONNECT-capable proxy as the enforcement point | The wire is RFC 9110 CONNECT with RFC 9209 `Proxy-Status`; no agent-specific protocol |
-| Portable policy and audit | One JSON policy descriptor and one JSON audit record work across implementations |
-| Conformance you can run | Black-box fixtures, a harness, and a driver contract for any boundary |
+The wire is RFC 9110 CONNECT with RFC 9209 `Proxy-Status` and nothing
+agent-specific, so any CONNECT-capable proxy can act as the boundary. The
+policy descriptor and the audit record are each one JSON document that works
+across implementations. The conformance suite (black-box fixtures, a harness,
+and a driver contract) runs against any boundary.
 
-The workload's cooperation is never required; the runtime's confinement is.
-The guarantee is about which destinations traffic reaches, not about what an
-allowed service does with it.
+What the boundary controls is which destinations traffic reaches. It does not
+control what an allowed service does with that traffic. It works whether or
+not the workload cooperates, but only while the runtime keeps the sandbox
+confined.
 
 ## Repository
 
@@ -55,12 +64,13 @@ allowed service does with it.
 
 ## Roles
 
-Four roles can be built by different parties and combined; each has
-conformance profiles ([registries](spec/draft/registries.md)).
+The specification splits the system into four roles. Different parties can
+build them and combine them, and each role has its own conformance profiles
+([registries](spec/draft/registries.md)).
 
-- **Adapter**: turns workload connections into CONNECT requests. Packet adapters (TUN, network namespace, VMM backend) carry every connection of an uncooperative workload; an explicit adapter serves proxy-aware clients on hosts without packet interception.
-- **Boundary**: any CONNECT-terminating proxy that applies the policy descriptor, resolves and checks addresses, signals failures with `Proxy-Status`, and writes audit records.
-- **Controller**: the runtime that creates the sandbox, binds one channel to one policy, and revokes both.
+- **Adapter**: turns workload connections into CONNECT requests. A packet adapter (TUN, network namespace, or VMM packet backend) captures every connection whether or not the workload cooperates. An explicit adapter serves proxy-aware clients on hosts where packet interception isn't available.
+- **Boundary**: any CONNECT-terminating proxy that applies the policy descriptor, resolves and checks addresses, reports failures with `Proxy-Status`, and writes audit records.
+- **Controller**: the runtime that creates the sandbox, binds its boundary socket to one policy descriptor, and revokes both.
 - **Ingress gateway** (optional): delivers authenticated inbound requests to one pinned loopback port.
 
 ## Quick Start
@@ -79,12 +89,13 @@ demo/test_demo.sh
 
 ## Status
 
-The specification is a draft of version 1. The reference boundary, adapters,
-and launcher implement it; the conformance suite's HTTP/1.1 boundary groups
-run in CI. Firecracker and QEMU microVM scenarios execute on hosted runners.
-Envoy has been used as an alternative boundary for TCP CONNECT over loopback.
-[docs/implementations.md](docs/implementations.md) records what is verified
-and what is not. Release rules are in [spec/README.md](spec/README.md).
+The specification is a draft of version 1. The reference boundary, the
+adapters, and the launcher implement it. The HTTP/1.1 boundary groups of the
+conformance suite run in CI, and the Firecracker and QEMU microVM scenarios
+run on hosted runners. Envoy has been used as an alternative boundary for TCP
+CONNECT over loopback. [docs/implementations.md](docs/implementations.md)
+records what has been verified and what hasn't. Release rules are in
+[spec/README.md](spec/README.md).
 
 ## License
 

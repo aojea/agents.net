@@ -5,22 +5,24 @@
 [../README.md](../README.md) for how versions are released.
 
 `agents.net` defines a network interface between a sandbox and an external
-policy-enforcing proxy. Applications use ordinary sockets. An adapter, either
-inside the sandbox, in a dedicated network namespace, or in an isolated VMM
-packet backend, converts supported connections into HTTP `CONNECT` requests.
-Adapters deliver requests through a dedicated boundary socket. The boundary
-applies that socket's assigned policy before opening an upstream connection.
-The sandbox has no direct external network path.
+policy-enforcing proxy. Applications inside the sandbox use ordinary sockets.
+An adapter converts supported connections into HTTP `CONNECT` requests and
+delivers them through a dedicated boundary socket. The adapter can run inside
+the sandbox, in a dedicated network namespace, or in an isolated VMM packet
+backend. The boundary applies the policy assigned to that socket before it
+opens an upstream connection. The sandbox has no direct external network
+path.
 
-Applications cannot bypass this policy by ignoring proxy settings or replacing
-the adapter, provided runtime confinement remains intact. Runtime adapters and
-proxies use the same HTTP interface; no particular proxy, service mesh, or
-orchestration system is required. An optional application gateway can attach
-service credentials without giving the reusable key to the workload.
+As long as runtime confinement remains intact, an application cannot bypass
+the policy by ignoring proxy settings or replacing the adapter. Every adapter
+and proxy uses the same HTTP interface, so the specification does not depend
+on a particular proxy, service mesh, or orchestration system. An optional
+application gateway can attach service credentials without giving the
+reusable key to the workload.
 
-TCP connections can target hostnames, IPv4 addresses, or IPv6 addresses. The
-boundary applies policy to each destination. UDP tunneling and ingress are
-optional.
+TCP connections can target hostnames, IPv4 addresses, or IPv6 addresses, and
+the boundary applies policy to each destination. UDP tunneling and ingress
+are optional.
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT", "SHOULD",
 "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and "OPTIONAL" in these
@@ -42,33 +44,35 @@ documents are to be interpreted as described in BCP 14 (RFC 2119, RFC 8174).
 | [registries.md](registries.md) | Roles and profiles, reason tokens, registries, implementation statement | Yes |
 | [schema/](schema/) | JSON Schema for the policy descriptor and audit record | Yes |
 
-Informative material is outside the specification: [rationale and
-alternatives](../../docs/rationale.md), [implementations and their
-status](../../docs/implementations.md), [test evidence](../../docs/evidence.md),
-the [conformance suite](../../conformance/README.md), and the
-[reference implementation](../../sdk/README.md).
+The following material is informative and is not part of the specification:
+[rationale and alternatives](../../docs/rationale.md), [implementations and
+their status](../../docs/implementations.md), [test
+evidence](../../docs/evidence.md), the [conformance
+suite](../../conformance/README.md), and the [reference
+implementation](../../sdk/README.md).
 
 ## 1. Components
 
 This specification uses the following terms:
 
-- **Sandbox:** An isolated, untrusted workload with no direct external network access. Its only networking is through one of the adapter paths below.
-- **Adapter:** The component that translates application traffic into CONNECT requests. It runs inside the sandbox with a TUN interface, or outside it terminating its NIC through a dedicated network namespace or isolated userspace packet backend, or exposes an explicit endpoint to proxy-aware clients ([adapters.md](adapters.md)). It has no authority to grant access.
-- **Boundary socket:** A dedicated, access-controlled endpoint assigned to one sandbox lifetime and policy. In the local model it is a pathname Unix stream socket.
+- **Sandbox:** An isolated, untrusted workload with no direct external network access. Its only network path is one of the adapter placements below.
+- **Adapter:** The component that translates application traffic into CONNECT requests. It can run inside the sandbox behind a TUN interface, outside the sandbox where the workload NIC terminates (a dedicated network namespace or an isolated userspace packet backend), or as an explicit endpoint for proxy-aware clients ([adapters.md](adapters.md)). The adapter has no authority to grant access.
+- **Boundary socket:** A dedicated, access-controlled endpoint assigned to one sandbox lifetime and one policy. In the local model it is a pathname Unix stream socket.
 - **Boundary proxy:** The external proxy that authorizes requests and opens upstream connections.
-- **Controller:** The trusted runtime or launcher that creates the sandbox, adapter environment, socket access, and policy binding. This is a responsibility, not a requirement for a separate control-plane service.
+- **Controller:** The trusted runtime or launcher that creates the sandbox, sets up the adapter environment and socket access, and binds the policy. The controller is a role that an existing runtime can fill; a separate control-plane service is not needed.
 - **Policy descriptor:** The JSON document that states what a sandbox may reach ([policy.md](policy.md)).
-- **Generation:** One lifetime of a sandbox under one policy binding; restarts and restores start a new generation.
+- **Generation:** One lifetime of a sandbox under one policy binding. A restart or a restore starts a new generation.
 
 ## 2. Network Path
 
 For each supported connection, the adapter sends the destination hostname or
 IP address and port to the boundary proxy. The proxy authorizes the request,
-resolves hostnames when needed, and connects to an allowed address. Denied
-requests fail at the tunnel handshake. The following diagram shows the TUN and
-namespace adapter paths. An isolated userspace VMM packet backend and an
-explicit loopback endpoint are other placements; all use the same boundary
-interface and destination-policy requirements.
+resolves the hostname when needed, and connects to an allowed address. A
+denied request fails at the tunnel handshake. The following diagram shows the
+TUN and namespace adapter paths. The adapter can also be placed in an
+isolated userspace VMM packet backend or exposed as an explicit loopback
+endpoint; every placement uses the same boundary interface and is subject to
+the same destination policy requirements.
 
 ```mermaid
 flowchart LR
@@ -89,20 +93,23 @@ flowchart LR
     Boundary -- "Authorized connection" --> Upstream["Upstream service"]
 ```
 
-The diagram shows alternatives for one sandbox, not a shared endpoint for
-unrelated sandboxes. In option A, the sandbox has no external NIC. In option B,
-its only NIC terminates in the proxy namespace, with no bridge or route to an
-external network. Changing guest routes does not create another exit.
+The two options in the diagram are alternative placements for a single
+sandbox. Both reach that sandbox's own boundary socket; unrelated sandboxes
+do not share an endpoint. In option A, the sandbox has no external NIC. In
+option B, its only NIC terminates in the proxy namespace, which has no bridge
+or route to an external network. In either option, changing routes inside the
+guest does not open another exit.
 
-For a VM using option A, a Unix socket is not directly accessible across the
-guest kernel. The runtime must provide a restricted channel, such as a dedicated
-VSOCK service bound to that VM's boundary socket. An unrestricted host VSOCK
-listener is not equivalent. VM channel provisioning is a deployment extension;
-the local container and namespace model does not require it.
+When option A runs in a VM, the guest cannot reach a host Unix socket
+directly, so the runtime must provide a restricted channel, such as a
+dedicated vsock service bound to that VM's boundary socket. An unrestricted
+host vsock listener is not a substitute. Provisioning this channel is a
+deployment extension; the local container and namespace model does not need
+it.
 
 Firecracker's virtio-vsock device provides such a channel without a relay
-process: guest connections to CID 2 port `P` are delivered to the host Unix
-socket `<uds_path>_P`, so the boundary listens directly on that path and the
+process. A guest connection to CID 2 port `P` is delivered to the host Unix
+socket `<uds_path>_P`, so the boundary listens directly on that path, and the
 guest can reach only the ports the controller chose to bind under that VM's
 prefix. Host-initiated connections to the guest go through `<uds_path>` with
 Firecracker's own `CONNECT <port>` handshake. A VMM that exposes host
@@ -111,10 +118,11 @@ Firecracker's own `CONNECT <port>` handshake. A VMM that exposes host
 
 ## 3. Roles
 
-Four roles can be implemented by different parties and combined: **boundary**,
-**adapter**, **controller**, and **ingress gateway**. Each has conformance
-profiles ([registries.md Section 1](registries.md#1-roles-and-profiles))
-verified by the [conformance suite](../../conformance/README.md).
+The specification defines four roles: **boundary**, **adapter**,
+**controller**, and **ingress gateway**. Different parties can implement
+them, and one implementation can combine several. Each role has conformance
+profiles ([registries.md Section 1](registries.md#1-roles-and-profiles)) that
+the [conformance suite](../../conformance/README.md) verifies.
 
 ## 4. Normative References
 

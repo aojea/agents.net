@@ -1,11 +1,13 @@
 <!-- Informative. Not part of the specification. -->
 # Implementations and Status
 
-**Informative.** Products appear here only with their validation status; the normative specification is [spec/draft](../spec/draft/index.md).
+**Informative.** This page records what has been built and how far each part
+has been checked. Products appear here only with their validation status. The
+normative specification is [spec/draft](../spec/draft/index.md).
 
-The examples below are not protocol dependencies. Support for CONNECT is distinct
-from compliance with this specification's identity, policy, and isolation
-requirements.
+None of the products below is a dependency of the protocol. A proxy that
+supports CONNECT does not, by that alone, meet this specification's identity,
+policy, and isolation requirements.
 
 | Capability | Current status |
 | --- | --- |
@@ -37,28 +39,29 @@ requirements.
 | Codex CLI `codex-network-proxy` | HTTP CONNECT and SOCKS5 forward proxy on host loopback with domain allow/deny lists (`*.example.com`, `**.example.com`), a read-only "limited" mode enforced by TLS termination with a proxy-held CA, and local/private address rejection | Source and README read on September 16, 2026 (`codex-rs/network-proxy`, `codex-rs/linux-sandbox` at `49305d7`). No local interoperability run. |
 
 The Codex CLI arrangement is the second column of the [comparison table](rationale.md#1-comparison-with-common-alternatives). Its Linux
-sandbox has two layers. Bubblewrap runs the command with `--unshare-net`; a
+sandbox has two layers. Bubblewrap runs the command with `--unshare-net`. A
 helper binds a loopback TCP listener inside that namespace, passes it over a
-Unix socket to a bridge process on the host, rewrites the proxy environment
-variables to that listener, and the bridge relays each accepted connection to
-the proxy after sending a per-command attribution token. A seccomp filter on
-the command then denies `ptrace`, `process_vm_readv`/`writev`, and `io_uring`,
-and in proxy mode permits `socket()` only for `AF_INET` and `AF_INET6`, so the
-command cannot open Unix sockets (only `socketpair`) unless the policy grants
-them; with networking disabled it denies `connect`, `bind`, `listen`,
-`accept`, `sendto`, and every socket family except `AF_UNIX`. The namespace
-removes external egress; the filter closes the paths a namespace does not
-cover, which this specification lists as runtime responsibilities in Section
-4.3. Only clients that honor the proxy variables reach the proxy. Its
-documentation states that hostnames resolving to local or private addresses
-are rejected by a best-effort lookup and that DNS rebinding is not fully
-prevented; the reference boundary here dials the address it checked. Whether
-this repository's clients interoperate with that proxy has not been tested.
+Unix socket to a bridge process on the host, and rewrites the proxy
+environment variables to point at that listener. The bridge relays each
+accepted connection to the proxy after sending a per-command attribution
+token. On top of that, a seccomp filter on the command denies `ptrace`,
+`process_vm_readv`/`writev`, and `io_uring`. In proxy mode the filter permits
+`socket()` only for `AF_INET` and `AF_INET6`, so the command cannot open Unix
+sockets (only `socketpair`) unless the policy grants them. With networking
+disabled it denies `connect`, `bind`, `listen`, `accept`, `sendto`, and every
+socket family except `AF_UNIX`. The namespace removes external egress, and
+the filter closes the paths a namespace does not cover, which this
+specification lists as runtime responsibilities in Section 4.3. Only clients
+that honor the proxy variables reach the proxy. The Codex documentation says
+that hostnames resolving to local or private addresses are rejected by a
+best-effort lookup and that DNS rebinding is not fully prevented. By contrast,
+the reference boundary here dials the address it checked. Whether this
+repository's clients interoperate with the Codex proxy has not been tested.
 
 The Envoy [example configuration](../sdk/examples/envoy-boundary.yaml) and
-[interop test](../sdk/test_envoy.sh) reproduce the Envoy result. A gateway that
-uses the same proxy internally still needs its own configuration and
-interoperability validation.
+[interop test](../sdk/test_envoy.sh) reproduce the Envoy result. A gateway
+that uses Envoy internally still needs its own configuration and its own
+interoperability run.
 
 Implementation references:
 

@@ -8,12 +8,13 @@
 
 ## 1. Method
 
-The same nine personas as the first round were run again as independent,
-read-only agent sessions, each given its earlier positions and their
-dispositions and asked to evaluate the current specification, reference, and
-conformance suite. No employee of any named organization participated. Every
-claim about the reference implementation was rechecked against the source
-before it was acted on; claims that did not survive are in Section 4.
+The same nine personas from the first round were run again as independent,
+read-only agent sessions. Each was given its earlier positions and their
+dispositions and asked to evaluate the current specification, reference
+implementation, and conformance suite. No employee of any named organization
+took part. Every claim about the reference implementation was rechecked
+against the source before anything was done about it. The claims that did not
+hold up are in Section 4.
 
 ## 2. Verdicts
 
@@ -69,14 +70,14 @@ before it was acted on; claims that did not survive are in Section 4.
   present in [wire.md §5.1](../spec/draft/wire.md#51-special-purpose-addresses)
   and in the reference's `nonPublic` list.
 - "The launcher accepts only `127.0.0.1`; IPv6 agents are excluded" (P2).
-  True at the time of review; resolved by item 7.
+  This was true at the time of the review and was resolved by item 7.
 - "Envoy passes only about 7% of `boundary-core` by configuration" (P6).
-  A plausible estimate, not a measurement; recorded as motivation for open
-  work item 7 in the roadmap.
+  This was an estimate, not a measurement. It is recorded as motivation for
+  open work item 7 in the roadmap.
 
 ## 5. Result
 
-After the changes above the reference passes all 60 automated
-`boundary-core` cases (two new depth cases), all Go tests, the demo
-presubmit, and the Firecracker and QEMU scenarios; fixtures validate against
-the updated schemas.
+After the changes above, the reference passes all 60 automated
+`boundary-core` cases (including the two new depth cases), all Go tests, the
+demo presubmit, and the Firecracker and QEMU scenarios. The fixtures validate
+against the updated schemas.

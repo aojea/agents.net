@@ -4,137 +4,164 @@
 **Status:** Draft
 
 This document defines how a boundary learns which sandbox a request belongs
-to and which policy applies. The wire ([wire.md](wire.md)) never carries
-identity; the channel does. Four bindings are defined: a dedicated listener
-(the baseline), a certificate-authenticated channel, a shared process with
-dedicated listeners, and VM channels.
+to and which policy applies. The identity of a request comes from the channel
+it arrives on; the wire protocol ([wire.md](wire.md)) has no field for it.
+Four bindings are defined: a dedicated listener (the baseline), a
+certificate-authenticated channel, a shared process with dedicated listeners,
+and VM channels.
 
 ## 1. Identity and Metadata
 
-- **Guest metadata:** Headers such as `Sandbox-Id` MAY carry telemetry. They MUST NOT select an identity or grant permissions. The boundary MUST discard or overwrite guest identity headers before passing identity to another trusted service. A boundary MAY copy such values into the audit record's `meta` object ([audit.md](audit.md)).
-- **Dedicated endpoint:** In the local model, the controller MUST bind the listener to one sandbox lifetime and policy. Socket access controls establish permission to use that policy. Peer credentials MAY provide additional audit or access checks; they are not required to rediscover an identity already fixed by the listener.
-- **Other transports:** A deployment using a shared listener or VM relay MUST provide an equivalent trusted binding. Unix peer credentials and VSOCK CIDs require a mapping that handles restarts and identifier reuse. The socket peer may be a runtime process rather than the application. These identifiers are not cryptographic attestation.
-- **Optional mTLS:** The channel MAY use mTLS with a deployment-issued workload certificate. The certificate format and issuing authority are deployment choices. The authenticated identity selects policy (Section 4). A shared session MUST NOT select different identities from untrusted per-stream headers.
+Headers set by the guest, such as `Sandbox-Id`, MAY carry telemetry. They
+MUST NOT select an identity or grant permissions. Before the boundary passes
+identity to another trusted service it MUST discard or overwrite any guest
+identity headers. A boundary MAY copy their values into the `meta` object of
+the audit record ([audit.md](audit.md)).
 
-Policy configuration and certificate issuance are outside the wire protocol.
-Implementation-specific filters, APIs, and route resources are not part of this
-specification.
+In the local model the controller MUST bind each listener to one sandbox
+lifetime and one policy. A process that can connect to the socket is
+permitted to use that policy; the socket's access controls are the permission
+check. Peer credentials MAY add audit detail or a further access check. They
+are not needed to establish an identity the listener already fixes.
+
+A deployment that uses a shared listener or a VM relay MUST provide a trusted
+binding equivalent to the dedicated listener. Unix peer credentials and vsock
+CIDs need a mapping that survives restarts and identifier reuse before they
+can name a sandbox. The peer on such a socket can be a runtime process rather
+than the application itself, and none of these identifiers is cryptographic
+attestation.
+
+The channel MAY use mTLS with a workload certificate issued by the
+deployment; the certificate format and the issuing authority are deployment
+choices. The authenticated identity then selects the policy (Section 4). A
+shared session MUST NOT select different identities from untrusted per-stream
+headers.
+
+Policy configuration and certificate issuance are outside the wire protocol,
+and implementation-specific filters, APIs, and route resources are not part of
+this specification.
 
 ## 2. Isolation and Channel Ownership
 
 The controller MUST exclude direct external routes, additional NICs, inherited
-host network sockets, unauthorized VSOCK services, and access to other
-workloads' boundary endpoints. Management interfaces and descriptor-transfer
-interfaces MUST NOT be exposed on workload data channels.
+host network sockets, unauthorized vsock services, and access to other
+workloads' boundary endpoints from the sandbox. Management interfaces and
+descriptor-transfer interfaces MUST NOT be exposed on workload data channels.
 
-In the local model, the controller MUST create a dedicated pathname Unix socket
-with a fixed sandbox and policy binding before exposing it to the adapter.
-Exclusive access to that listener is sufficient to select the assigned policy;
-the adapter does not need to prove its identity again. The boundary MUST NOT
-let a request select another listener's identity or policy.
+In the local model the controller MUST create a dedicated pathname Unix
+socket, bound to one sandbox and one policy, before exposing it to the
+adapter. Because only that sandbox's adapter can reach the listener,
+connecting to it is enough to select the assigned policy, and the adapter does
+not prove its identity again. The boundary MUST NOT let a request select
+another listener's identity or policy.
 
-Pathname socket access depends on filesystem permissions, mount visibility,
-and directory ownership. Network-namespace isolation alone does not protect a
-shared pathname. Abstract Unix sockets do not have filesystem permissions.
-Workloads MUST NOT be able to replace socket paths or modify boundary policy,
-credentials, logs, or executable files.
+Access to a pathname socket is governed by filesystem permissions, mount
+visibility, and directory ownership. A network namespace by itself does not
+protect a shared pathname, and abstract Unix sockets have no filesystem
+permissions at all. Workloads MUST NOT be able to replace socket paths or
+modify boundary policy, credentials, logs, or executable files.
 
-Only the assigned socket or its dedicated directory is exposed to the adapter,
-not a directory containing other workloads' sockets. Permissions must account
-for host UID/GID mappings and any capabilities that bypass filesystem checks.
-Several sandboxes running as the same host UID are not separated by a `0600`
-socket mode alone. The runtime MUST prevent alternate filesystem access,
-cross-process FD theft, and access to container/runtime management sockets.
-The namespace adapter needs these process and filesystem restrictions as well
-as its network namespace. Its namespace-local network capability does not
-justify unrestricted host privileges.
+The adapter sees only its assigned socket or the directory dedicated to it,
+never a directory that also holds other workloads' sockets. Permissions have
+to be evaluated against the host UID/GID mapping and against any capability
+that bypasses filesystem checks; a `0600` socket mode does not separate
+several sandboxes that run as the same host UID. The runtime MUST prevent
+alternate filesystem access, cross-process FD theft, and access to container
+or runtime management sockets. The namespace adapter needs these process and
+filesystem restrictions in addition to its network namespace; the network
+capability it holds inside that namespace is not a reason to grant it wider
+host privileges.
 
-`SO_PEERCRED` reports credentials associated with connection or socket-pair
-creation; passing an FD does not update those credentials to the new holder.
-It may support audit or an additional access check on a dedicated listener.
-If a deployment uses UIDs, PIDs, namespace handles, or VSOCK CIDs to select
-identity, it MUST map them through trusted controller state, handle reuse, and
-not treat them as globally unique tenant identities. VSOCK CID 1 is local
-communication, not VM attestation.
+`SO_PEERCRED` reports the credentials recorded when the connection or socket
+pair was created; passing the FD to another process does not update them. On
+a dedicated listener it can support audit or an additional access check. A
+deployment that selects identity from UIDs, PIDs, namespace handles, or vsock
+CIDs MUST map them through trusted controller state, handle reuse, and not
+treat them as globally unique tenant identities. vsock CID 1 is the local
+CID; it does not attest to a VM.
 
-Connected-FD provisioning is an optional alternative to pathname sockets.
-`SCM_RIGHTS` duplicates access to an open file description; it does not move a
-socket into another namespace or establish its holder's identity. A deployment
-using a registration service MUST authenticate and authorize its control peer,
-bind each endpoint to a sandbox lifetime and policy, validate descriptor
-count/type/state, reject truncated ancillary data, close unexpected descriptors,
-and prevent unintended inheritance. `SO_PASSCRED` with `SCM_CREDENTIALS` can
-authenticate local registration messages under Linux credential rules. Neither
-mechanism is required on the baseline CONNECT data channel.
+Passing a connected FD is an optional alternative to a pathname socket.
+`SCM_RIGHTS` duplicates access to an open file description; the socket stays
+in the namespace where it was created, and holding the descriptor establishes
+nothing about the holder's identity. A deployment that uses a registration
+service MUST authenticate and authorize its control peer, bind each endpoint
+to a sandbox lifetime and policy, validate descriptor count, type, and state,
+reject truncated ancillary data, close unexpected descriptors, and prevent
+unintended inheritance. `SO_PASSCRED` with `SCM_CREDENTIALS` can authenticate
+local registration messages under Linux credential rules. The baseline CONNECT
+data channel requires neither mechanism.
 
 ## 3. Listener-Bound Identity (`boundary-core`)
 
-Access to the listener selects the policy. A request field never selects
-identity. This is the baseline binding; every other binding in this document
-must provide an equivalent to it.
+In this binding the listener that accepted the connection selects the policy,
+and no request field can change that selection. It is the baseline; every
+other binding in this document has to provide an equivalent.
 
 ## 4. Certificate-Bound Identity (`boundary-tls`)
 
 ### 4.1 Authentication and Transport Integrity
 
 The local model relies on kernel access controls, runtime confinement, and the
-controller's fixed listener binding. It does not require mTLS, signed CONNECT
-requests, or a registration protocol between the adapter and boundary. Across an
-untrusted transport, the adapter and boundary MUST authenticate each other and
-protect traffic confidentiality and integrity. TLS is the reference mechanism.
-Transport protection applies to the outer channel; it does not authenticate
-the upstream application or inspect inner TLS traffic.
+controller's fixed listener binding, so it needs no mTLS, signed CONNECT
+requests, or registration protocol between adapter and boundary. When the
+transport between them is untrusted, the adapter and boundary MUST authenticate
+each other and protect the confidentiality and integrity of the traffic; TLS
+is the reference mechanism. This protection covers the outer channel only. It
+does not authenticate the upstream application and does not inspect TLS
+traffic inside the tunnel.
 
-For TLS deployments:
+In a TLS deployment:
 
-1. Verify certificate chains against configured trust anchors, validity periods, permitted algorithms, and the appropriate server/client extended key usage.
-2. Verify the expected boundary identity against a SAN. A client certificate must map to an authorized workload identity; a valid chain alone does not grant policy or tenant access. Ambiguous identity mappings MUST be rejected.
-3. Reject missing required client certificates, unknown issuers, expired or not-yet-valid certificates, and mismatched endpoint identities. Authentication failure MUST NOT fall back to plaintext or anonymous access.
-4. Require TLS 1.2 or later and prefer TLS 1.3. HTTP/2 over TLS MUST negotiate `h2` through ALPN. Verification must remain enabled in production.
-5. Define certificate rotation, compromise response, and revocation. Expiration does not automatically terminate an established TLS session. Session resumption MUST NOT bypass current identity, generation, or policy checks. Do not accept tunnel authorization in replayable TLS early data.
+1. Each side verifies the peer's certificate chain against configured trust anchors, validity periods, permitted algorithms, and the appropriate server or client extended key usage.
+2. The expected boundary identity is verified against a SAN. A client certificate has to map to an authorized workload identity; a valid chain by itself grants neither policy nor tenant access, and ambiguous identity mappings MUST be rejected.
+3. A missing client certificate where one is required, an unknown issuer, an expired or not-yet-valid certificate, or a mismatched endpoint identity is rejected. Authentication failure MUST NOT fall back to plaintext or anonymous access.
+4. TLS 1.2 or later is required and TLS 1.3 preferred. HTTP/2 over TLS MUST negotiate `h2` through ALPN. Verification stays enabled in production.
+5. The deployment defines certificate rotation, compromise response, and revocation. An established TLS session does not end when its certificate expires. Session resumption MUST NOT bypass current identity, generation, or policy checks, and tunnel authorization is not accepted in replayable TLS early data.
 
-TLS proves possession of a key and protects records against modification. It
-does not prove that an authenticated workload is uncompromised. A key stored
-inside an untrusted guest may be extracted or used by guest root. A certificate
-or signature supplied by that guest cannot attest to the integrity of its own
-CONNECT construction.
+TLS proves possession of a key and protects records against modification; it
+does not show that the authenticated workload is uncompromised. Guest root can
+extract or use a key stored inside an untrusted guest, so a certificate or
+signature supplied by that guest says nothing about how its CONNECT requests
+were constructed.
 
-A separate CONNECT signature is not required on an authenticated, protected
-channel. If a deployment uses signed delegation through intermediaries, the
-signature must bind the issuer, subject, audience, destination, port, transport,
-direction, generation, expiry, and replay context. The boundary still validates
-the request and applies local policy. Signing untrusted claims does not make
-their content safe.
+On an authenticated, protected channel no separate CONNECT signature is
+needed. A deployment that delegates through intermediaries with signed
+requests has to bind the signature to the issuer, subject, audience,
+destination, port, transport, direction, generation, expiry, and replay
+context. The boundary still validates the request and applies local policy,
+because a signature over untrusted claims does not make their content safe.
 
 ### 4.2 Identity Mapping
 
-A `boundary-tls` listener terminates TLS 1.2 or later with a
-deployment-issued server certificate. When it requires client certificates it
+A `boundary-tls` listener terminates TLS 1.2 or later with a server
+certificate issued by the deployment. When it requires client certificates it
 MUST verify the chain against configured anchors and the `clientAuth`
 extended key usage, derive the identity from the first URI SAN, else the
-first DNS SAN, else the Common Name, and look it up in controller-provided
-state that maps identity to policy. A missing or unmapped identity MUST be
-rejected with a TLS alert or a 403 `identity-unknown` before any request is
-authorized. All streams and requests on the session carry that identity.
-Session resumption MUST re-evaluate the mapping. The listener's own policy,
-if any, applies only to connections whose identity maps to it.
+first DNS SAN, else the Common Name, and look that identity up in
+controller-provided state that maps identities to policies. A missing or
+unmapped identity MUST be rejected with a TLS alert or a 403
+`identity-unknown` before any request is authorized. Every stream and request
+on the session carries the identity, and session resumption MUST re-evaluate
+the mapping. If the listener has a policy of its own, it applies only to
+connections whose identity maps to it.
 
-This binding is the HBONE-style arrangement: HTTP/2 CONNECT over mTLS with a
-SPIFFE URI SAN is one conforming instance.
+HTTP/2 CONNECT over mTLS with a SPIFFE URI SAN, as in HBONE, is one
+conforming instance of this binding.
 
 ## 5. Shared Process, Dedicated Listeners (`boundary-multi`)
 
 A boundary process serving several listeners MUST keep, per listener: the
 identity and generation, the policy descriptor, connection and stream
 budgets, idle and head deadlines, and the audit `listener`/`sandbox` labels.
-Budgets are configured by the controller per listener, outside the policy
+The controller configures budgets per listener, outside the policy
 descriptor. Exhaustion of one listener's budget MUST NOT cause another
 listener to refuse requests. Closing one listener MUST terminate its accepted
 connections and pending dials and MUST NOT affect other listeners. Policy
 replacement for one listener MUST be atomic with respect to requests on that
-listener and MUST be recorded with the new `policy` value. The process is a
-shared compromise boundary; deployments that isolate mutually untrusted
-workloads from a boundary compromise MUST NOT rely on this binding alone.
+listener and MUST be recorded with the new `policy` value. A compromise of
+the process reaches every listener it serves; deployments that need to
+isolate mutually untrusted workloads from a boundary compromise MUST NOT rely
+on this binding alone.
 
 ## 6. VM Channels (`controller-vm`)
 
@@ -145,6 +172,8 @@ workloads from a boundary compromise MUST NOT rely on this binding alone.
 | Hyper-V sockets (`AF_HYPERV`) | VM ID (GUID) observed on accept | Same rules as `AF_VSOCK` with the VM ID as the identifier |
 | Userspace packet backend (QEMU stream, similar) | The adapter is outside the guest; its boundary socket is listener-bound | Adapter confinement per Section 2; one packet channel per VM lifetime |
 
-Any identifier observed on accept is provenance, not attestation. The
-controller MUST record the mapping before the VM starts, revoke it before the
-identifier can be reused, and expose to each VM only the ports bound for it.
+An identifier observed on accept tells the boundary which channel a
+connection arrived on. It does not attest to the software running behind that
+channel. The controller MUST record the mapping before the VM starts, revoke
+it before the identifier can be reused, and expose to each VM only the ports
+bound for it.

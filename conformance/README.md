@@ -4,12 +4,15 @@
 **Tests:** [agents.net specification, version 1 (draft)](../spec/draft/index.md)  
 **Fixtures:** [fixtures/](fixtures/) — **Schemas:** [spec/draft/schema/](../spec/draft/schema/) — **Harness:** [harness/](harness/)
 
-A conformance claim names a role, one or more profiles, and this suite
-version, and is accompanied by the results file and the implementation
-statement of [registries.md §4](../spec/draft/registries.md#4-implementation-statement).
-"Conformant" means every case of the claimed profiles whose result is not
-`skip` has the result `pass`, and every item of the runtime audit checklist
-that applies to the role is recorded.
+This suite tests an implementation of one agents.net role (boundary,
+adapter, controller, or ingress gateway) against the draft specification.
+A conformance claim names the role, the profiles, and the suite version,
+and comes with two documents: the results file the harness writes and
+the implementation statement described in
+[registries.md §4](../spec/draft/registries.md#4-implementation-statement).
+The implementation is conformant when every case in the claimed profiles
+has the result `pass` or `skip` and you have recorded every item of the
+runtime audit checklist that applies to the role.
 
 ## 1. Terms
 
@@ -23,6 +26,9 @@ that applies to the role is recorded.
 | Observation | A fact the harness can see from outside the IUT: status, fields, bytes relayed, upstream accepts, audit lines, process state, packets |
 
 ## 2. Profiles and Groups
+
+Each profile is tested by one group of cases. The last column shows
+which of them harness 0.1 automates.
 
 | Profile | Group | Cases | Fixture | Automated in 0.1 |
 | --- | --- | --- | --- | --- |
@@ -40,13 +46,18 @@ that applies to the role is recorded.
 | `controller-snapshot` | C-SNAP | 01–02 | controller.json | No |
 | `ingress-gateway` | I-ING | 01–06 | [ingress.json](fixtures/ingress.json) | No |
 
-A profile's prerequisite profiles ([registries.md §1](../spec/draft/registries.md#1-roles-and-profiles)) must be claimed with it. Cases
-with `requires` are `skip` when the named capability is absent from the
-environment or the implementation statement (`ipv6`, `udp_enabled`,
-`synthetic_dns`, `socks5`, `diagnostics`, `snapshot`,
-`two_sandboxes`).
+A profile's prerequisite profiles, listed in
+[registries.md §1](../spec/draft/registries.md#1-roles-and-profiles),
+must be claimed along with it. Some cases carry a `requires` list naming
+a capability (`ipv6`, `udp_enabled`, `synthetic_dns`, `socks5`,
+`diagnostics`, `snapshot`, or `two_sandboxes`). When the environment or
+your implementation statement lacks that capability, the case's result
+is `skip`.
 
 ## 3. Harness Architecture
+
+The harness reads the fixtures, starts and stops the IUT through the
+driver, sends requests, and writes one result line per case:
 
 ```text
                        +----------------------------+
@@ -66,26 +77,35 @@ environment or the implementation statement (`ipv6`, `udp_enabled`,
 
 ### 3.1 Boundary Role
 
-The harness owns:
+The harness runs the upstream, the resolver, the audit reader, and the
+request clients described below. You write the driver that starts and
+stops the IUT.
 
-- **Upstream**: an echo listener on `127.0.0.1` and, when available, `[::1]`
-  on one port `{port}`. It counts accepted connections. A case's `dials` is
-  the number of accepts attributable to that case.
-- **Resolver**: a DNS server the harness runs and the IUT is configured to
-  use; the driver receives its address in the hints file as
-  `{"dns": "127.0.0.1:PORT"}`. It answers A and AAAA for the names a
-  `dns` case defines (successive answers for rebinding), returns no data for
-  other types, and NXDOMAIN for unknown names; it counts queries per name
-  and type for `dns_queries_max`. Other cases steer names with the
-  descriptor's `resolve` lists and with `localhost`, which the system hosts
-  file maps to loopback.
-- **Audit capture**: the driver writes the IUT's audit lines to a file; the
-  harness reads the lines appended during each case and validates each
-  against [audit.schema.json](../spec/draft/schema/audit.schema.json).
-- **Clients**: raw HTTP/1.1 over TCP; HTTP/2 prior knowledge; connect-udp
-  capsule client; TLS client with the certificate set named by the case.
+The upstream is an echo listener on `127.0.0.1` and, when IPv6 loopback
+is available, on `[::1]`, both on the same port `{port}`. It counts the
+connections it accepts; a case's `dials` is the number of accepts
+attributable to that case.
 
-The driver owns the IUT. Its contract:
+The resolver is a DNS server the harness runs. The driver receives its
+address in the hints file as `{"dns": "127.0.0.1:PORT"}` and configures
+the IUT to use it. The resolver answers A and AAAA queries for the names
+a `dns` case defines, and when the case tests rebinding it returns the
+successive answers the case lists. Other record types get no data, and
+unknown names get NXDOMAIN. It counts queries per name and type so the
+harness can check `dns_queries_max`. The other cases steer names without
+the resolver: the descriptor's `resolve` lists map names to addresses,
+and `localhost` reaches loopback through the system hosts file.
+
+The driver writes the IUT's audit lines to the file the harness names.
+After each case the harness reads the lines appended during that case
+and validates each one against
+[audit.schema.json](../spec/draft/schema/audit.schema.json).
+
+The clients are raw HTTP/1.1 over TCP, HTTP/2 with prior knowledge, a
+connect-udp capsule client, and a TLS client that presents the
+certificate set the case names.
+
+The driver follows this contract:
 
 ```text
 driver start <policy.json> <listen-url> <audit-path> <hints.json>
@@ -96,21 +116,24 @@ driver stop
     IUT exited; audit file complete
 ```
 
-`listen-url` is `tcp://127.0.0.1:PORT` or `unix:///path`. The hints object
-may contain `max_connections`, `max_streams`, `wire` (`h1` or `h2`), `dns`,
-and `tls` (paths of server certificate, key, and client CA for `boundary-tls`).
+`listen-url` is either `tcp://127.0.0.1:PORT` or `unix:///path`. The
+hints file is a JSON object that may contain `max_connections`,
+`max_streams`, `wire` (`h1` or `h2`), `dns`, and `tls` (the paths of the
+server certificate, key, and client CA that `boundary-tls` uses).
 
 ### 3.2 Adapter Role
 
-The harness plays the boundary. It listens on the channel the controller
-assigned to the sandbox, runs the workload probe inside the sandbox through
-the IUT's normal launch path, records audit lines for its own decisions, and
-where a case says `harness_boundary`, produces the named response. Packet
-counts on host interfaces other than the boundary channel are observations
-for `external_packets`.
+For the adapter role the harness stands in for the boundary. It listens
+on the channel the controller assigned to the sandbox and launches the
+workload probe inside the sandbox through the IUT's normal launch path.
+It writes audit lines for its own decisions, and when a case sets
+`harness_boundary` it returns the response that field names. For
+`external_packets` it counts packets on every host interface other than
+the boundary channel.
 
-The probe is any executable that honors this contract, so that every
-provider runs the same cases:
+The probe runs inside the sandbox and exercises the adapter. Any
+executable that follows this contract can serve as the probe, which lets
+every provider run the same cases:
 
 | Input | Meaning |
 | --- | --- |
@@ -126,20 +149,23 @@ provider runs the same cases:
 | Exit 3 | The probe could not run (missing inputs) |
 | Standard output | One JSON object per case: `{"id", "result": "pass"\|"fail"\|"skip", "elapsed_ms", "detail"}` |
 
-The harness correlates the probe's lines with its own audit records to
-produce the case results.
+The harness combines the probe's output lines with its own audit records
+to produce the case results.
 
 ### 3.3 Controller and Ingress Roles
 
-The harness drives the controller's public interface (command line, API, or
-SDK) to create sandboxes A and B with the fixture's policies, then observes
-sockets, processes, audit files, and packet captures as each case states.
-For the ingress role the harness plays the gateway on the ingress channel.
-Cases that require a packet capture (C-LOCAL-05) or inspection of the
-adapter's process environment (C-LOCAL-07) are procedures the claimant
-executes and reports; harness 0.1 does not automate them.
+For the controller role the harness drives whatever public interface the
+controller offers (command line, API, or SDK) to create two sandboxes, A
+and B, with the fixture's policies. It then inspects sockets, processes,
+audit files, and packet captures as each case directs. For the ingress
+role the harness plays the gateway on the ingress channel. Two controller
+cases are procedures you run and report yourself, because harness 0.1
+does not automate them: C-LOCAL-05 needs a packet capture, and
+C-LOCAL-07 inspects the adapter's process environment.
 
 ## 4. Fixture Format
+
+A fixture is a JSON file of cases. Each case looks like this:
 
 ```json
 {
@@ -169,14 +195,16 @@ executes and reports; harness 0.1 does not automate them.
 | `expect.audit` | Subset of the last audit record written during the case; a list value accepts any member; `address_not_in` lists prefixes the dialed address must not start with |
 | `expect.proxy_status` | Parameters the `Proxy-Status` member must carry |
 
-Placeholders: `{port}`, `{upstream4}`, `{upstream6}`, `{payload}`, `{nested}`,
-`{pad}` as listed in each fixture's `placeholders`. Adapter and controller
-fixtures use `{target4}`, `{target6}`, `{udp_enabled}` for the harness
-boundary's upstream and configuration.
+The harness substitutes placeholders before it sends a request or renders
+a descriptor. The boundary cases use `{port}`, `{upstream4}`,
+`{upstream6}`, `{payload}`, `{nested}`, and `{pad}`, listed in the
+fixture's `placeholders` object. Adapter and controller fixtures use
+`{target4}`, `{target6}`, and `{udp_enabled}` for the harness boundary's
+upstream addresses and configuration.
 
 ## 5. Pass Criteria
 
-For every automated case:
+The harness marks an automated case `pass` when all of the following hold:
 
 1. The status matches `expect.status`.
 2. Every non-2xx response carries exactly one `Proxy-Status` field with one
@@ -189,16 +217,17 @@ For every automated case:
 5. Every audit line written during the case validates against the schema,
    and the last one contains `expect.audit`.
 
-A case whose driver reported exit 3 is `unsupported`, which counts as `fail`
-for a conformance claim of that profile.
+If the driver exits 3 for a case's descriptor, the case is
+`unsupported`. In a conformance claim for that profile, `unsupported`
+counts as `fail`.
 
 ## 6. Runtime Audit Checklist
 
-These properties are not observable through the wire and are recorded per
-deployment by inspection. A controller or adapter claim lists each item with
-the evidence used. The items name the control, not a Linux mechanism; the
-evidence column gives Linux and macOS examples, and another platform
-supplies its own.
+The wire tests can't observe these properties, so you verify them by
+inspecting the deployment. A controller or adapter claim lists each item
+together with the evidence used. Each item names a control rather than a
+platform mechanism; the evidence column gives Linux and macOS examples,
+and on another platform you supply the equivalent.
 
 | # | Item | Evidence |
 | --- | --- | --- |
@@ -215,8 +244,9 @@ supplies its own.
 
 ## 7. Running the Harness
 
-Version 0.1 automates the HTTP/1.1 boundary groups, including the resolver
-cases. Against the reference boundary:
+Harness 0.1 automates the HTTP/1.1 boundary cases (`h1`, `h1-busy`, and
+`h1-proxystatus`) and the `dns` resolver cases. To run it against the
+reference boundary:
 
 ```bash
 python3 conformance/harness/run_boundary.py \
@@ -225,35 +255,41 @@ python3 conformance/harness/run_boundary.py \
 ```
 
 The [reference driver](harness/drivers/connect-proxy.sh) builds
-`connect-proxy` on first use (or uses `$CONNECT_PROXY`) and starts it with
-`-policy <descriptor>`; the hints `dns`, `max_connections`, `max_streams`,
-`wire`, `generation`, and `tls` map to the corresponding flags. Another
-implementation conforms to the same contract with its own driver; nothing
-else in the harness is specific to the reference.
+`connect-proxy` on first use, or uses the binary named by
+`$CONNECT_PROXY`, and starts it with `-policy <descriptor>`. It translates
+the hints `dns`, `max_connections`, `max_streams`, `wire`, `generation`,
+and `tls` into the corresponding flags. The driver is the only part of
+the harness that is specific to the reference. To test your own
+implementation, write a driver that follows the contract in section 3.1
+and pass it with `--driver`.
 
 [check_fixtures.py](harness/check_fixtures.py) validates every fixture
-descriptor and the audit examples against the schemas (requires the
-`jsonschema` package). The [conformance workflow](../.github/workflows/conformance.yml)
-runs both on every change to the suite, the schemas, or the reference.
+descriptor and the audit examples against the schemas. It needs the
+`jsonschema` package. The [conformance workflow](../.github/workflows/conformance.yml)
+runs the harness and the fixture check on every change to the suite, the
+schemas, or the reference.
 
-Result at this revision of the reference: every automated `boundary-core`
-case passes (60); B-CORE-49 is `manual`.
+At this revision of the reference, all 60 automated `boundary-core` cases
+pass and B-CORE-49 is reported as `manual`.
 
 ## 8. Reporting
 
-The results file has one JSON object per case:
+The harness writes one JSON object per case to the results file:
 
 ```json
 {"id": "B-CORE-37", "group": "boundary-core", "result": "pass", "detail": ""}
 ```
 
-`result` is `pass`, `fail`, `skip`, `unsupported`, or `manual`. A claim
-consists of the results file, the implementation statement, and the suite
-version. Claims are stated as "conforms to agents.net `boundary-core`,
-`boundary-h2` at suite 0.1". A `manual` case is reported with the procedure
-followed and the observation, in the implementation statement's `results`.
+`result` is one of `pass`, `fail`, `skip`, `unsupported`, or `manual`. A
+claim is worded "conforms to agents.net `boundary-core`, `boundary-h2` at
+suite 0.1" and comes with the results file and the implementation
+statement. For each `manual` case, record in the implementation
+statement's `results` the procedure you followed and what you observed.
 
 ## 9. Existing Evidence
+
+Where a case is also exercised by a test or scenario in this repository,
+this table names it.
 
 | Cases | Repository evidence |
 | --- | --- |

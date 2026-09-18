@@ -1,16 +1,16 @@
 # agents.net the Hard Way
 
-Bootstrap a Zero-Network Sandbox from scratch, one command at a time.
+Build a zero-network sandbox from scratch, one command at a time.
 
-This tutorial walks through the [agents.net](../README.md) reference implementation ([sdk/](../sdk/README.md)) end to end. By the end you will have run a real, unmodified agent harness inside a container with **`--network none`**, confined by a launcher injected at `docker run` time, and watched every flow it makes cross a single Unix socket as a named HTTP `CONNECT` tunnel -- [the spec's egress wire](../spec/draft/wire.md) -- where it is checked against policy and audited on the host. A bonus section at the end swaps the boundary for other CONNECT-terminating implementations, including an unmodified Envoy.
+This tutorial walks through the [agents.net](../README.md) reference implementation ([sdk/](../sdk/README.md)) end to end. You'll run an unmodified agent harness in a container started with **`--network none`**, confined by a launcher that is injected at `docker run` time. Every connection the harness opens crosses one Unix socket as a named HTTP `CONNECT` tunnel ([the spec's egress wire](../spec/draft/wire.md)), and the host checks it against policy and writes an audit line. A later section swaps the boundary for other CONNECT-terminating implementations, including an unmodified Envoy.
 
-Read the [agents.net specification](../spec/draft/index.md) first for the *why* (the sandbox definition, the egress boundary interface, the TLS inspection models, the ingress interface, the security model, and the decision matrix). This doc is the *how*.
+Read the [agents.net specification](../spec/draft/index.md) first; it covers the sandbox definition, the egress boundary interface, the TLS inspection models, the ingress interface, the security model, and the decision matrix. This tutorial assumes that background and concentrates on running the pieces.
 
-Everything here runs against a free, local model server ([Ollama](https://ollama.com)) by default, so you can work through the whole tutorial without a paid API key or a dependency on any single model provider. A final section shows how to point the exact same image at a real hosted provider instead, using the same credential-injection tier rather than a key baked into the image -- with no rebuild and no change to the run command.
+By default everything runs against a local model server ([Ollama](https://ollama.com)), so you don't need a paid API key or an account with any model provider. A later section points the same image at a hosted provider through the boundary's credential-inject tier; the key stays on the host, and neither the image nor the run command changes.
 
 ## Target Audience
 
-This tutorial is for engineers building or evaluating sandboxes for autonomous agents, who want to see the "a route and a socket, not a routed network" architecture actually run, rather than just read about it.
+This tutorial is for engineers who build or evaluate sandboxes for autonomous agents and want to see the architecture run rather than only read about it. In this architecture the sandbox gets a route and a socket instead of a routed network.
 
 ## What You'll Build
 
@@ -37,22 +37,22 @@ flowchart LR
     ext["External Client (curl)"] -- "POST http://localhost:9000/webhook" --> proxy
 ```
 
-Four allow-list tiers, enforced entirely on the host side, decided on destination *names*, with the container never holding a routable network interface, a resolvable DNS path, or a real secret. The image knows nothing about agents.net; the launcher is injected at run time (the spec's recommended entrypoint injection).
+The host boundary decides every flow by destination *name* against four allow-list tiers. The container never has a routable network interface, a path to a real DNS resolver, or a real secret, and the image knows nothing about agents.net: the launcher is injected at run time, which is the entrypoint injection the spec recommends.
 
 ![agents.net terminal demo](terminal-demo.gif)
 
 ## Prerequisites
 
 - Docker
-- `openssl`, `sh`/`bash`, `python3` (no third-party Python packages required -- `host_proxy.py` only uses the standard library)
-- Go (or just Docker: Lab 3 shows both ways to build the launcher)
-- [Ollama](https://ollama.com) running as a normal (non-sandboxed) container on the host, published to loopback only -- see Lab 1. No paid API key, no account, no vendor lock-in.
+- `openssl`, `sh`/`bash`, `python3` (`host_proxy.py` uses only the standard library, so no third-party Python packages)
+- Go, or Docker alone (Lab 3 shows both ways to build the launcher)
+- [Ollama](https://ollama.com) running as an ordinary, unsandboxed container on the host, published to loopback only (Lab 1). No API key or account is needed.
 
-All commands below are run from the repository root unless noted otherwise.
+Run all commands from the repository root unless noted otherwise.
 
 ## Lab 1: Start the Local Model Provider (Ollama)
 
-The agent harness needs a model to talk to. Run Ollama as an ordinary Docker container -- it is **not** part of the sandbox and has completely normal networking; only the host boundary will ever talk to it on the sandbox's behalf:
+The agent harness needs a model to talk to. Run Ollama as an ordinary Docker container with normal networking. It is **not** part of the sandbox; the host boundary is the only thing that will talk to it on the sandbox's behalf:
 
 ```bash
 docker run -d --name ollama \
@@ -63,9 +63,9 @@ docker run -d --name ollama \
 docker exec ollama ollama pull qwen2.5:0.5b
 ```
 
-`-p 127.0.0.1:11434:11434` publishes Ollama to the host's loopback interface only -- not to the LAN, and not on a Docker network shared with the sandbox. The sandboxed container will never be able to reach it directly (it has no network interface at all); only `host_proxy.py`, running with normal host networking, dials `127.0.0.1:11434` on the sandbox's behalf. This is the same "the boundary holds the thing the sandbox isn't trusted with" pattern as `CREDENTIAL_HOSTS`, just with a real address instead of a real secret.
+`-p 127.0.0.1:11434:11434` publishes Ollama on the host's loopback interface only, not on the LAN and not on a Docker network the sandbox could share. The sandboxed container has no network interface at all, so it can't reach Ollama directly; `host_proxy.py`, running with normal host networking, dials `127.0.0.1:11434` for it. This is the same arrangement as `CREDENTIAL_HOSTS` later on: the boundary holds something the sandbox isn't trusted with, in this case an address rather than a secret.
 
-`qwen2.5:0.5b` (397 MB) is lightweight and fast, making the reference demo easy to run on any laptop without heavy memory requirements. Larger models can also be specified in [agent.py](agent.py) and [Dockerfile](Dockerfile) if desired.
+`qwen2.5:0.5b` (397 MB) is small and fast enough to run the demo on a laptop without much memory. You can pick a larger model in [agent.py](agent.py) and [Dockerfile](Dockerfile).
 
 **Verify:**
 
@@ -83,10 +83,10 @@ The host boundary terminates TLS locally for its fake-response tier, so it needs
 
 This creates:
 
-- `demo/certs/agent-ca.pem` / `agent-ca.key` — the demo root CA. The [Dockerfile](Dockerfile) bakes `agent-ca.pem` into the sandbox image's system trust store at build time (the trust-store coordination from the spec's [TLS inspection models](../spec/draft/gateway.md#1-tls-inspection-and-verification-models)), so run this lab **before** Lab 5.
-- `demo/certs/agent-mitm.pem` / `agent-mitm.key` — a single leaf certificate with a `SAN` entry per host the boundary needs to terminate TLS for (`example.com` by default). The leaf never enters the image -- it lives host-side only, which is why adding TLS-inspected hosts later needs no rebuild.
+- `demo/certs/agent-ca.pem` / `agent-ca.key`: the demo root CA. The [Dockerfile](Dockerfile) bakes `agent-ca.pem` into the image's system trust store at build time (the trust-store coordination described in the spec's [TLS inspection models](../spec/draft/gateway.md#1-tls-inspection-and-verification-models)), so run this lab **before** Lab 5.
+- `demo/certs/agent-mitm.pem` / `agent-mitm.key`: one leaf certificate with a `SAN` entry for each host the boundary terminates TLS for (`example.com` by default). The leaf stays on the host and never enters the image, so adding TLS-inspected hosts later needs no rebuild.
 
-A single cert with multiple exact `SAN` entries is used instead of a wildcard: `*.example.com` matches one subdomain label and never the bare apex `example.com` itself. Since this is a private demo CA (not bound by public CA/Browser-Forum wildcard rules), listing exact hostnames is simpler and fully general -- pass extra hostnames as arguments to cover more, e.g. `./demo/gen_certs.sh api.openai.com` (needed later, only for the cloud-migration bonus).
+The script lists exact hostnames as `SAN` entries rather than using a wildcard, because `*.example.com` matches one subdomain label and not the bare apex `example.com`. A private demo CA isn't bound by the CA/Browser Forum's wildcard rules, so exact names are the simpler choice and cover any host you add. Pass extra hostnames as arguments, for example `./demo/gen_certs.sh api.openai.com`; you'll need that only for the cloud-migration bonus.
 
 **Verify:**
 
@@ -98,20 +98,20 @@ Expected output includes `DNS:example.com`.
 
 ## Lab 3: Build the Launcher
 
-The launcher is this repo's [tun2connect](../sdk/) in its `run` mode: a dependency-free static binary that becomes PID 1, terminates the sandbox's TCP in userspace (gVisor), answers DNS with invented addresses, and opens one named HTTP `CONNECT` tunnel per flow on the boundary socket. Build it once:
+The launcher is this repo's [tun2connect](../sdk/) in its `run` mode, a static binary with no runtime dependencies. It becomes PID 1, terminates the sandbox's TCP in userspace with gVisor's netstack, answers DNS queries with invented addresses, and opens one named HTTP `CONNECT` tunnel per flow on the boundary socket. Build it once:
 
 ```bash
 CGO_ENABLED=0 go -C sdk build -o "$PWD/demo/tun2connect" ./cmd/tun2connect
 ```
 
-(No Go toolchain on the host? Build it hermetically in a container instead:)
+If there is no Go toolchain on the host, build it in a container instead:
 
 ```bash
 docker run --rm -v "$PWD":/src -w /src/sdk -e CGO_ENABLED=0 \
   golang:1.26 go build -o /src/demo/tun2connect ./cmd/tun2connect
 ```
 
-**Verify** -- it is static (runs in any image, including scratch) and prints its usage:
+**Verify** that the binary is static (so it runs in any image, including scratch) and prints its usage:
 
 ```bash
 file demo/tun2connect | grep "statically linked"
@@ -120,10 +120,10 @@ file demo/tun2connect | grep "statically linked"
 
 ## Lab 4: Understand and Start the Host Boundary
 
-[host_proxy.py](host_proxy.py) is the demo enforcement point: an HTTP CONNECT
-proxy on a Unix Domain Socket. Requests carry a hostname when the adapter has a
-DNS mapping, or an IP address otherwise. This demo allows the hostnames in the
-following tiers:
+[host_proxy.py](host_proxy.py) is the demo's enforcement point, an HTTP CONNECT
+proxy on a Unix domain socket. Each request names a hostname when the launcher
+has a DNS mapping for the destination, and an IP address otherwise. The demo
+policy sorts allowed hostnames into four tiers:
 
 | Tier | Example hosts | What happens | Configured via |
 | --- | --- | --- | --- |
@@ -133,20 +133,22 @@ following tiers:
 | **Credential-inject**, opt-in | `api.openai.com` | TLS terminated locally, the agent's `Authorization` header (empty, placeholder, or garbage) is stripped and replaced with the real `Bearer <token>`, then genuinely relayed upstream with the real system trust store. Empty/unconfigured by default -- see the cloud-migration section at the end of this tutorial. | `AGENT_PROXY_TOKENS="host=ENV_VAR_NAME,..."` |
 
 Anything not on the four lists is refused with `403 Forbidden` and a
-`Proxy-Status` field carrying the reason, and logged. The guest sees a connection failure. This
-demo policy denies IP literals; that is not a protocol or adapter restriction.
-The [Go boundary](../sdk/cmd/connect-proxy/main.go) accepts explicitly
-authorized addresses and CIDRs through `ip` and `cidr` rules in its
-[policy descriptor](../spec/draft/policy.md), and unlike this demo it
-also resolves allowed hostnames itself and refuses non-public results.
+`Proxy-Status` field that carries the reason, and the refusal is logged. Inside
+the sandbox the agent sees a failed connection. The demo policy also refuses IP
+literals, but that is a choice of this sample policy rather than a limit of the
+protocol or the launcher: the [Go boundary](../sdk/cmd/connect-proxy/main.go)
+accepts addresses and CIDRs through `ip` and `cidr` rules in its
+[policy descriptor](../spec/draft/policy.md). Unlike this demo, it also
+resolves allowed hostnames itself and refuses results that aren't public
+addresses.
 
-Start the boundary on the host. For the local-only demo in this tutorial, no credentials are needed at all:
+Start the boundary on the host. The local-only demo needs no credentials:
 
 ```bash
 python3 demo/host_proxy.py
 ```
 
-**Verify** -- the startup banner should show all four allow-lists:
+**Verify** that the startup banner shows all four allow-lists:
 
 ```text
 [*] Host Boundary (HTTP CONNECT) listening on: /tmp/agent-sockets/egress-proxy.sock
@@ -157,27 +159,27 @@ python3 demo/host_proxy.py
 [*] Audit log: /tmp/agent-proxy-audit.log
 ```
 
-An empty `Credential-inject allow-list: {}` is expected and correct here -- that tier is opt-in, for the cloud-migration bonus later. Leave the boundary running in this terminal (or run it under `&`/a separate pane) for the rest of the tutorial.
+`Credential-inject allow-list: {}` is expected: that tier is opt-in and only used in the cloud-migration bonus. Leave the boundary running in this terminal, or in the background with `&` or a separate pane, for the rest of the tutorial.
 
 ## Lab 5: Build the Sandbox Image
 
-[Dockerfile](Dockerfile) installs the harness dependencies, copies in the demo's [agent.py](agent.py), and bakes the demo CA into the system trust store. Deliberately, it contains **no launcher, no proxy variables, no bridge scripts, no socket paths** -- the image knows nothing about agents.net:
+The [Dockerfile](Dockerfile) installs the harness dependencies, copies in the demo's [agent.py](agent.py), and bakes the demo CA into the system trust store. It contains **no launcher, no proxy variables, no bridge scripts, and no socket paths**; the image knows nothing about agents.net:
 
 ```bash
 docker build -t agentsnet-demo demo/
 ```
 
-**Verify** -- run it *without* the launcher and watch the zero-network sandbox fail closed:
+**Verify** by running the image *without* the launcher; the zero-network sandbox fails closed:
 
 ```bash
 docker run --rm --network none agentsnet-demo
 ```
 
-Every connection attempt fails immediately: no `eth0`, no route, no resolver. This is the starting point the launcher builds on -- the isolation comes from the runtime, not from a firewall rule -- and the launcher will now build the only way out of it.
+Every connection attempt fails at once, because the container has no `eth0`, no route, and no resolver. The isolation comes from the runtime rather than from a firewall rule. The launcher starts from this state and adds the only way out.
 
 ## Lab 6: Run the Agent Behind the Injected Launcher
 
-Now run it for real. The launcher is injected at run time (the spec's recommended **entrypoint injection**): the binary is bind-mounted read-only, `--entrypoint` wraps the image's command, and three flags provide what the [egress boundary interface](../spec/draft/wire.md#1-egress-boundary-interface) needs -- no network, a tun device, and the socket directory:
+Now run the agent behind the launcher. This is the **entrypoint injection** the spec recommends: the launcher binary is bind-mounted read-only, `--entrypoint` puts it in front of the image's command, and three flags supply what the [egress boundary interface](../spec/draft/wire.md#1-egress-boundary-interface) needs, namely no network, a tun device, and the socket directory:
 
 ```bash
 docker run --rm \
@@ -191,13 +193,13 @@ docker run --rm \
   python3 /demo/agent.py "Fetch https://example.com and report its status code."
 ```
 
-Note what is missing: no `-e` flag with an API key, **no proxy environment variables, no compatibility switches**. The harness runs exactly as it would on a normal network -- ordinary sockets, DNS and HTTP -- and is confined anyway. `tun2connect run` becomes PID 1, refuses to start if any interface besides loopback and its own tun exists, builds `tun0` as the only route, and delivers every flow to `host_proxy.py` as a named HTTP `CONNECT` tunnel.
+The command passes no `-e` flag with an API key, **no proxy environment variables, and no compatibility switches**. The harness runs exactly as it would on a normal network, with ordinary sockets, DNS, and HTTP, and is confined anyway. `tun2connect run` becomes PID 1, refuses to start if any interface other than loopback and its own tun exists, configures `tun0` as the only route, and delivers every flow to `host_proxy.py` as a named HTTP `CONNECT` tunnel.
 
-The agent will resolve and call `ollama` (a name that exists nowhere but in the boundary's config), complete its task against `example.com` (answered locally with the canned response, trusted via the baked-in demo CA), and any other destination it tries is refused with a clean connection error.
+The agent resolves and calls `ollama`, a name that exists only in the boundary's configuration. It completes its task against `example.com`, which the boundary answers locally with the canned response over TLS that the container trusts because of the baked-in demo CA. Any other destination it tries is refused with a plain connection error.
 
 ## Lab 7: Read the Audit Trail
 
-While (or after) Lab 6 runs, tail the audit log on the host:
+While Lab 6 runs, or after it finishes, tail the audit log on the host:
 
 ```bash
 tail -f /tmp/agent-proxy-audit.log
@@ -213,15 +215,15 @@ A representative run looks like this:
 
 Reading it line by line:
 
-- **`ALLOW-LOCAL ollama:11434`** -- the harness's model call, relayed to the operator's Ollama. The name `ollama` arrived intact through virtual DNS; only the boundary knows the real address.
-- **`ALLOW-FAKE example.com:443`** -- the demo's task target, TLS terminated locally and answered with a canned response, never touching the real internet.
-- **`BLOCK secret-vault.example:443`** -- deny-by-default at work: refused with `403` and a `Proxy-Status` reason, seen by the agent as a connection error, and recorded here. Each flow gets one decision and one log line.
+- **`ALLOW-LOCAL ollama:11434`**: the harness's model call, relayed to your Ollama container. The name `ollama` arrived intact through the launcher's virtual DNS, and only the boundary knows the real address.
+- **`ALLOW-FAKE example.com:443`**: the demo's task target. The boundary terminated TLS locally and answered with a canned response; nothing went to the real internet.
+- **`BLOCK secret-vault.example:443`**: a destination on none of the lists. The boundary refused it with `403` and a `Proxy-Status` reason, the agent saw a connection error, and the attempt was recorded here. Each flow gets one decision and one log line.
 
-Because the launched command is just a normal non-interactive invocation, the same image can be reused with a different prompt by changing the trailing arguments, no rebuild required.
+The launched command is an ordinary non-interactive invocation, so you can reuse the image with a different prompt by changing the trailing arguments; no rebuild is needed.
 
 ## Lab 8 (Optional): Ingress -- Deliver a Webhook Into the Sandbox
 
-Ingress uses a second Unix socket, served from *inside* the sandbox by the launcher. `--ingress-port` pins the loopback ports (one or more, comma-separated) ingress streams may reach; the launcher refuses to start without it, and a `CONNECT` naming any other port is answered `403` with `Proxy-Status: ingress; error=http_request_denied; reason=port-not-permitted`. Note that both flags must come **before** the boundary-socket argument: the launcher stops parsing flags at the first positional argument, so everything after it is passed to the agent untouched:
+Ingress uses a second Unix socket, which the launcher serves from *inside* the sandbox. `--ingress-port` pins the loopback ports (one or more, comma-separated) that ingress streams may reach. When `--ingress-socket` is given without it, the launcher refuses to start, and a `CONNECT` that names any other port is answered `403` with `Proxy-Status: ingress; error=http_request_denied; reason=port-not-permitted`. Both flags must come **before** the boundary-socket argument, because the launcher stops parsing flags at the first positional argument and passes everything after it to the agent untouched:
 
 ```bash
 docker run --rm \
@@ -242,13 +244,13 @@ From another terminal, deliver a webhook through the boundary's public ingress g
 curl -s -X POST -d 'deploy finished' http://localhost:9000/webhook
 ```
 
-The boundary dials the sandbox's ingress socket, performs the [ingress handshake](../spec/draft/ingress.md#2-wire) (`CONNECT 127.0.0.1:8081 HTTP/1.1` answered `200`; a microVM offers the identical channel over vsock), and the launcher joins the stream to the agent's loopback listener. The agent prints the delivered payload; the audit log records the `INGRESS` line.
+The boundary dials the sandbox's ingress socket and performs the [ingress handshake](../spec/draft/ingress.md#2-wire): it sends `CONNECT 127.0.0.1:8081 HTTP/1.1`, and the launcher answers `200` and joins the stream to the agent's loopback listener. (A microVM offers the same channel over vsock.) The agent prints the delivered payload, and the audit log gains an `INGRESS` line.
 
-*Permissions note:* the ingress socket file is created from inside the container by the launcher, which opens it to `0666` so the unprivileged `host_proxy.py` can dial it. If you swap in a launcher that doesn't, open it manually: `docker exec <container> chmod 666 /var/run/agents.net/ingress-proxy.sock`. (Rootless Podman avoids the question entirely: container-root is your own uid, so the socket comes out owned by you.)
+*Permissions note:* the launcher creates the ingress socket file from inside the container and sets its mode to `0666` so that the unprivileged `host_proxy.py` can dial it. If you swap in a launcher that doesn't, open it yourself: `docker exec <container> chmod 666 /var/run/agents.net/ingress-proxy.sock`. Under rootless Podman the question doesn't arise, because container root is your own uid and the socket is created owned by you.
 
 ## Bonus: Migrate to a Real Cloud Model -- Without Touching the Sandbox
 
-Everything above ran against the free local provider. Switching the same sandbox to a real hosted backend (e.g. `api.openai.com`) uses the credential-inject tier, and the point is what *doesn't* change: the image, the `docker run` command and the agent all stay the same -- only host-side state changes.
+Everything above ran against the local provider. To switch the same sandbox to a hosted backend such as `api.openai.com`, use the credential-inject tier. The image, the `docker run` command, and the agent stay the same; only host-side state changes.
 
 ```bash
 # 1. Add the host to the leaf cert (host-side file only; no image rebuild):
@@ -259,18 +261,19 @@ export OPENAI_API_KEY=sk-...           # exists only in the HOST's shell
 AGENT_PROXY_TOKENS="api.openai.com=OPENAI_API_KEY" python3 demo/host_proxy.py
 ```
 
-The startup banner now shows the host with a non-secret fingerprint (`sha256:...`), and `ALLOW-INJECT` audit lines carry that fingerprint so an operator can confirm a rotation took effect without the log ever holding a secret. The sandboxed agent can send an empty, placeholder, or garbage `Authorization` header -- the boundary strips it and injects the real one, and the real credential's blast radius shrinks to "whatever this one boundary process was handed."
+The startup banner now lists the host with a non-secret fingerprint (`sha256:...`), and `ALLOW-INJECT` audit lines carry the same fingerprint, so you can confirm that a key rotation took effect without the log ever holding a secret. The sandboxed agent may send an empty, placeholder, or garbage `Authorization` header; the boundary strips it and injects the real one. The real credential never enters the sandbox, and the only process that holds it is the boundary.
 
 ## Implementation Examples
 
-The [specification](../spec/draft/wire.md) uses HTTP
-CONNECT between the guest adapter and the boundary. The following examples use
-different implementations of that interface. Each deployment still needs its
-own channel access controls, workload identity, and destination policy.
+The [specification](../spec/draft/wire.md) uses HTTP CONNECT between the
+guest adapter and the boundary. The examples below put different
+implementations of that interface at the boundary. Each deployment still has
+to supply its own channel access controls, workload identity, and destination
+policy.
 
 ### Lab A: the reference boundary, no root required
 
-`connect-proxy` is the Go sibling of `host_proxy.py`: deny-by-default on names, addresses, ports, and transports from a [policy descriptor](../spec/draft/policy.md), one JSON audit record per decision. Because curl speaks CONNECT to HTTP proxies, you can watch the policy work without a sandbox:
+`connect-proxy` is the Go counterpart of `host_proxy.py`. It reads a [policy descriptor](../spec/draft/policy.md), denies by default on names, addresses, ports, and transports, and writes one JSON audit record per decision. curl speaks CONNECT to HTTP proxies, so you can watch the policy work without a sandbox:
 
 ```bash
 go -C sdk build -o /tmp/connect-proxy ./cmd/connect-proxy
@@ -285,7 +288,7 @@ curl --proxy http://127.0.0.1:18080 https://evil.example                        
 curl --proxy http://127.0.0.1:18080 http://example.com:8080/                                # 403: port-not-allowed
 ```
 
-The audit records mirror Lab 7's decisions, made on the same policy input -- the name and port in the CONNECT authority. The boundary resolves the allowed name itself, records the address it checked and dialed, and denies names that resolve to loopback, private, or link-local addresses unless the descriptor lists them in `resolved_addresses` or as literals. Each record carries the sandbox label and policy version from the descriptor the controller installed, never anything the guest sent:
+The audit records correspond to Lab 7's decisions and are made on the same input, the name and port in the CONNECT authority. The boundary resolves the allowed name itself, records the address it checked and dialed, and denies names that resolve to loopback, private, or link-local addresses unless the descriptor lists them in `resolved_addresses` or as literals. Each record carries the sandbox label and policy version from the descriptor the controller installed, and nothing the guest sent:
 
 ```json
 {"ts":"2026-09-16T16:20:31Z","listener":"tcp://127.0.0.1:18080","sandbox":"lab-a","policy":"lab-a-1","wire":"h1","transport":"tcp","destination":"example.com:443","address":"93.184.216.34:443","rule":"example","decision":"allow"}
@@ -293,17 +296,17 @@ The audit records mirror Lab 7's decisions, made on the same policy input -- the
 {"ts":"2026-09-16T16:20:35Z","listener":"tcp://127.0.0.1:18080","sandbox":"lab-a","policy":"lab-a-1","wire":"h1","transport":"tcp","destination":"example.com:8080","decision":"block","reason":"port-not-allowed"}
 ```
 
-`-h2` enables HTTP/2 CONNECT streams; `"features": {"udp": true}` in the
-descriptor enables UDP proxying using `connect-udp` (RFC 9298).
-`-max-connections`, `-max-streams`, and `-idle-timeout` bound the resources
+`-h2` enables HTTP/2 CONNECT streams. `"features": {"udp": true}` in the
+descriptor enables UDP proxying with `connect-udp` (RFC 9298).
+`-max-connections`, `-max-streams`, and `-idle-timeout` cap the resources
 one sandbox can hold.
 
 ### Lab B: Envoy CONNECT Example
 
 The [example configuration](../sdk/examples/envoy-boundary.yaml) enables
 HTTP/1.1 and HTTP/2 TCP CONNECT in Envoy. It listens on loopback and has no
-workload authorization policy. This is a transport interoperability example,
-not a production boundary configuration.
+workload authorization policy, so treat it as a transport interoperability
+check rather than a production boundary configuration.
 
 ```bash
 docker run -d --name envoy-connect --network host \
@@ -318,73 +321,73 @@ curl -s 127.0.0.1:19901/stats | grep downstream_cx_upgrades_total
 
 Port `10001` accepts HTTP/2 CONNECT with prior knowledge. The
 [interop test](../sdk/test_envoy.sh) exercises both listeners with the
-repository's clients. It does not test UDP, IPC transports, workload identity,
+repository's clients. It doesn't cover UDP, IPC transports, workload identity,
 or gateway controllers that configure Envoy.
 
 ### Lab C: Workload Certificates
 
-The boundary channel can use mTLS. For example,
+The boundary channel can run over mTLS.
 `connect-proxy -h2 -tls-cert ... -tls-key ... -tls-client-ca ca.pem` requires a
 verified client certificate and records its identity in the audit record. A
-[SPIFFE](https://spiffe.io) URI is one possible certificate identity:
+[SPIFFE](https://spiffe.io) URI is one form that identity can take:
 
 ```json
 {"ts":"...","listener":"tcp://127.0.0.1:18443","wire":"h2","transport":"tcp","destination":"api.example.com:443","address":"203.0.113.10:443","peer":"spiffe://cluster.local/ns/sandbox/sa/agent-123","decision":"allow"}
 ```
 
-Other certificate identities are supported; the tests use
+Other certificate identities work too; the tests use
 `sandbox://tenant-a/agent-123`. The reference proxy records the identity but
-still uses a global destination allowlist. Identity-based authorization is
-separate work. Using HTTP/2 and mTLS alone does not validate interoperability
-with a service mesh.
+still authorizes against one global destination allowlist; identity-based
+authorization is separate work. Running HTTP/2 over mTLS doesn't by itself
+show interoperability with a service mesh.
 
 ## Troubleshooting
 
 **The agent gets `Connection refused` for hosts you didn't expect**
-This is the ACL working as designed -- check the audit log for the matching `BLOCK` line. Two options, both valid:
+The allow-list is doing its job. Check the audit log for the matching `BLOCK` line, then either:
 
-- Leave it refused. This is the "unexpected-egress visibility" the architecture is meant to provide.
-- Add the host to `AGENT_PROXY_PASSTHROUGH` (comma-separated) when starting `host_proxy.py`.
+- leave the host refused, which is how the architecture makes unexpected egress visible, or
+- add it to `AGENT_PROXY_PASSTHROUGH` (comma-separated) when starting `host_proxy.py`.
 
 **`tun2connect` exits immediately complaining about an unexpected interface**
-The container was not started with `--network none`. The launcher refuses to run in a namespace with any interface besides loopback and its own tun -- a half-configured sandbox is a startup error, not a quiet hole.
+The container wasn't started with `--network none`. The launcher refuses to run in a namespace that has any interface besides loopback and its own tun, so a half-configured sandbox fails at startup instead of leaving a second route open.
 
 **`tun2connect` fails to create the tun**
-Missing `--cap-add NET_ADMIN` and/or `--device /dev/net/tun` on the `docker run` line.
+The `docker run` line is missing `--cap-add NET_ADMIN`, `--device /dev/net/tun`, or both.
 
 **`dropping CAP_NET_ADMIN after TUN setup: ...`**
-After the tun exists the launcher removes `CAP_NET_ADMIN` from itself and from the agent's bounding set, and refuses to start the agent if it cannot. It needs `CAP_SETPCAP` (in the default container set; do not `--cap-drop SETPCAP`) and a launcher built with `CGO_ENABLED=0`, as in Lab 1.
+Once the tun exists, the launcher removes `CAP_NET_ADMIN` from itself and from the agent's bounding set, and refuses to start the agent if that fails. Dropping the capability needs `CAP_SETPCAP` (part of the default container set; don't `--cap-drop SETPCAP`) and a launcher built with `CGO_ENABLED=0`, as in Lab 1.
 
 **`[!] no demo MITM cert (run gen_certs.sh) -- refusing`**
-Lab 4 was started before Lab 2 completed. Run `./demo/gen_certs.sh` and restart `host_proxy.py`.
+The boundary (Lab 4) was started before the certificates (Lab 2) existed. Run `./demo/gen_certs.sh` and restart `host_proxy.py`.
 
 **`AGENT_PROXY_TOKENS: '<VAR>' is not set on the host -- '<host>' will NOT be reachable`**
-Only relevant for the cloud-migration bonus -- fails closed by design. Export the referenced environment variable in the *host's* shell (not the container's) before starting `host_proxy.py`.
+This only comes up in the cloud-migration bonus, and it fails closed on purpose. Export the named environment variable in the *host's* shell (not the container's) before starting `host_proxy.py`.
 
 **Container hangs or every flow fails instantly**
-Confirm the socket directory mount matches where `host_proxy.py` is actually listening (`/tmp/agent-sockets` on the host by default) and that the boundary process is still running.
+Check that the socket directory you mounted is the one `host_proxy.py` is listening in (`/tmp/agent-sockets` on the host by default) and that the boundary process is still running.
 
 **`[INGRESS ERROR] ... ERR the agent is not listening`**
-The agent's loopback listener isn't up (or listens on a different port than the boundary's `AGENT_INGRESS_PORT`, default `8081`).
+The agent's loopback listener isn't up, or it listens on a different port from the boundary's `AGENT_INGRESS_PORT` (default `8081`).
 
 ## Automated Testing
 
-Run unit tests and the end-to-end sandbox presubmit test locally:
+Run the unit tests and the end-to-end sandbox presubmit locally:
 
 ```bash
 ./demo/test_demo.sh
 ```
 
-This automated suite runs:
+The script runs, in order:
 
 1. Python unit tests for `host_proxy.py` (CONNECT codec, dispatch, tier behavior, refusals).
 2. Certificate generation (`gen_certs.sh`).
 3. Launcher build (`tun2connect`) and container build.
-4. Fail-closed check: the image with no launcher and no network makes zero connections.
+4. A fail-closed check: the image with no launcher and no network makes zero connections.
 5. The launcher-injected run: fake-response over TLS, local-provider relay, and a refused host observed as `ECONNREFUSED`.
 6. Host boundary audit trail verification.
 
-This suite also runs automatically on GitHub Actions presubmit for all pull requests and pushes to `main`.
+The same suite runs on GitHub Actions presubmit for all pull requests and pushes to `main`.
 
 ## Cleanup
 

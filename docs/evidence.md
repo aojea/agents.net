@@ -1,22 +1,23 @@
 <!-- Informative. Not part of the specification. -->
 # Test Evidence
 
-**Informative.** What has been executed, where, and what it does not prove. The conformance suite that turns these into repeatable claims is [conformance/](../conformance/README.md).
+**Informative.** This page records which tests have been run, on what setup, and what those runs do not show. The conformance suite in [conformance/](../conformance/README.md) is where these checks become repeatable claims.
 
-The scenario suite tests containers, namespaces, local VSOCK connections, and
-two Firecracker microVMs. It does not measure native runtime interception.
+The scenario suite covers containers, namespaces, local vsock connections, and
+two Firecracker microVMs. It doesn't measure native runtime interception.
 
-- [scenarios/data/results.md](../scenarios/data/results.md) - Historical 100-flow HTTPS summaries; not remeasured during the design correction.
-- [scenarios/README.md](../scenarios/README.md) - Actual scenario inventory, prerequisites, and measurement limitations.
-- [conformance/README.md](../conformance/README.md) - Conformance suite: profiles per role, black-box fixtures with expected status, reason token, upstream dial count, and audit record, a driver contract for any boundary implementation, and the runtime audit checklist. Its README records the reference's current pass/fail count.
+- [scenarios/data/results.md](../scenarios/data/results.md) - Historical 100-flow HTTPS summaries. They weren't remeasured during the design correction.
+- [scenarios/README.md](../scenarios/README.md) - The scenario inventory, with prerequisites and the limits of what each measurement shows.
+- [conformance/README.md](../conformance/README.md) - The conformance suite. It defines profiles per role, black-box fixtures that state the expected status, reason token, upstream dial count, and audit record, a driver contract that any boundary implementation can satisfy, and the runtime audit checklist. Its README records the reference's current pass/fail count.
 
 ## 1. Security Verification Matrix
 
-Each test must assert both the decision and the absence of an unauthorized
-side effect, such as an upstream dial, credential use, or successful tunnel.
-The following matrix separates existing evidence from required follow-up work.
+Every test here has to check two things: the decision itself, and that
+nothing unauthorized happened on the side, such as an upstream dial, a
+credential use, or a tunnel that opened anyway. The matrix below separates
+what has been tested from what still needs to be.
 
-The local model's acceptance checks are:
+The acceptance checks for the local model are:
 
 1. Run two isolated sandboxes with different dedicated sockets and policies. Neither the workloads nor their adapters can access the other endpoint or host management sockets, including under the runtime's guest-root and UID-mapping configuration.
 2. Send equivalent requests through each adapter and directly to its assigned socket. Allowed destinations succeed and denied destinations fail regardless of identity headers or adapter replacement. Include hostname and IPv4/IPv6 literal destinations.
@@ -24,9 +25,10 @@ The local model's acceptance checks are:
 4. Stop either adapter and change guest routes. No direct external path becomes available. For namespace mode, verify confinement beyond the network namespace as well as redirection behavior.
 5. Terminate a dedicated boundary while tunnels and dials are active. No flow survives completed revocation, and restarting or reusing a sandbox name does not give old connections access to the replacement endpoint.
 
-These are required checks, not a statement of completed test coverage. FD
-registration, mTLS identity dispatch, attestation, credential injection, and
-ingress checks apply only when those extensions are used.
+This list says what has to be checked. It doesn't claim that all of it has
+been. The checks for FD registration, mTLS identity dispatch, attestation,
+credential injection, and ingress only apply when a deployment uses those
+extensions.
 
 | Property | Check | Current coverage |
 | --- | --- | --- |
@@ -47,39 +49,42 @@ ingress checks apply only when those extensions are used.
 | Software integrity | Wrong signer/digest, modified policy, stale update, replayed attestation, wrong session key | Not implemented; depends on deployment verifier |
 | Ingress | Caller auth, authorized service only, stale route rejection, port restrictions, namespace return path | Demo and Firecracker deliveries reach the guest loopback listener; the launcher joins streams only to its pinned port (unit test and Firecracker scenario); caller authentication and stale-route rejection are not implemented; namespace reverse channel is not implemented |
 
-Live namespace tests exercise Linux veth redirection, not a VM hypervisor or
-confidential-computing boundary. The Firecracker scenario exercises the KVM and
-virtio-vsock boundary on one host; it does not attest the guest or test other
-VMMs. A full security review must also cover the
-controller, credential service, runtime configuration, and deployed proxy.
+The live namespace tests exercise Linux veth redirection. They say nothing
+about a VM hypervisor or a confidential-computing boundary. The Firecracker
+scenario does exercise the KVM and virtio-vsock boundary, on one host, but it
+doesn't attest the guest or cover other VMMs. A full security review would
+also have to look at the controller, the credential service, the runtime
+configuration, and the deployed proxy.
 
-Run the authentication, integrity, payload, and literal-destination checks:
+To run the authentication, integrity, payload, and literal-destination
+checks:
 
 ```bash
 go -C sdk test -race -count=1 ./pkg/tun2connect ./cmd/connect-proxy
 ```
 
-Run the fuzz targets for a bounded time each (regression inputs under
-`testdata/fuzz` are replayed by ordinary `go test`):
+To run the fuzz targets for a bounded time each (ordinary `go test` replays
+the regression inputs under `testdata/fuzz`):
 
 ```bash
 FUZZTIME=1m sdk/test_fuzz.sh
 ```
 
-These tests create temporary test certificates and local sockets. They do not
-exercise a production issuer, software attestation service, or tenant controller.
+Both commands create temporary test certificates and local sockets. Neither
+touches a production issuer, a software attestation service, or a tenant
+controller.
 
 ## 2. Firecracker Two-Sandbox Test
 
 [scenarios/09-firecracker-vsock/run.sh](../scenarios/09-firecracker-vsock/run.sh)
 boots two Firecracker microVMs on KVM from a shared read-only Alpine root
 filesystem with the launcher as `/sbin/init`. Neither VM has a network device.
-Each VM has its own `uds_path`, and its boundary is one `connect-proxy`
-process listening on `<uds_path>_1024`, which is where Firecracker delivers
+Each VM has its own `uds_path`, and its boundary is a single `connect-proxy`
+process listening on `<uds_path>_1024`, the path where Firecracker delivers
 guest connections to CID 2 port 1024. VM A's policy permits
-`test.example.com` on port 9443 only, statically mapped to a host loopback
-HTTPS server; VM B's policy is empty. The guest workload runs `curl` through
-the TUN adapter and `socat` directly on the vsock channel.
+`test.example.com` on port 9443 only, statically mapped to an HTTPS server on
+host loopback. VM B's policy is empty. Inside the guests, the workload runs
+`curl` through the TUN adapter and `socat` directly on the vsock channel.
 
 | Check | VM A (permitted) | VM B (empty policy) |
 | --- | --- | --- |
@@ -94,10 +99,10 @@ the TUN adapter and `socat` directly on the vsock channel.
 | Boundary process killed during a 2 MB/s download of a 4 GiB body | Transfer ends after a few megabytes with a curl error; the old socket path refuses connections | Unaffected: a raw `CONNECT` to VM B's socket still receives `403` |
 | Replacement boundary started on the same path with an empty policy descriptor and a new `version` | Guest's next `curl` to the previously allowed name is refused; the replacement's audit records the block under the new version | Refused as before |
 
-Every boundary record carries the `sandbox` and `version` values of the
-descriptor the script installed on that VM's listener; the test checks that
-no record is missing them.
+Every boundary record carries the `sandbox` and `version` values from the
+descriptor the script installed on that VM's listener, and the test fails if
+any record is missing them.
 
 The test passes on Firecracker v1.16.1 with guest kernel 6.18.41 from the
-Firecracker CI artifacts. It does not test guest attestation, snapshot and
+Firecracker CI artifacts. It doesn't cover guest attestation, snapshot and
 restore, other VMMs, draining, or resource exhaustion.
