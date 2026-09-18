@@ -49,10 +49,11 @@ that shaped version 1, and open work.
 | --- | --- |
 | Failure signaling | RFC 9209 `Proxy-Status` with a `reason` parameter; no private header |
 | Capability discovery | None in band; the implementation statement declares capabilities, unsupported requests fail with defined reasons, RFC 8441 SETTINGS is the only in-band signal |
-| Policy model | Allow rules only, default deny, unordered; literal permissions also admit the same address as a resolution result; `resolved_addresses` never authorizes a literal |
-| Name patterns | Exact, suffix (any depth, not the suffix itself), and `*` |
+| Policy model | Allow rules only, default deny, unordered; literal permissions also admit the same address as a resolution result; `resolved_addresses` never authorizes a literal and must lie within a special-purpose range |
+| Name patterns | Exact, suffix (any depth by default, bounded with `depth`, never the suffix itself), and `*` |
 | Audit decisions | `block` = the boundary refused (policy or malformed); `fail` = it could not serve (resolution, dial, budget, TLS) |
-| Ingress wire | HTTP CONNECT to the pinned loopback port; no textual handshake |
+| Malformed requests | Specific reason tokens preferred; the generic `malformed-request` is permitted so that existing proxies can conform without re-parsing |
+| Ingress wire | HTTP CONNECT to a pinned loopback port (IPv4 or IPv6 loopback, one or more ports); no textual handshake; the gateway records the audit |
 | SOCKS5 | Only as a local endpoint of an explicit adapter, translated to CONNECT; never on the boundary wire |
 | Live policy reload | Not in version 1; restart-based revocation is the baseline |
 | Application gateways | Outside the wire profile; requirements stated when used |
@@ -60,9 +61,10 @@ that shaped version 1, and open work.
 ## 5. Open Work
 
 1. `boundary-multi` in the reference command, or a second implementation
-   that has it.
+   that has it; B-MULTI automation in the harness.
 2. `adapter-explicit` reference: loopback CONNECT endpoint in the launcher
-   with environment setup.
+   with environment setup; a reference probe implementing the
+   [adapter probe contract](../conformance/README.md#32-adapter-role).
 3. A reload profile (`boundary-reload`) with atomic replacement and
    documented established-flow behavior, once a controller needs it.
 4. `connect-ip` (RFC 9484) remains out of scope until a workload requires
@@ -70,4 +72,14 @@ that shaped version 1, and open work.
 5. A Windows adapter and a Hyper-V channel test.
 6. Harness support for HTTP/2, connect-udp, TLS, and the in-sandbox adapter
    and controller groups.
-7. A second independent boundary implementation passing `boundary-core`.
+7. A second independent boundary implementation passing `boundary-core`;
+   the natural candidate is an Envoy ext_authz service that evaluates the
+   descriptor and emits `Proxy-Status` and audit records, which would also
+   define a reusable policy-decision interface.
+8. A descriptor generator that emits rules from package-manager
+   configuration and service manifests, so that frameworks do not write
+   descriptors by hand.
+9. An informative application-gateway profile for TLS termination with
+   host-held credentials, with its own fixtures.
+10. A Kubernetes integration guide: per-pod socket exposure, CRD to
+    descriptor translation, SPIFFE identity mapping for `boundary-tls`.

@@ -51,7 +51,7 @@ allowed service does with it.
 | [sdk/](sdk/README.md) | Reference implementation in Go: library, three adapters (in-guest TUN launcher, namespace proxy, QEMU packet backend), and the `connect-proxy` boundary | [sdk/README.md](sdk/README.md) |
 | [demo/](demo/README.md) | Runnable tutorial: an unmodified agent in a `--network none` container, confined by the injected launcher, with a Python boundary | [demo/README.md](demo/README.md) |
 | [scenarios/](scenarios/README.md) | Executed topologies and measurements: containers, namespaces, Firecracker and QEMU microVMs, revocation, benchmarks | [scenarios/README.md](scenarios/README.md) |
-| [docs/](docs/) | Informative material: [rationale and alternatives](docs/rationale.md), [implementations and status](docs/implementations.md), [test evidence](docs/evidence.md), [stakeholder review](docs/review-2026-09.md), [roadmap](docs/roadmap.md) | [docs/roadmap.md](docs/roadmap.md) |
+| [docs/](docs/) | Informative material: [rationale and alternatives](docs/rationale.md), [implementations and status](docs/implementations.md), [test evidence](docs/evidence.md), [stakeholder reviews](docs/review-2026-09.md) ([second round](docs/review-2026-09b.md)), [roadmap](docs/roadmap.md) | [docs/roadmap.md](docs/roadmap.md) |
 
 ## Roles
 

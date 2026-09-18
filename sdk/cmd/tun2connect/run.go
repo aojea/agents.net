@@ -66,8 +66,8 @@ func runLauncher(args []string) {
 	device := fs.String("device", "tun0", "TUN device name to create")
 	mtu := fs.Uint("mtu", 1500, "TUN MTU")
 	udp := fs.Bool("udp", false, "tunnel UDP sessions via connect-udp (DNS is always answered locally)")
-	ingress := fs.String("ingress-socket", "", "serve the ingress channel (HTTP CONNECT 127.0.0.1:<port>) on this Unix socket path or vsock://PORT; requires -ingress-port")
-	ingressPort := fs.Uint("ingress-port", 0, "the only loopback port ingress streams may be joined to (1-65535)")
+	ingress := fs.String("ingress-socket", "", "serve the ingress channel (HTTP CONNECT 127.0.0.1:<port> or [::1]:<port>) on this Unix socket path or vsock://PORT; requires -ingress-port")
+	ingressPorts := fs.String("ingress-port", "", "comma-separated loopback ports ingress streams may be joined to (1-65535); nothing else is reachable")
 	sandboxID := fs.String("sandbox-id", "", "value for the Sandbox-Id header on every tunnel request")
 	fs.Usage = runUsage(fs)
 	fs.Parse(args)
@@ -80,8 +80,9 @@ func runLauncher(args []string) {
 	if !strings.Contains(boundary, "://") {
 		boundary = "unix://" + boundary
 	}
-	if *ingress != "" && (*ingressPort == 0 || *ingressPort > 65535) {
-		log.Fatal("-ingress-socket requires -ingress-port in the range 1-65535: the controller, not the caller, chooses which local service ingress reaches")
+	pinned, err := parsePinnedPorts(*ingressPorts)
+	if *ingress != "" && (err != nil || len(pinned) == 0) {
+		log.Fatal("-ingress-socket requires -ingress-port listing one or more ports in the range 1-65535: the controller, not the caller, chooses which local services ingress reaches")
 	}
 
 	// Refuse to start if the namespace has any interface besides loopback:
@@ -140,7 +141,7 @@ func runLauncher(args []string) {
 	defer eng.Close()
 
 	if ingressListener != nil {
-		go serveIngress(ingressListener, uint16(*ingressPort))
+		go serveIngress(ingressListener, pinned)
 	}
 
 	log.Printf("launcher up: device=%s boundary=%s agent=%q", *device, boundary, argv)
@@ -288,12 +289,28 @@ func listenIngress(spec string) (net.Listener, error) {
 	return ln, nil
 }
 
+// parsePinnedPorts reads the comma-separated -ingress-port value.
+func parsePinnedPorts(value string) (map[uint16]bool, error) {
+	pinned := map[uint16]bool{}
+	if value == "" {
+		return pinned, nil
+	}
+	for _, field := range strings.Split(value, ",") {
+		number, err := strconv.ParseUint(strings.TrimSpace(field), 10, 16)
+		if err != nil || number == 0 {
+			return nil, fmt.Errorf("invalid ingress port %q", field)
+		}
+		pinned[uint16(number)] = true
+	}
+	return pinned, nil
+}
+
 // serveIngress answers HTTP CONNECT on the reverse channel
 // (spec/draft/ingress.md Section 2) and joins each accepted stream to the
 // agent's loopback listener, so the host can deliver inbound requests
-// without the sandbox exposing any port. Only the pinned port is
-// reachable: the request names it, it does not choose it.
-func serveIngress(ln net.Listener, pinned uint16) {
+// without the sandbox exposing any port. Only the pinned ports are
+// reachable: the request names one, it does not choose another.
+func serveIngress(ln net.Listener, pinned map[uint16]bool) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -303,13 +320,13 @@ func serveIngress(ln net.Listener, pinned uint16) {
 			defer conn.Close()
 			conn.SetDeadline(time.Now().Add(5 * time.Second))
 			br := bufio.NewReader(io.LimitReader(conn, maxIngressHead))
-			status, reason := ingressTarget(br, pinned)
+			target, status, reason := ingressTarget(br, pinned)
 			if reason != "" {
 				fmt.Fprintf(conn, "HTTP/1.1 %d %s\r\nProxy-Status: %s\r\nContent-Length: 0\r\n\r\n",
 					status, http.StatusText(status), tun2connect.ProxyStatus("ingress", reason))
 				return
 			}
-			upstream, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", pinned), 5*time.Second)
+			upstream, err := net.DialTimeout("tcp", target, 5*time.Second)
 			if err != nil {
 				fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nProxy-Status: %s\r\nContent-Length: 0\r\n\r\n",
 					tun2connect.ProxyStatus("ingress", "dial-failed"))
@@ -341,32 +358,32 @@ func bufferedBytes(br *bufio.Reader) io.Reader {
 }
 
 // ingressTarget parses one HTTP/1.1 CONNECT head and checks that it names
-// the pinned loopback port. A non-empty reason is the refusal token; status
-// is its HTTP status (spec/draft/registries.md Section 2). The head is read
-// here rather than with net/http, which discards the Host field before it
-// can be compared with the request-target.
-func ingressTarget(br *bufio.Reader, pinned uint16) (status int, reason string) {
+// a loopback address and a pinned port. It returns the address to dial, or
+// a refusal token and its HTTP status (spec/draft/registries.md Section 2).
+// The head is read here rather than with net/http, which discards the Host
+// field before it can be compared with the request-target.
+func ingressTarget(br *bufio.Reader, pinned map[uint16]bool) (target string, status int, reason string) {
 	line, err := br.ReadString('\n')
 	if err != nil {
-		return http.StatusBadRequest, "malformed-request-line"
+		return "", http.StatusBadRequest, "malformed-request-line"
 	}
 	fields := strings.Split(strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r"), " ")
 	if len(fields) != 3 || fields[0] == "" || fields[1] == "" {
-		return http.StatusBadRequest, "malformed-request-line"
+		return "", http.StatusBadRequest, "malformed-request-line"
 	}
 	method, target, version := fields[0], fields[1], fields[2]
 	if version != "HTTP/1.1" && version != "HTTP/1.0" {
 		if strings.HasPrefix(version, "HTTP/") {
-			return http.StatusHTTPVersionNotSupported, "unsupported-version"
+			return "", http.StatusHTTPVersionNotSupported, "unsupported-version"
 		}
-		return http.StatusBadRequest, "malformed-request-line"
+		return "", http.StatusBadRequest, "malformed-request-line"
 	}
 	var host string
 	hosts := 0
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
-			return http.StatusBadRequest, "malformed-header"
+			return "", http.StatusBadRequest, "malformed-header"
 		}
 		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 		if line == "" {
@@ -374,7 +391,7 @@ func ingressTarget(br *bufio.Reader, pinned uint16) (status int, reason string) 
 		}
 		name, value, ok := strings.Cut(line, ":")
 		if !ok || name == "" || strings.ContainsAny(name, " \t") {
-			return http.StatusBadRequest, "malformed-header"
+			return "", http.StatusBadRequest, "malformed-header"
 		}
 		if strings.EqualFold(name, "Host") {
 			hosts++
@@ -382,27 +399,27 @@ func ingressTarget(br *bufio.Reader, pinned uint16) (status int, reason string) 
 		}
 	}
 	if hosts > 1 {
-		return http.StatusBadRequest, "duplicate-host"
+		return "", http.StatusBadRequest, "duplicate-host"
 	}
 	if method != http.MethodConnect {
-		return http.StatusMethodNotAllowed, "connect-only"
+		return "", http.StatusMethodNotAllowed, "connect-only"
 	}
 	if version == "HTTP/1.1" && hosts == 0 {
-		return http.StatusBadRequest, "missing-host"
+		return "", http.StatusBadRequest, "missing-host"
 	}
 	addr, port, err := net.SplitHostPort(target)
-	if err != nil || addr != "127.0.0.1" {
-		return http.StatusBadRequest, "malformed-target"
+	if err != nil || (addr != "127.0.0.1" && addr != "::1") {
+		return "", http.StatusBadRequest, "malformed-target"
 	}
 	number, err := strconv.ParseUint(port, 10, 16)
 	if err != nil || number == 0 {
-		return http.StatusBadRequest, "malformed-port"
+		return "", http.StatusBadRequest, "malformed-port"
 	}
 	if hosts == 1 && host != target {
-		return http.StatusBadRequest, "authority-mismatch"
+		return "", http.StatusBadRequest, "authority-mismatch"
 	}
-	if uint16(number) != pinned {
-		return http.StatusForbidden, "port-not-permitted"
+	if !pinned[uint16(number)] {
+		return "", http.StatusForbidden, "port-not-permitted"
 	}
-	return 0, ""
+	return target, 0, ""
 }

@@ -68,6 +68,7 @@
           "oneOf": [{"const": "*"}, {"$ref": "#/$defs/hostname"}]
         },
         "suffix": {"$ref": "#/$defs/hostname"},
+        "depth": {"type": "integer", "minimum": 1, "maximum": 126},
         "ip": {"$ref": "#/$defs/ipAddress"},
         "cidr": {"$ref": "#/$defs/cidr"},
         "ports": {"$ref": "#/$defs/ports"},
@@ -85,7 +86,8 @@
         {"required": ["cidr"]}
       ],
       "dependentSchemas": {
-        "resolve": {"required": ["name"], "not": {"properties": {"name": {"const": "*"}}}}
+        "resolve": {"required": ["name"], "not": {"properties": {"name": {"const": "*"}}}},
+        "depth": {"required": ["suffix"]}
       }
     },
     "addressException": {

@@ -21,6 +21,13 @@ in public: one always-moving draft and frozen releases.
    incompatible change; a release without such a change keeps them.
 4. Implementation statements name the specification version and the suite
    version they were produced against.
+5. While `draft/` carries `agents_net_policy: 1`, changes to the descriptor,
+   the audit record, the reason token registry, and the authorization
+   algorithm are additive only: new optional fields, new tokens, new
+   profiles. A change that would alter the decision an existing descriptor
+   produces, or make an existing record or token invalid, increments the
+   schema version and is released as the next major version. Deployments
+   that ship against the draft can therefore keep their descriptors.
 
 ## Changing the Draft
 

@@ -24,6 +24,7 @@ policy; the conformance suite reads it to verify implementations.
 | `destination` | string | when parsed | Requested authority after normalization, `host:port` or `[v6]:port` |
 | `address` | string | no | Dialed `ip:port`; present only when a connection was established |
 | `peer` | string | no | Channel-authenticated identity (certificate SAN) or kernel credentials |
+| `connection` | string | no | Boundary-local identifier of the accepted connection or HTTP/2 session, so that requests on one session can be correlated |
 | `rule` | string | no | `id` of the rule that allowed the request |
 | `decision` | string | yes | `allow`; `block` when the boundary refused the request (policy or malformed); `fail` when it could not serve it (resolution, dial, budget, TLS) |
 | `reason` | string | when not `allow` | Reason token ([registries.md](registries.md#2-reason-tokens)) |

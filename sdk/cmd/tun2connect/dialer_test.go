@@ -83,7 +83,7 @@ func TestIngressOnlyReachesPinnedPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go serveIngress(ln, pinned)
+	go serveIngress(ln, map[uint16]bool{pinned: true})
 
 	handshake := func(head string) (status int, reason, rest string) {
 		conn, err := net.Dial("unix", socket)
@@ -115,6 +115,10 @@ func TestIngressOnlyReachesPinnedPort(t *testing.T) {
 		{"other listening port", connect(other), 403, "port-not-permitted"},
 		{"unlistened port", connect(22), 403, "port-not-permitted"},
 		{"non-loopback target", fmt.Sprintf("CONNECT 10.0.0.1:%d HTTP/1.1\r\nHost: 10.0.0.1:%d\r\n\r\n", pinned, pinned), 400, "malformed-target"},
+		{"localhost name", fmt.Sprintf("CONNECT localhost:%d HTTP/1.1\r\nHost: localhost:%d\r\n\r\n", pinned, pinned), 400, "malformed-target"},
+		{"other loopback address", fmt.Sprintf("CONNECT 127.0.0.2:%d HTTP/1.1\r\nHost: 127.0.0.2:%d\r\n\r\n", pinned, pinned), 400, "malformed-target"},
+		{"IPv6 loopback, pinned port, no listener", fmt.Sprintf("CONNECT [::1]:%d HTTP/1.1\r\nHost: [::1]:%d\r\n\r\n", pinned, pinned), 502, "dial-failed"},
+		{"folded header", fmt.Sprintf("CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n continued\r\n\r\n", pinned, pinned), 400, "malformed-header"},
 		{"Host names another port", fmt.Sprintf("CONNECT 127.0.0.1:%d HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", pinned, other), 400, "authority-mismatch"},
 		{"missing Host", fmt.Sprintf("CONNECT 127.0.0.1:%d HTTP/1.1\r\n\r\n", pinned), 400, "missing-host"},
 		{"GET", "GET / HTTP/1.1\r\nHost: x\r\n\r\n", 405, "connect-only"},

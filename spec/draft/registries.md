@@ -46,6 +46,7 @@ specification change to this table.
 | `authority-mismatch` | 400 | `http_request_error` | `Host` names a different destination than the request-target |
 | `malformed-upgrade` | 400 | `http_request_error` | `Upgrade: connect-udp` without `Connection: Upgrade` or with conflicting tokens |
 | `malformed-template` | 400 | `http_request_error` | connect-udp path does not match the configured URI template or decodes to an invalid host or port |
+| `malformed-request` | 4xx except 403 | `http_request_error` | Generic refusal of a malformed request by a boundary that does not distinguish the defect; the specific tokens above are preferred |
 | `unsupported-protocol` | 400 or 501 | `http_request_error` | Extended CONNECT `:protocol` value not supported |
 | `head-too-large` | 431 | `http_request_error` | Request head exceeds the documented limit |
 | `connect-only` | 405 | `http_request_error` | Method other than CONNECT and other than a connect-udp upgrade |
@@ -85,8 +86,9 @@ Published with every conformance result:
 | `suite_version`, `spec_revision` | What was tested |
 | `channels` | Listener types: `unix`, `tcp`, `tls`, `vsock-uds`, `vsock`, `hyperv` |
 | `wire` | `h1`, `h2`; TLS versions; ALPN |
-| `limits` | Head bytes, head deadline, connections, streams per session, idle timeout, capsule bytes, datagram bytes |
-| `resolver` | System resolver, static mapping, both; IDNA handling |
+| `limits` | Head bytes, head deadline, connections, streams per session, idle timeout, capsule bytes, datagram bytes; for `boundary-multi`, the maximum listeners per process |
+| `timing` | `ready_timeout_ms` (controller), `denial_latency_bound_ms` (adapter) |
+| `resolver` | System resolver, static mapping, both; IDNA handling; for adapters, the response code returned for names and record types the synthetic resolver does not answer |
 | `address_table_deviations` | MUST be empty for conformance |
 | `adapter_compatibility` | [adapters.md Section 2](adapters.md#2-packet-adapter-adapter-packet) statement, for adapters |
 | `extensions` | Additional reason tokens, template, SOCKS5 endpoint, diagnostics |

@@ -26,7 +26,7 @@ that applies to the role is recorded.
 
 | Profile | Group | Cases | Fixture | Automated in 0.1 |
 | --- | --- | --- | --- | --- |
-| `boundary-core` | B-CORE | 01–60 | [boundary.json](fixtures/boundary.json) | All except B-CORE-49 (`manual`) |
+| `boundary-core` | B-CORE | 01–62 | [boundary.json](fixtures/boundary.json) | All except B-CORE-49 (`manual`) |
 | `boundary-h2` | B-H2 | 01–08 | boundary.json | No |
 | `boundary-udp` | B-UDP | 01–08 | boundary.json | No |
 | `boundary-tls` | B-TLS | 01–09 | boundary.json | No |
@@ -109,12 +109,35 @@ where a case says `harness_boundary`, produces the named response. Packet
 counts on host interfaces other than the boundary channel are observations
 for `external_packets`.
 
+The probe is any executable that honors this contract, so that every
+provider runs the same cases:
+
+| Input | Meaning |
+| --- | --- |
+| `AGENTS_NET_PROBE_CASES` | Comma-separated case ids to run, default all |
+| `AGENTS_NET_PROBE_TARGET4`, `AGENTS_NET_PROBE_TARGET6` | The harness boundary's upstream addresses (`{target4}`, `{target6}`) |
+| `AGENTS_NET_PROBE_DENIAL_BOUND_MS` | The adapter's declared denial latency bound; a denial slower than this fails A-PKT-02 |
+| `AGENTS_NET_PROBE_FEATURES` | Comma-separated capabilities present: `ipv6`, `udp_enabled`, `synthetic_dns`, `socks5`, `diagnostics` |
+
+| Output | Meaning |
+| --- | --- |
+| Exit 0 | Every selected case passed or was skipped |
+| Exit 1 | At least one case failed |
+| Exit 3 | The probe could not run (missing inputs) |
+| Standard output | One JSON object per case: `{"id", "result": "pass"\|"fail"\|"skip", "elapsed_ms", "detail"}` |
+
+The harness correlates the probe's lines with its own audit records to
+produce the case results.
+
 ### 3.3 Controller and Ingress Roles
 
 The harness drives the controller's public interface (command line, API, or
 SDK) to create sandboxes A and B with the fixture's policies, then observes
 sockets, processes, audit files, and packet captures as each case states.
 For the ingress role the harness plays the gateway on the ingress channel.
+Cases that require a packet capture (C-LOCAL-05) or inspection of the
+adapter's process environment (C-LOCAL-07) are procedures the claimant
+executes and reports; harness 0.1 does not automate them.
 
 ## 4. Fixture Format
 
@@ -139,11 +162,11 @@ For the ingress role the harness plays the gateway on the ingress channel.
 | `harness` | `h1`, `h1-busy`, `h1-proxystatus`, `dns`, `h2`, `udp`, `tls`, `multi`, `manual` |
 | `request.raw` | Bytes sent after connecting; `\r\n` as written; placeholders substituted |
 | `request.dns` | For `dns` cases: name to address list, or list of successive answers for rebinding |
-| `expect.status` | Integer, list of acceptable integers, `"2xx"`, or a frame outcome such as `RST_STREAM:REFUSED_STREAM` |
-| `expect.reason` | Reason token, list of acceptable tokens, or `null` for none; read from the `reason` parameter of `Proxy-Status` |
+| `expect.status` | Integer, list of acceptable values, `"2xx"`, `"4xx"` (400-499 other than 403), or a frame outcome such as `RST_STREAM:REFUSED_STREAM` |
+| `expect.reason` | Reason token, list of acceptable tokens, or `null` for none; read from the `reason` parameter of `Proxy-Status`. Malformed-request cases accept the specific token or `malformed-request` |
 | `expect.dials` / `dials_max` | Upstream accepts attributable to the case |
 | `expect.echoed` | Bytes after the head were relayed and returned by the echo upstream |
-| `expect.audit` | Subset of the last audit record written during the case; `address_not_in` lists prefixes the dialed address must not start with |
+| `expect.audit` | Subset of the last audit record written during the case; a list value accepts any member; `address_not_in` lists prefixes the dialed address must not start with |
 | `expect.proxy_status` | Parameters the `Proxy-Status` member must carry |
 
 Placeholders: `{port}`, `{upstream4}`, `{upstream6}`, `{payload}`, `{nested}`,
@@ -157,8 +180,9 @@ For every automated case:
 
 1. The status matches `expect.status`.
 2. Every non-2xx response carries exactly one `Proxy-Status` field with one
-   member, an `error` parameter, and a `reason` parameter; the reason token
-   matches `expect.reason`.
+   member whose name is an sf-token, an `error` parameter from the HTTP
+   Proxy Error Types registry, and a `reason` parameter matching
+   `[a-z0-9-]{1,32}`; the reason token matches `expect.reason`.
 3. Upstream accepts equal `expect.dials` (or do not exceed `dials_max`).
 4. For 2xx with `expect.echoed`, the bytes sent after the head come back
    unchanged; for non-2xx no bytes follow the response head.
@@ -172,17 +196,19 @@ for a conformance claim of that profile.
 
 These properties are not observable through the wire and are recorded per
 deployment by inspection. A controller or adapter claim lists each item with
-the evidence used.
+the evidence used. The items name the control, not a Linux mechanism; the
+evidence column gives Linux and macOS examples, and another platform
+supplies its own.
 
 | # | Item | Evidence |
 | --- | --- | --- |
-| 1 | The sandbox has no network interface other than one terminating in the adapter (packet) or none (explicit) | `ip link`, VMM configuration |
-| 2 | Only the assigned boundary socket (or channel ports) is visible to the adapter; no other sandbox's socket, runtime socket, or management socket | Mount table, socket directory listing, VMM vsock configuration |
-| 3 | Socket directory ownership and mode, UID/GID mapping, and capability set prevent another workload from connecting or replacing the endpoint | `stat`, `/proc/<pid>/status` capabilities, user namespace mapping |
-| 4 | The adapter and workload cannot open raw or packet sockets, `ptrace` other processes, or read other processes' memory | seccomp profile, `CapBnd` |
-| 5 | The adapter drops `CAP_NET_ADMIN` after device setup and cannot regain it | `CapBnd` after start |
-| 6 | Inherited descriptors are closed; the boundary socket is not passed to the workload | `/proc/<pid>/fd` of the workload |
-| 7 | Abstract Unix sockets outside the assigned endpoint are unreachable from the adapter | Network namespace inspection |
+| 1 | The sandbox has no network interface other than one terminating in the adapter (packet) or none (explicit) | `ip link`, VMM configuration; macOS: sandbox profile denies `network-outbound` except the endpoint |
+| 2 | Only the assigned boundary socket (or channel ports) is visible to the adapter; no other sandbox's socket, runtime socket, or management socket | Mount table, socket directory listing, VMM vsock configuration; macOS: sandbox profile file-read/write rules |
+| 3 | Socket directory ownership and mode, UID/GID mapping, and privileges prevent another workload from connecting or replacing the endpoint | `stat`, `/proc/<pid>/status` capabilities, user namespace mapping; macOS: `stat`, per-sandbox user |
+| 4 | The adapter and workload cannot open raw or packet sockets, trace other processes, or read other processes' memory | seccomp profile and `CapBnd`; macOS: sandbox profile denies `network-raw`, `process-info`, `mach-*` |
+| 5 | Privileges the adapter needed only for setup are dropped and cannot be regained | Linux: `CapBnd` without `CAP_NET_ADMIN` after start; macOS: no elevated setup step, or the setup helper exits |
+| 6 | Inherited descriptors are closed; the boundary socket is not passed to the workload | `/proc/<pid>/fd` of the workload; macOS: `lsof -p` |
+| 7 | No Unix socket other than the assigned endpoint is reachable from the adapter, including abstract-namespace sockets where the platform has them | Network namespace inspection; macOS: sandbox profile |
 | 8 | Boundary policy, binaries, configuration, and audit files are not writable by any sandbox | Mounts and modes |
 | 9 | Revocation waits for process exit or flow termination before the path or identity is reused | Controller logs against audit timestamps |
 | 10 | Audit sink is append-only from the boundary's view and protected from sandboxes | Sink configuration |
@@ -211,7 +237,7 @@ descriptor and the audit examples against the schemas (requires the
 runs both on every change to the suite, the schemas, or the reference.
 
 Result at this revision of the reference: every automated `boundary-core`
-case passes (58); B-CORE-49 is `manual`.
+case passes (60); B-CORE-49 is `manual`.
 
 ## 8. Reporting
 
@@ -233,7 +259,7 @@ followed and the observation, in the implementation statement's `results`.
 | --- | --- |
 | B-CORE-01–28, 30, 31, 50–52 | [corpus_test.go](../sdk/cmd/connect-proxy/corpus_test.go) negative corpus |
 | B-CORE-33–45, 60 | [main_test.go](../sdk/cmd/connect-proxy/main_test.go) policy and resolver tests |
-| B-CORE-54–59 | [policy_test.go](../sdk/cmd/connect-proxy/policy_test.go) suffix, mixed-answer, and IDNA tests; harness resolver cases |
+| B-CORE-54–59, 61, 62 | [policy_test.go](../sdk/cmd/connect-proxy/policy_test.go) suffix, depth, mixed-answer, and IDNA tests; harness resolver cases |
 | B-CORE-46, B-H2-08 | Payload-separation tests over HTTP/1.1 and HTTP/2 |
 | B-CORE-47, B-H2-04, C-LOCAL-02 | Firecracker scenario forged `Sandbox-Id` |
 | B-CORE-48 | Connection budget test (503 before head) |

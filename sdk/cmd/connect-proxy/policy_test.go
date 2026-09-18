@@ -100,6 +100,12 @@ func TestDescriptorValidation(t *testing.T) {
 		"exception with name":    policyJSON(``, `,"resolved_addresses":[{"name":"a.example"}]`),
 		"exception without cidr": policyJSON(``, `,"resolved_addresses":[{"ports":[443]}]`),
 		"exception with id":      policyJSON(``, `,"resolved_addresses":[{"cidr":"10.0.0.0/8","id":"x"}]`),
+		"exception catch-all":    policyJSON(``, `,"resolved_addresses":[{"cidr":"0.0.0.0/0"}]`),
+		"exception v6 catch-all": policyJSON(``, `,"resolved_addresses":[{"cidr":"::/0"}]`),
+		"exception public range": policyJSON(``, `,"resolved_addresses":[{"cidr":"8.0.0.0/8"}]`),
+		"exception spans ranges": policyJSON(``, `,"resolved_addresses":[{"cidr":"192.0.0.0/8"}]`),
+		"depth on name":          policyJSON(`{"name":"a.example","depth":1}`, ""),
+		"depth negative":         policyJSON(`{"suffix":"example","depth":-1}`, ""),
 		"id too long":            policyJSON(`{"id":"`+strings.Repeat("i", 65)+`","name":"a.example"}`, ""),
 	} {
 		if _, err := loadDescriptor([]byte(bad), ""); err == nil {
@@ -110,6 +116,8 @@ func TestDescriptorValidation(t *testing.T) {
 		policyJSON(`{"name":"xn--bcher-kva.example"},{"name":"my_service.internal","ports":[8080]},{"name":"a-b.c"}`, ""),
 		policyJSON(`{"cidr":"::ffff:203.0.113.0/120","ports":[443]}`, ""),
 		policyJSON(``, `,"features":{}`),
+		policyJSON(``, `,"resolved_addresses":[{"cidr":"10.0.0.0/8"},{"cidr":"127.0.0.1/32"},{"cidr":"169.254.169.254/32"},{"cidr":"fd00::/8"},{"cidr":"::1/128"},{"cidr":"100.64.0.0/10"},{"cidr":"::ffff:10.1.0.0/112"}]`),
+		policyJSON(`{"suffix":"example.com","depth":1}`, ""),
 	} {
 		if _, err := loadDescriptor([]byte(good), ""); err != nil {
 			t.Errorf("valid descriptor rejected: %v\n%s", err, good)
@@ -230,12 +238,14 @@ func TestSuffixPolicy(t *testing.T) {
 	setResolver(t, func(ctx context.Context, network, host string) ([]netip.Addr, error) {
 		return []netip.Addr{netip.MustParseAddr("93.184.216.34")}, nil
 	})
-	p := setPolicy(t, policyJSON(`{"id":"sfx","suffix":"Example.COM.","ports":[443]},{"id":"exact","name":"exact.example.com","ports":[443]}`, ""))
+	p := setPolicy(t, policyJSON(`{"id":"sfx","suffix":"Example.COM.","ports":[443]},{"id":"exact","name":"exact.example.com","ports":[443]},{"id":"one","suffix":"github.io","depth":1,"ports":[443]},{"id":"two","suffix":"pages.test","depth":2,"ports":[443]}`, ""))
 	ctx := context.Background()
 	for _, test := range []struct{ host, reason, rule string }{
 		{"a.example.com", "", "sfx"}, {"a.b.example.com", "", "sfx"}, {"A.EXAMPLE.COM.", "", "sfx"},
 		{"exact.example.com", "", "exact"},
 		{"example.com", "not-on-allowlist", ""}, {"notexample.com", "not-on-allowlist", ""}, {"example.com.evil", "not-on-allowlist", ""},
+		{"user.github.io", "", "one"}, {"a.user.github.io", "not-on-allowlist", ""}, {"github.io", "not-on-allowlist", ""},
+		{"a.pages.test", "", "two"}, {"a.b.pages.test", "", "two"}, {"a.b.c.pages.test", "not-on-allowlist", ""},
 	} {
 		v := p.authorize(ctx, test.host, "443", "tcp")
 		if v.reason != test.reason || v.rule != test.rule {

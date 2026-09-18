@@ -34,6 +34,7 @@ import (
 	"net/textproto"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -113,6 +114,7 @@ type auditRecord struct {
 	Destination string `json:"destination,omitempty"`
 	Address     string `json:"address,omitempty"`
 	Peer        string `json:"peer,omitempty"`
+	Connection  string `json:"connection,omitempty"`
 	Rule        string `json:"rule,omitempty"`
 	Decision    string `json:"decision"`
 	Reason      string `json:"reason,omitempty"`
@@ -167,10 +169,21 @@ func (r h2Responder) deny(status int, reason string) {
 	r.w.WriteHeader(status)
 }
 
+// session labels every record of one accepted connection or HTTP/2
+// session: the channel-authenticated peer identity (audit-only) and a
+// boundary-local connection id for correlating requests.
+type session struct{ peer, id string }
+
+var connections atomic.Uint64
+
+func newSession(peer string) session {
+	return session{peer: peer, id: strconv.FormatUint(connections.Add(1), 10)}
+}
+
 // connectUpstream authorizes host:port and dials a checked address. It
 // writes the refusal itself and returns nil when no tunnel may be opened.
-func connectUpstream(ctx context.Context, r responder, wire, network, host, port, peer string) net.Conn {
-	rec := auditRecord{Wire: wire, Transport: network, Destination: net.JoinHostPort(host, port), Peer: peer}
+func connectUpstream(ctx context.Context, r responder, wire, network, host, port string, s session) net.Conn {
+	rec := auditRecord{Wire: wire, Transport: network, Destination: net.JoinHostPort(host, port), Peer: s.peer, Connection: s.id}
 	p := current.Load()
 	if p == nil {
 		rec.Decision, rec.Reason = "fail", "policy-unavailable"
@@ -228,13 +241,13 @@ func dialAuthorized(network string, addresses []netip.Addr, port string) (net.Co
 }
 
 // malformed records and refuses a request that never reached policy.
-func malformed(r responder, wire, network, destination, peer, reason string) {
-	refuse(r, wire, network, destination, peer, http.StatusBadRequest, reason)
+func malformed(r responder, wire, network, destination string, s session, reason string) {
+	refuse(r, wire, network, destination, s, http.StatusBadRequest, reason)
 }
 
 // refuse records a block decision and writes the refusal.
-func refuse(r responder, wire, network, destination, peer string, status int, reason string) {
-	audit(auditRecord{Wire: wire, Transport: network, Destination: destination, Peer: peer, Decision: "block", Reason: reason})
+func refuse(r responder, wire, network, destination string, s session, status int, reason string) {
+	audit(auditRecord{Wire: wire, Transport: network, Destination: destination, Peer: s.peer, Connection: s.id, Decision: "block", Reason: reason})
 	r.deny(status, reason)
 }
 
@@ -298,13 +311,13 @@ func relay(client io.ReadWriter, upstream net.Conn, closeClient func()) {
 	io.Copy(client, activityReader{upstream, touch})
 }
 
-func handleConnect(conn net.Conn, br *bufio.Reader, h *head, peer string) {
+func handleConnect(conn net.Conn, br *bufio.Reader, h *head, s session) {
 	host, port, reason := connectTarget(h)
 	if reason != "" {
-		malformed(h1Responder{conn}, "h1", "tcp", h.target, peer, reason)
+		malformed(h1Responder{conn}, "h1", "tcp", h.target, s, reason)
 		return
 	}
-	upstream := connectUpstream(context.Background(), h1Responder{conn}, "h1", "tcp", host, port, peer)
+	upstream := connectUpstream(context.Background(), h1Responder{conn}, "h1", "tcp", host, port, s)
 	if upstream == nil {
 		return
 	}
@@ -317,18 +330,18 @@ func handleConnect(conn net.Conn, br *bufio.Reader, h *head, peer string) {
 	}{br, conn}, upstream, func() { conn.Close() })
 }
 
-func handleConnectUDP(conn net.Conn, br *bufio.Reader, h *head, peer string) {
+func handleConnectUDP(conn net.Conn, br *bufio.Reader, h *head, s session) {
 	path, ok := upgradeTarget(h)
 	if !ok {
-		malformed(h1Responder{conn}, "h1", "udp", h.target, peer, "malformed-upgrade")
+		malformed(h1Responder{conn}, "h1", "udp", h.target, s, "malformed-upgrade")
 		return
 	}
 	host, port, ok := masqueTarget(path)
 	if !ok {
-		malformed(h1Responder{conn}, "h1", "udp", h.target, peer, "malformed-template")
+		malformed(h1Responder{conn}, "h1", "udp", h.target, s, "malformed-template")
 		return
 	}
-	upstream := connectUpstream(context.Background(), h1Responder{conn}, "h1", "udp", host, port, peer)
+	upstream := connectUpstream(context.Background(), h1Responder{conn}, "h1", "udp", host, port, s)
 	if upstream == nil {
 		return
 	}
@@ -529,6 +542,7 @@ func serve(conn net.Conn) {
 		audit(auditRecord{Wire: "h1", Decision: "fail", Reason: "tls-failed"})
 		return
 	}
+	s := newSession(peer)
 	// Bound the request head in time and bytes so a stalled or oversized
 	// head cannot hold the handler or its memory.
 	conn.SetReadDeadline(time.Now().Add(headTimeout.Load()))
@@ -538,7 +552,7 @@ func serve(conn net.Conn) {
 	if err != nil {
 		var he *headError
 		if errors.As(err, &he) {
-			audit(auditRecord{Wire: "h1", Peer: peer, Decision: "block", Reason: he.reason})
+			audit(auditRecord{Wire: "h1", Peer: s.peer, Connection: s.id, Decision: "block", Reason: he.reason})
 			h1Responder{conn}.deny(he.status, he.reason)
 		}
 		return
@@ -547,11 +561,11 @@ func serve(conn net.Conn) {
 	limiter.remaining = -1
 	switch {
 	case h.method == http.MethodConnect:
-		handleConnect(conn, br, h, peer)
+		handleConnect(conn, br, h, s)
 	case h.method == http.MethodGet && isUpgrade(h):
-		handleConnectUDP(conn, br, h, peer)
+		handleConnectUDP(conn, br, h, s)
 	default:
-		refuse(h1Responder{conn}, "h1", "", "", peer, http.StatusMethodNotAllowed, "connect-only")
+		refuse(h1Responder{conn}, "h1", "", "", s, http.StatusMethodNotAllowed, "connect-only")
 	}
 }
 
@@ -605,25 +619,25 @@ func sessionPeer(conn net.Conn) (string, error) {
 
 // serveH2 handles one stream of the multiplexed session: CONNECT is a
 // TCP tunnel, extended CONNECT (:protocol connect-udp) a UDP session.
-// peer is the session's mTLS identity, audit-only.
-func serveH2(peer string) http.HandlerFunc {
+// s carries the session's mTLS identity (audit-only) and connection id.
+func serveH2(s session) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodConnect {
-			refuse(h2Responder{w}, "h2", "", "", peer, http.StatusMethodNotAllowed, "connect-only")
+			refuse(h2Responder{w}, "h2", "", "", s, http.StatusMethodNotAllowed, "connect-only")
 			return
 		}
 		f, _ := w.(http.Flusher)
 		if proto := r.Header.Get(":protocol"); proto != "" {
 			if proto != "connect-udp" {
-				malformed(h2Responder{w}, "h2", "", r.URL.Path, peer, "unsupported-protocol")
+				malformed(h2Responder{w}, "h2", "", r.URL.Path, s, "unsupported-protocol")
 				return
 			}
 			host, port, ok := masqueTarget(r.URL.Path)
 			if !ok {
-				malformed(h2Responder{w}, "h2", "udp", r.URL.Path, peer, "malformed-template")
+				malformed(h2Responder{w}, "h2", "udp", r.URL.Path, s, "malformed-template")
 				return
 			}
-			upstream := connectUpstream(r.Context(), h2Responder{w}, "h2", "udp", host, port, peer)
+			upstream := connectUpstream(r.Context(), h2Responder{w}, "h2", "udp", host, port, s)
 			if upstream == nil {
 				return
 			}
@@ -641,14 +655,14 @@ func serveH2(peer string) http.HandlerFunc {
 
 		host, port, err := net.SplitHostPort(r.Host)
 		if err != nil || host == "" {
-			malformed(h2Responder{w}, "h2", "tcp", r.Host, peer, "malformed-target")
+			malformed(h2Responder{w}, "h2", "tcp", r.Host, s, "malformed-target")
 			return
 		}
 		if _, err := parsePort(port); err != nil {
-			malformed(h2Responder{w}, "h2", "tcp", r.Host, peer, "malformed-port")
+			malformed(h2Responder{w}, "h2", "tcp", r.Host, s, "malformed-port")
 			return
 		}
-		upstream := connectUpstream(r.Context(), h2Responder{w}, "h2", "tcp", host, port, peer)
+		upstream := connectUpstream(r.Context(), h2Responder{w}, "h2", "tcp", host, port, s)
 		if upstream == nil {
 			return
 		}
@@ -699,7 +713,7 @@ func serveListener(ln net.Listener, useH2 bool, maxConnections, maxStreams int) 
 				conn.Close()
 				return
 			}
-			h2s.ServeConn(conn, &http2.ServeConnOpts{Handler: serveH2(peer)})
+			h2s.ServeConn(conn, &http2.ServeConnOpts{Handler: serveH2(newSession(peer))})
 		}()
 	}
 }

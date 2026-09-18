@@ -22,6 +22,7 @@ appears in every audit record ([audit.md](audit.md)).
   "rules": [
     {"id": "npm", "name": "registry.npmjs.org", "ports": [443]},
     {"id": "gh-pkgs", "suffix": "pkg.github.com", "ports": [443]},
+    {"id": "gh-user", "suffix": "github.io", "depth": 1, "ports": [443]},
     {"id": "db", "ip": "203.0.113.10", "ports": [5432]},
     {"id": "v6net", "cidr": "2001:db8::/64", "ports": ["443", "8000-8099"], "transports": ["tcp", "udp"]},
     {"id": "internal", "name": "svc.internal.example", "ports": [443], "resolve": ["10.0.1.50"]}
@@ -46,13 +47,17 @@ list of integers or `"a-b"` ranges within 1-65535; absent means every port.
 `transports` is a subset of `["tcp", "udp"]`; absent means `["tcp"]`.
 `resolve` is permitted only with `name` (not `"*"`) and lists the addresses
 used instead of DNS for that name; those addresses are authorized for the
-rule's ports and transports without a `resolved_addresses` entry. `id` is
-optional and appears in the audit record's `rule` field. Rules are unordered;
-a request is allowed when any rule allows it.
+rule's ports and transports without a `resolved_addresses` entry. `depth`
+is permitted only with `suffix` and bounds the number of labels before the
+suffix ([wire.md Section 6](wire.md#6-name-normalization-and-matching)).
+`id` is optional and appears in the audit record's `rule` field. Rules are
+unordered; a request is allowed when any rule allows it.
 
 `resolved_addresses` lists special-purpose addresses or prefixes
 ([wire.md Section 5.1](wire.md#51-special-purpose-addresses)) that resolved
-results MAY use, per port. It does not authorize literals.
+results MAY use, per port. Each entry MUST be contained in one
+special-purpose range; a descriptor with an entry outside those ranges, such
+as `0.0.0.0/0`, is invalid. It does not authorize literals.
 
 `features.udp` false means every connect-udp request is `udp-disabled`
 regardless of rules. `features.h2` is informational for controllers.

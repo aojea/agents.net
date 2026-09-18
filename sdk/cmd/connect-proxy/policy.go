@@ -34,6 +34,7 @@ type descriptorRule struct {
 	ID         string   `json:"id"`
 	Name       string   `json:"name"`
 	Suffix     string   `json:"suffix"`
+	Depth      int      `json:"depth"`
 	IP         string   `json:"ip"`
 	CIDR       string   `json:"cidr"`
 	Ports      []any    `json:"ports"`
@@ -140,6 +141,7 @@ type rule struct {
 
 type suffixRule struct {
 	suffix string
+	depth  int // maximum labels before the suffix; 0 means unlimited
 	rule   *rule
 }
 
@@ -212,12 +214,15 @@ func loadDescriptor(data []byte, generation string) (*policy, error) {
 		}
 	}
 	for i, dr := range d.ResolvedAddresses {
-		if dr.CIDR == "" || dr.Name != "" || dr.Suffix != "" || dr.IP != "" || dr.Transports != nil || dr.Resolve != nil || dr.ID != "" {
+		if dr.CIDR == "" || dr.Name != "" || dr.Suffix != "" || dr.IP != "" || dr.Transports != nil || dr.Resolve != nil || dr.ID != "" || dr.Depth != 0 {
 			return nil, fmt.Errorf("policy descriptor: resolved_addresses %d: only cidr and ports are allowed", i)
 		}
 		prefix, err := parsePrefix(dr.CIDR)
 		if err != nil {
 			return nil, fmt.Errorf("policy descriptor: resolved_addresses %d: %w", i, err)
+		}
+		if !specialPurpose(prefix) {
+			return nil, fmt.Errorf("policy descriptor: resolved_addresses %d: %s is not within a special-purpose range", i, prefix)
 		}
 		ports, err := parsePorts(dr.Ports)
 		if err != nil {
@@ -265,6 +270,9 @@ func (p *policy) addRule(dr descriptorRule) error {
 			r.resolve = append(r.resolve, address.Unmap())
 		}
 	}
+	if dr.Depth != 0 && (dr.Suffix == "" || dr.Depth < 0) {
+		return errors.New("depth requires a suffix and a positive value")
+	}
 	switch {
 	case dr.Name == "*":
 		p.wildcard = append(p.wildcard, r)
@@ -279,7 +287,7 @@ func (p *policy) addRule(dr descriptorRule) error {
 		if !ok {
 			return fmt.Errorf("suffix %q is not a hostname", dr.Suffix)
 		}
-		p.suffixes = append(p.suffixes, suffixRule{suffix: suffix, rule: r})
+		p.suffixes = append(p.suffixes, suffixRule{suffix: suffix, depth: dr.Depth, rule: r})
 	case dr.IP != "":
 		address, err := netip.ParseAddr(dr.IP)
 		if err != nil || address.Zone() != "" {
@@ -400,6 +408,25 @@ func publicAddress(address netip.Addr) bool {
 	return true
 }
 
+// specialPurpose reports whether every address in prefix is special-purpose
+// (spec/draft/wire.md Section 5.1): the prefix lies within one nonPublic
+// range or within one of the classifier ranges netip provides.
+func specialPurpose(prefix netip.Prefix) bool {
+	ranges := append([]netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("127.0.0.0/8"),
+		netip.MustParsePrefix("169.254.0.0/16"), netip.MustParsePrefix("172.16.0.0/12"),
+		netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("224.0.0.0/4"),
+		netip.MustParsePrefix("::/128"), netip.MustParsePrefix("::1/128"),
+		netip.MustParsePrefix("fc00::/7"), netip.MustParsePrefix("fe80::/10"), netip.MustParsePrefix("ff00::/8"),
+	}, nonPublic...)
+	for _, r := range ranges {
+		if r.Addr().Is4() == prefix.Addr().Is4() && r.Bits() <= prefix.Bits() && r.Contains(prefix.Addr()) {
+			return true
+		}
+	}
+	return false
+}
+
 // selectRule returns the first rule permitting port and network. When none
 // does, reason says why the closest candidate failed: "" when no rule
 // matched the destination at all.
@@ -493,9 +520,13 @@ func (p *policy) authorize(ctx context.Context, host, port, network string) verd
 	v.destination = net.JoinHostPort(name, port)
 	candidates := append([]*rule(nil), p.names[name]...)
 	for _, s := range p.suffixes {
-		if strings.HasSuffix(name, "."+s.suffix) {
-			candidates = append(candidates, s.rule)
+		if !strings.HasSuffix(name, "."+s.suffix) {
+			continue
 		}
+		if s.depth > 0 && strings.Count(name[:len(name)-len(s.suffix)-1], ".")+1 > s.depth {
+			continue
+		}
+		candidates = append(candidates, s.rule)
 	}
 	candidates = append(candidates, p.wildcard...)
 	selected, reason := selectRule(candidates, number, network)

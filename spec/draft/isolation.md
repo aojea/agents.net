@@ -190,15 +190,19 @@ controls and tests rather than claimed as a cryptographic proof.
 ### 6.1 Local (`controller-local`)
 
 The lifecycle in [lifecycle.md](lifecycle.md#2-ingress-revocation-and-updates)
-has two observable states. **Ready** means the boundary listener accepts
-connections and answers a request under the installed policy; a controller
-MUST NOT start the workload before observing readiness. **Revoked** means the
-listener no longer accepts connections and every connection it had accepted
-has terminated; a controller MUST NOT report revocation, reuse the socket
-path, or reuse the sandbox identity for a new generation before observing it.
-Two sandboxes under one controller MUST NOT be able to connect to each other's
-boundary sockets, and a request forged on one sandbox's channel MUST be
-decided under that channel's policy.
+has two observable states. **Ready** means a CONNECT to a destination the
+policy denies, sent on the sandbox's channel, receives 403 rather than a
+connection error, within the `ready_timeout_ms` the implementation statement
+declares; a controller MUST NOT start the workload before observing
+readiness. **Revoked** means a new connection on the channel fails and every
+connection the listener had accepted has been closed by the boundary (the
+client observes EOF or a reset), with the last audit record for that
+generation timestamped no later than the controller's revocation report; a
+controller MUST NOT report revocation, reuse the socket path, or reuse the
+sandbox identity for a new generation before observing it. Two sandboxes
+under one controller MUST NOT be able to connect to each other's boundary
+sockets, and a request forged on one sandbox's channel MUST be decided under
+that channel's policy.
 
 ### 6.2 VM (`controller-vm`)
 

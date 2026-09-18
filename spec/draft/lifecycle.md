@@ -68,12 +68,15 @@ that cannot hand off its state requires a fresh environment on restart.
 The adapter's synthetic name state belongs to the sandbox generation. On
 restore, the controller MUST do one of: (a) restore the adapter's state
 together with the guest; (b) start a fresh adapter whose address allocations
-cannot equal any address the previous generation could have issued, for
-example by deriving a disjoint sub-pool from the generation; or (c) refuse
-the restore. The restored generation MUST be bound to its policy and recorded
-as a new `generation` in audit records before the guest runs. Restart,
-snapshot, or restore MUST NOT attach a fresh synthetic DNS state to a guest
-retaining old mappings.
+cannot equal any address the previous generation could have issued; or (c)
+refuse the restore. The adapter's compatibility statement MUST declare which
+options it supports and, for (b), the partition scheme: for example, the
+controller passes a generation index `g` and the adapter allocates only from
+the `g`-th equal slice of its pool, so that two generations of one sandbox
+never share an address. The restored generation MUST be bound to its policy
+and recorded as a new `generation` in audit records before the guest runs.
+Restart, snapshot, or restore MUST NOT attach a fresh synthetic DNS state to
+a guest retaining old mappings.
 
 ## 4. Availability and Audit
 

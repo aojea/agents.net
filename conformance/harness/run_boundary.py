@@ -37,8 +37,8 @@ HEAD_LIMIT = 1 << 16
 AUTOMATED = ("h1", "h1-busy", "h1-proxystatus", "dns")
 AUDIT_FIELDS = {
     "agents_net_audit", "ts", "listener", "sandbox", "generation", "policy", "wire",
-    "transport", "direction", "destination", "address", "peer", "rule", "decision",
-    "reason", "meta",
+    "transport", "direction", "destination", "address", "peer", "connection", "rule",
+    "decision", "reason", "meta",
 }
 
 
@@ -297,10 +297,47 @@ def read_exact(sock, n, already):
     return buf
 
 
+PROXY_ERROR_TYPES = {
+    "dns_timeout", "dns_error", "destination_not_found", "destination_unavailable",
+    "destination_ip_prohibited", "destination_ip_unroutable", "connection_refused",
+    "connection_terminated", "connection_timeout", "connection_read_timeout",
+    "connection_write_timeout", "connection_limit_reached", "tls_protocol_error",
+    "tls_certificate_error", "tls_alert_received", "http_request_error", "http_request_denied",
+    "http_response_incomplete", "http_response_header_section_size", "http_response_header_size",
+    "http_response_body_size", "http_response_trailer_section_size", "http_response_trailer_size",
+    "http_response_transfer_coding", "http_response_content_coding", "http_response_timeout",
+    "http_upgrade_failed", "http_protocol_error", "proxy_internal_response", "proxy_internal_error",
+    "proxy_configuration_error", "proxy_loop_detected",
+}
+SF_TOKEN = re.compile(r"^[A-Za-z*][A-Za-z0-9:/!#$%&'*+\-.^_`|~]*$")
+REASON_TOKEN = re.compile(r"^[a-z0-9-]{1,32}$")
+
+
 def one_of(expected, actual):
     if isinstance(expected, list):
-        return actual in expected
+        return any(one_of(e, actual) for e in expected)
+    if expected == "2xx":
+        return isinstance(actual, int) and 200 <= actual < 300
+    if expected == "4xx":
+        return isinstance(actual, int) and 400 <= actual < 500 and actual != 403
     return actual == expected
+
+
+def proxy_status_violations(value):
+    """RFC 9209 grammar the boundary must follow for its single member."""
+    problems = []
+    if "," in value:
+        problems.append("Proxy-Status has more than one member")
+    parsed = parse_proxy_status(value)
+    if not SF_TOKEN.match(parsed["name"]):
+        problems.append("Proxy-Status member %r is not an sf-token" % parsed["name"])
+    if parsed.get("error") not in PROXY_ERROR_TYPES:
+        problems.append("Proxy-Status error %r is not a registered proxy error type" % parsed.get("error"))
+    if not REASON_TOKEN.match(parsed.get("reason") or ""):
+        problems.append("Proxy-Status reason %r is not a reason token" % parsed.get("reason"))
+    if "details" in parsed and any(ch in parsed["details"] for ch in "\r\n"):
+        problems.append("Proxy-Status details contains control characters")
+    return problems
 
 
 def check_common(case, ctx, status, headers, upstream, before, audit, problems):
@@ -313,12 +350,8 @@ def check_common(case, ctx, status, headers, upstream, before, audit, problems):
     if not 200 <= status < 300:
         if len(values) != 1:
             problems.append("%d Proxy-Status fields, want exactly one" % len(values))
-        elif "," in values[0]:
-            problems.append("Proxy-Status has more than one member")
-        if values and not proxy_status.get("error"):
-            problems.append("Proxy-Status lacks an error parameter")
-        if values and not token:
-            problems.append("Proxy-Status lacks a reason parameter")
+        else:
+            problems.extend(proxy_status_violations(values[0]))
     elif values:
         problems.append("Proxy-Status on a 2xx response")
     want_reason = expect.get("reason")
@@ -361,7 +394,7 @@ def check_common(case, ctx, status, headers, upstream, before, audit, problems):
                     for banned in val:
                         if addr.startswith(banned):
                             problems.append("audit address %r is a denied address" % addr)
-                elif rec.get(key) != val:
+                elif not one_of(val, rec.get(key)):
                     problems.append("audit %s=%r, want %r" % (key, rec.get(key), val))
 
 

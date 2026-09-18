@@ -50,7 +50,7 @@ func boundaryClient(t *testing.T, protocol string) tun2connect.Dialer {
 		if protocol == "h1" {
 			go serve(server)
 		} else {
-			go new(http2.Server).ServeConn(server, &http2.ServeConnOpts{Handler: serveH2("")})
+			go new(http2.Server).ServeConn(server, &http2.ServeConnOpts{Handler: serveH2(newSession(""))})
 		}
 		t.Cleanup(func() { client.Close(); server.Close() })
 		return client, nil

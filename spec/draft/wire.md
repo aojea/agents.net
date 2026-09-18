@@ -91,7 +91,9 @@ resolved addresses of denied requests, or policy contents. No other response
 field carries the decision.
 
 Policy denials MUST use status 403. Malformed requests MUST use a 4xx status
-other than 403. Resolution and dial failures MUST use 502. Resource
+other than 403 and SHOULD use the specific reason token for the defect; a
+boundary that cannot distinguish defects MAY use the generic token
+`malformed-request`. Resolution and dial failures MUST use 502. Resource
 exhaustion and unavailable policy MUST use 503. Unsupported HTTP versions
 MUST use 505. A client MUST NOT infer success from any field when the status
 is not 2xx.
@@ -173,17 +175,21 @@ upstream verification to make interception work.
 
 A hostname in a request-target, `Host` field, or connect-udp template is
 normalized by lowercasing ASCII letters, removing one trailing `.`, and
-converting U-labels to A-labels (IDNA 2008, UTS #46 non-transitional). After
-normalization the name MUST consist of one or more labels of 1-63 characters
-from `a-z`, `0-9`, `-`, `_`, separated by `.`, with total length at most 253;
-otherwise the request is `malformed-target`.
+converting U-labels to A-labels with the UTS #46 non-transitional lookup
+mapping and the Bidi rule, with the STD3 ASCII rules relaxed so that `_` is
+permitted. After normalization the name MUST consist of one or more labels
+of 1-63 characters from `a-z`, `0-9`, `-`, `_`, separated by `.`, with total
+length at most 253; otherwise the request is `malformed-target`.
 
 A rule with `name` matches when the normalized name is equal to it. A rule
 with `suffix` matches when the normalized name ends with `.` followed by the
 suffix and has at least one label before it; the suffix itself does not
-match. The rule `name: "*"` matches every valid name and never a literal
-address. Policy names and suffixes are normalized identically at load time; a
-policy containing an address in a `name` or `suffix` field is invalid.
+match. A suffix rule with `depth` matches only when the number of labels
+before the suffix is at most `depth`, so `{"suffix": "example.com", "depth": 1}`
+matches `a.example.com` and not `a.b.example.com`. The rule `name: "*"`
+matches every valid name and never a literal address. Policy names and
+suffixes are normalized identically at load time; a policy containing an
+address in a `name` or `suffix` field is invalid.
 
 ## 7. HTTP/2
 
@@ -237,3 +243,40 @@ not sufficient for later requests on the same connection. Responses and tool
 outputs remain untrusted, including instructions received from an allowed
 service. Network authentication does not prevent prompt injection or make
 downloaded code safe.
+
+## 10. Security Considerations
+
+The boundary is the only component whose decisions the sandbox cannot
+influence, so every guest-controlled input it consumes is an attack surface:
+the request head, the connect-udp template, DNS answers for allowed names,
+and tunnel payload. Section 2 bounds the parser; Section 5 requires that the
+address dialed is the address checked, which defeats rebinding and mixed
+answers; Section 9 forbids interpreting payload as control messages. The
+special-purpose table in Section 5.1 exists because a name allowlist is not
+an address allowlist: a permitted name may resolve to a metadata service or
+loopback. An exception in `resolved_addresses` reopens exactly the range it
+names and nothing else, which is why such an exception MUST be contained in
+a special-purpose range ([policy.md](policy.md)).
+
+A denial is visible to the workload only as a connection failure; the
+reason token is for the gateway, the operator, and the audit record, not for
+the workload. The `details` parameter MUST NOT echo guest bytes because a
+response field is the only channel back to the workload other than the
+tunnel itself. Resource limits (connection budgets, stream budgets, head
+deadlines, idle timeouts) are part of the guarantee: an unbounded boundary
+can be held by one sandbox to the detriment of others.
+
+This profile authorizes destinations. It does not authenticate the upstream,
+inspect content, or constrain what an allowed service does; those are the
+subject of the optional gateway ([gateway.md](gateway.md)). The isolation
+that makes the boundary the only path is the runtime's responsibility
+([isolation.md](isolation.md)).
+
+## 11. IANA Considerations
+
+This profile requests registration of the `reason` parameter in the HTTP
+Proxy-Status Parameters registry (RFC 9209 Section 2.3), with the value
+syntax of an sf-token and semantics defined by the agents.net reason token
+registry ([registries.md Section 2](registries.md#2-reason-tokens)). It
+defines no new HTTP fields, status codes, or Proxy-Status error types; every
+`error` value used is already registered.

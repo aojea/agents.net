@@ -23,20 +23,28 @@ adapter fail, they do not escape.
 
 ## 2. Packet Adapter (`adapter-packet`)
 
-Covers TUN in the guest, namespace redirect, and VMM packet backends.
+Covers TUN in the guest, namespace redirect, VMM packet backends, and any
+other placement that receives the workload's packets or socket calls before
+they reach a network, including a userspace network stack integrated into
+the runtime; the profile names requirements, not a device.
 
 The adapter MUST deliver every TCP connection the workload initiates to a
 destination outside the sandbox as a CONNECT request with the workload's
 hostname when known and the literal address otherwise. It MUST answer DNS on
 UDP port 53 locally when it uses synthetic addresses and MUST NOT forward UDP
 unless UDP is enabled. Protocols it does not carry MUST fail without an
-alternative path. A denied CONNECT MUST be exposed to the workload as a
-connection failure within a documented bound; refusal before completing the
-workload's TCP handshake is RECOMMENDED where the adapter controls the
-handshake. The adapter MUST publish a compatibility statement listing:
-transports carried, DNS record types answered, synthetic address ranges, name
-capacity and address reuse policy, MTU, and the observable form of a denial
-(refused, reset, or timeout) for TCP and UDP.
+alternative path; in particular QUIC and HTTP/3 need UDP, and with UDP
+disabled only clients that fall back to TCP succeed. A denied CONNECT MUST be
+exposed to the workload as a connection failure within the bound the
+compatibility statement declares; refusal before completing the workload's
+TCP handshake is RECOMMENDED where the adapter controls the handshake. The
+adapter MUST publish a compatibility statement listing: transports carried,
+DNS record types answered and the response code for names and types it does
+not answer, synthetic address ranges, name capacity and address reuse
+policy, the scheme that keeps synthetic allocations disjoint across
+generations ([lifecycle.md Section 3](lifecycle.md#3-snapshot-and-restore-controller-snapshot)),
+MTU, the denial latency bound in milliseconds, and the observable form of a
+denial (refused, reset, or timeout) for TCP and UDP.
 
 A synthetic resolver invents addresses for names so that the name, not an
 address, reaches the boundary. Its ranges MUST NOT overlap destinations the
@@ -74,6 +82,8 @@ failure is part of the compatibility statement.
 When present, the environment variable `AGENTS_NET_DIAGNOSTICS` holds an
 `http://127.0.0.1:<port>/` or `unix:<path>` endpoint. `GET /denials` returns a
 JSON array of at most the last N (documented) denials for this sandbox, each
-with `ts`, `destination`, `transport`, `reason`, and `policy`. The endpoint is
-read-only, contains no data about other sandboxes, and MUST NOT expose policy
-contents beyond `policy`.
+with `ts`, `destination`, `transport`, `reason`, and `policy`, and MAY
+include `suggested_rule`, a descriptor rule derived from the denied request
+(not from the policy) that would have matched it. The endpoint is read-only,
+contains no data about other sandboxes, and MUST NOT expose policy contents
+beyond `policy`.

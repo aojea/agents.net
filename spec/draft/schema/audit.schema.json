@@ -18,6 +18,7 @@
     "destination": {"type": "string", "minLength": 1},
     "address": {"type": "string", "minLength": 1},
     "peer": {"type": "string"},
+    "connection": {"type": "string"},
     "rule": {"type": "string"},
     "decision": {"enum": ["allow", "block", "fail"]},
     "reason": {"type": "string", "pattern": "^[a-z0-9-]{1,32}$"},

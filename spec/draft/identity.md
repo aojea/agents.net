@@ -127,13 +127,14 @@ SPIFFE URI SAN is one conforming instance.
 A boundary process serving several listeners MUST keep, per listener: the
 identity and generation, the policy descriptor, connection and stream
 budgets, idle and head deadlines, and the audit `listener`/`sandbox` labels.
-Exhaustion of one listener's budget MUST NOT cause another listener to refuse
-requests. Closing one listener MUST terminate its accepted connections and
-pending dials and MUST NOT affect other listeners. Policy replacement for one
-listener MUST be atomic with respect to requests on that listener and MUST be
-recorded with the new `policy` value. The process is a shared compromise
-boundary; deployments that isolate mutually untrusted workloads from a
-boundary compromise MUST NOT rely on this binding alone.
+Budgets are configured by the controller per listener, outside the policy
+descriptor. Exhaustion of one listener's budget MUST NOT cause another
+listener to refuse requests. Closing one listener MUST terminate its accepted
+connections and pending dials and MUST NOT affect other listeners. Policy
+replacement for one listener MUST be atomic with respect to requests on that
+listener and MUST be recorded with the new `policy` value. The process is a
+shared compromise boundary; deployments that isolate mutually untrusted
+workloads from a boundary compromise MUST NOT rely on this binding alone.
 
 ## 6. VM Channels (`controller-vm`)
 

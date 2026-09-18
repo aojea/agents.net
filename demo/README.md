@@ -221,7 +221,7 @@ Because the launched command is just a normal non-interactive invocation, the sa
 
 ## Lab 8 (Optional): Ingress -- Deliver a Webhook Into the Sandbox
 
-Ingress uses a second Unix socket, served from *inside* the sandbox by the launcher. `--ingress-port` pins the one loopback port ingress streams may reach; the launcher refuses to start without it, and a `CONNECT` naming any other port is answered `403` with `Proxy-Status: ingress; error=http_request_denied; reason=port-not-permitted`. Note that both flags must come **before** the boundary-socket argument: the launcher stops parsing flags at the first positional argument, so everything after it is passed to the agent untouched:
+Ingress uses a second Unix socket, served from *inside* the sandbox by the launcher. `--ingress-port` pins the loopback ports (one or more, comma-separated) ingress streams may reach; the launcher refuses to start without it, and a `CONNECT` naming any other port is answered `403` with `Proxy-Status: ingress; error=http_request_denied; reason=port-not-permitted`. Note that both flags must come **before** the boundary-socket argument: the launcher stops parsing flags at the first positional argument, so everything after it is passed to the agent untouched:
 
 ```bash
 docker run --rm \
