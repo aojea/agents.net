@@ -199,8 +199,9 @@ names, name suffixes, the `*` wildcard, literal addresses, and prefixes, each
 with optional ports (integers or `"a-b"` ranges), transports, and, for names,
 a static `resolve` list used instead of DNS. `sandbox` and `version` in the
 descriptor label every audit record; `-generation` adds the controller's
-generation label. `features.udp` enables connect-udp. There are no
-policy flags. For example:
+generation label. `features.udp` enables connect-udp. `-resolver host:port`
+pins the DNS server the boundary consults instead of the system resolver.
+There are no policy flags. For example:
 
 ```bash
 cat > /run/agents.net/sandbox-a/policy.json <<'EOF'

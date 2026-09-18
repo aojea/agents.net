@@ -34,7 +34,7 @@ PAYLOAD = "after-head"
 NESTED = "CONNECT evil.test:443 HTTP/1.1\r\nHost: evil.test:443\r\nSandbox-Id: admin\r\n\r\n"
 PAD = "a" * 70000
 HEAD_LIMIT = 1 << 16
-AUTOMATED = ("h1", "h1-busy", "h1-proxystatus")
+AUTOMATED = ("h1", "h1-busy", "h1-proxystatus", "dns")
 AUDIT_FIELDS = {
     "agents_net_audit", "ts", "listener", "sandbox", "generation", "policy", "wire",
     "transport", "direction", "destination", "address", "peer", "rule", "decision",
@@ -95,6 +95,76 @@ class Upstream:
     def count(self):
         with self.lock:
             return self.accepts
+
+
+class DNS:
+    """Authoritative UDP resolver for the names a case defines.
+
+    answers maps a lowercase name to a list of addresses, or to a list of
+    lists consumed one per query of that name and type (rebinding). Unknown
+    names get NXDOMAIN; known names without records of the asked type get
+    an empty answer. Queries are counted per (name, type).
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.answers = {}
+        self.queries = {}
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("127.0.0.1", 0))
+        self.addr = "127.0.0.1:%d" % self.sock.getsockname()[1]
+        threading.Thread(target=self._serve, daemon=True).start()
+
+    def set(self, answers):
+        with self.lock:
+            self.answers = {k.lower().rstrip("."): v for k, v in answers.items()}
+            self.queries = {}
+
+    def max_queries(self):
+        with self.lock:
+            return max(self.queries.values(), default=0)
+
+    def _serve(self):
+        while True:
+            try:
+                data, peer = self.sock.recvfrom(4096)
+            except OSError:
+                return
+            try:
+                reply = self._answer(data)
+            except (IndexError, ValueError):
+                continue
+            self.sock.sendto(reply, peer)
+
+    def _answer(self, data):
+        header, body = data[:12], data[12:]
+        labels, pos = [], 0
+        while body[pos]:
+            n = body[pos]
+            labels.append(body[pos + 1:pos + 1 + n].decode("ascii", "replace"))
+            pos += 1 + n
+        name = ".".join(labels).lower()
+        qtype = int.from_bytes(body[pos + 1:pos + 3], "big")
+        question = body[:pos + 5]
+        with self.lock:
+            key = (name, qtype)
+            index = self.queries.get(key, 0)
+            self.queries[key] = index + 1
+            entry = self.answers.get(name)
+        rcode, records = 0, []
+        if entry is None:
+            rcode = 3
+        else:
+            addresses = entry[min(index, len(entry) - 1)] if entry and isinstance(entry[0], list) else entry
+            for text in addresses:
+                family = socket.AF_INET6 if ":" in text else socket.AF_INET
+                if (qtype == 1 and family == socket.AF_INET) or (qtype == 28 and family == socket.AF_INET6):
+                    rdata = socket.inet_pton(family, text)
+                    records.append(b"\xc0\x0c" + qtype.to_bytes(2, "big") + b"\x00\x01" + (0).to_bytes(4, "big")
+                                   + len(rdata).to_bytes(2, "big") + rdata)
+        flags = (0x8180 | rcode).to_bytes(2, "big")
+        counts = (1).to_bytes(2, "big") + len(records).to_bytes(2, "big") + b"\x00\x00\x00\x00"
+        return header[:2] + flags + counts + question + b"".join(records)
 
 
 class Audit:
@@ -295,9 +365,10 @@ def check_common(case, ctx, status, headers, upstream, before, audit, problems):
                     problems.append("audit %s=%r, want %r" % (key, rec.get(key), val))
 
 
-def run_h1(case, ctx, boundary, upstream, audit):
+def run_h1(case, ctx, boundary, upstream, audit, dns):
     problems = []
     raw = render(case["request"]["raw"], ctx)
+    dns.set(case["request"].get("dns", {}))
     before = upstream.count()
     audit.mark()
     sock = socket.create_connection(boundary, timeout=30)
@@ -317,10 +388,13 @@ def run_h1(case, ctx, boundary, upstream, audit):
     finally:
         sock.close()
     check_common(case, ctx, status, headers, upstream, before, audit, problems)
+    limit = case["expect"].get("dns_queries_max")
+    if limit is not None and dns.max_queries() > limit:
+        problems.append("%d DNS queries for one name and type, want at most %d" % (dns.max_queries(), limit))
     return problems
 
 
-def run_h1_busy(case, ctx, boundary, upstream, audit):
+def run_h1_busy(case, ctx, boundary, upstream, audit, dns):
     problems = []
     held = []
     before = upstream.count()
@@ -342,7 +416,7 @@ def run_h1_busy(case, ctx, boundary, upstream, audit):
     return problems
 
 
-RUNNERS = {"h1": run_h1, "h1-proxystatus": run_h1, "h1-busy": run_h1_busy}
+RUNNERS = {"h1": run_h1, "h1-proxystatus": run_h1, "dns": run_h1, "h1-busy": run_h1_busy}
 
 
 class Driver:
@@ -384,6 +458,7 @@ def main():
     with open(args.fixtures) as f:
         fixtures = json.load(f)
     upstream = Upstream()
+    dns = DNS()
     ctx = {
         "port": upstream.port,
         "upstream4": "127.0.0.1:%d" % upstream.port,
@@ -421,7 +496,7 @@ def main():
                 start_failure = None
                 policy = fixtures["policies"][case["policy"]]
                 descriptor = render(policy["descriptor"], ctx)
-                hints = policy.get("iut", {})
+                hints = dict(policy.get("iut", {}), dns=dns.addr)
                 policy_path = os.path.join(state_dir, case["policy"] + ".json")
                 hints_path = os.path.join(state_dir, case["policy"] + ".hints.json")
                 audit_path = os.path.join(state_dir, case["policy"] + ".audit.jsonl")
@@ -446,7 +521,7 @@ def main():
                 record(case, *start_failure)
                 continue
             try:
-                problems = RUNNERS[case["harness"]](case, ctx, boundary, upstream, audit)
+                problems = RUNNERS[case["harness"]](case, ctx, boundary, upstream, audit, dns)
             except Exception as exc:  # report, do not abort the run
                 problems = ["exception: %r" % (exc,)]
             record(case, "pass" if not problems else "fail", "; ".join(problems))

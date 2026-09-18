@@ -25,6 +25,8 @@ if "max_streams" in hints:
     args += ["-max-streams", str(hints["max_streams"])]
 if "generation" in hints:
     args += ["-generation", str(hints["generation"])]
+if "dns" in hints:
+    args += ["-resolver", hints["dns"]]
 tls = hints.get("tls") or {}
 for key, flag in (("cert", "-tls-cert"), ("key", "-tls-key"), ("client_ca", "-tls-client-ca")):
     if key in tls:

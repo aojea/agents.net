@@ -26,7 +26,7 @@ that applies to the role is recorded.
 
 | Profile | Group | Cases | Fixture | Automated in 0.1 |
 | --- | --- | --- | --- | --- |
-| `boundary-core` | B-CORE | 01–60 | [boundary.json](fixtures/boundary.json) | HTTP/1.1 cases; `dns` and `manual` cases are not |
+| `boundary-core` | B-CORE | 01–60 | [boundary.json](fixtures/boundary.json) | All except B-CORE-49 (`manual`) |
 | `boundary-h2` | B-H2 | 01–08 | boundary.json | No |
 | `boundary-udp` | B-UDP | 01–08 | boundary.json | No |
 | `boundary-tls` | B-TLS | 01–09 | boundary.json | No |
@@ -71,11 +71,14 @@ The harness owns:
 - **Upstream**: an echo listener on `127.0.0.1` and, when available, `[::1]`
   on one port `{port}`. It counts accepted connections. A case's `dials` is
   the number of accepts attributable to that case.
-- **Resolver**: for `harness: dns` cases, a DNS server the IUT is configured
-  to use; the driver receives its address in the hints file as
-  `{"dns": "127.0.0.1:PORT"}`. Cases without a resolver steer names with
-  the descriptor's `resolve` lists and with `localhost`, which the system
-  resolver maps to loopback.
+- **Resolver**: a DNS server the harness runs and the IUT is configured to
+  use; the driver receives its address in the hints file as
+  `{"dns": "127.0.0.1:PORT"}`. It answers A and AAAA for the names a
+  `dns` case defines (successive answers for rebinding), returns no data for
+  other types, and NXDOMAIN for unknown names; it counts queries per name
+  and type for `dns_queries_max`. Other cases steer names with the
+  descriptor's `resolve` lists and with `localhost`, which the system hosts
+  file maps to loopback.
 - **Audit capture**: the driver writes the IUT's audit lines to a file; the
   harness reads the lines appended during each case and validates each
   against [audit.schema.json](../spec/draft/schema/audit.schema.json).
@@ -186,8 +189,8 @@ the evidence used.
 
 ## 7. Running the Harness
 
-Version 0.1 automates the HTTP/1.1 boundary groups. Against the reference
-boundary:
+Version 0.1 automates the HTTP/1.1 boundary groups, including the resolver
+cases. Against the reference boundary:
 
 ```bash
 python3 conformance/harness/run_boundary.py \
@@ -197,14 +200,18 @@ python3 conformance/harness/run_boundary.py \
 
 The [reference driver](harness/drivers/connect-proxy.sh) builds
 `connect-proxy` on first use (or uses `$CONNECT_PROXY`) and starts it with
-`-policy <descriptor>`; the hints `max_connections`, `max_streams`, `wire`,
-`generation`, and `tls` map to the corresponding flags. Another
+`-policy <descriptor>`; the hints `dns`, `max_connections`, `max_streams`,
+`wire`, `generation`, and `tls` map to the corresponding flags. Another
 implementation conforms to the same contract with its own driver; nothing
 else in the harness is specific to the reference.
 
+[check_fixtures.py](harness/check_fixtures.py) validates every fixture
+descriptor and the audit examples against the schemas (requires the
+`jsonschema` package). The [conformance workflow](../.github/workflows/conformance.yml)
+runs both on every change to the suite, the schemas, or the reference.
+
 Result at this revision of the reference: every automated `boundary-core`
-case passes (52); the `dns` cases and B-CORE-49 are not automated by
-harness 0.1.
+case passes (58); B-CORE-49 is `manual`.
 
 ## 8. Reporting
 
@@ -226,6 +233,7 @@ followed and the observation, in the implementation statement's `results`.
 | --- | --- |
 | B-CORE-01–28, 30, 31, 50–52 | [corpus_test.go](../sdk/cmd/connect-proxy/corpus_test.go) negative corpus |
 | B-CORE-33–45, 60 | [main_test.go](../sdk/cmd/connect-proxy/main_test.go) policy and resolver tests |
+| B-CORE-54–59 | [policy_test.go](../sdk/cmd/connect-proxy/policy_test.go) suffix, mixed-answer, and IDNA tests; harness resolver cases |
 | B-CORE-46, B-H2-08 | Payload-separation tests over HTTP/1.1 and HTTP/2 |
 | B-CORE-47, B-H2-04, C-LOCAL-02 | Firecracker scenario forged `Sandbox-Id` |
 | B-CORE-48 | Connection budget test (503 before head) |
@@ -233,8 +241,8 @@ followed and the observation, in the implementation statement's `results`.
 | B-UDP-01, 02, 05 | Capsule and connect-udp tests |
 | B-TLS-02–05, 07–09 | [connect_tls_test.go](../sdk/pkg/tun2connect/connect_tls_test.go) |
 | A-PKT-01–07, 14 | Engine tests, live namespace integration, Firecracker and QEMU scenarios |
-| A-PKT-09, 10 | None; the reference client accepts only 200 and reads one response |
+| A-PKT-09, 10 | [connect_test.go](../sdk/pkg/tun2connect/connect_test.go): any 2xx accepted, interim responses skipped and bounded |
 | C-LOCAL-03, 04, C-VM-01, 02 | Firecracker scenario 09 revocation, unbound port, disjoint policies |
 | C-LOCAL-05 | Route-flush smoke script; packet-capture assertion not implemented |
-| I-ING-01, 02 | Firecracker scenario with the textual handshake; HTTP CONNECT form not implemented |
-| B-MULTI, A-EXP, A-DIAG, C-SNAP, I-ING-03–06 | None |
+| I-ING-01–04 | [dialer_test.go](../sdk/cmd/tun2connect/dialer_test.go) ingress handshake test; Firecracker scenario delivery and unpinned-port refusal |
+| B-MULTI, A-EXP, A-DIAG, C-SNAP, I-ING-05, 06 | None |

@@ -708,6 +708,7 @@ func main() {
 	listen := flag.String("listen", "unix:///tmp/boundary.sock", "listen address (unix:///path or tcp://host:port)")
 	policyPath := flag.String("policy", "", "policy descriptor file (spec/draft/policy.md) bound to this listener; required")
 	generation := flag.String("generation", "", "controller-assigned sandbox generation recorded in every audit record")
+	resolver := flag.String("resolver", "", "DNS server host:port the boundary resolves allowed hostnames with (default: the system resolver)")
 	maxConnections := flag.Int("max-connections", 1024, "maximum concurrently accepted client connections or HTTP/2 sessions; further connections receive 503")
 	maxStreams := flag.Int("max-streams", 256, "maximum concurrent streams per HTTP/2 session")
 	idle := flag.Duration("idle-timeout", time.Hour, "close tunnels that carry no data in either direction for this long; 0 disables")
@@ -729,6 +730,9 @@ func main() {
 		log.Fatal(err)
 	}
 	current.Store(p)
+	if *resolver != "" {
+		lookupNetIP = pinnedResolver(*resolver).LookupNetIP
+	}
 	tlsConfig, err := boundaryTLSConfig(*tlsCert, *tlsKey, *clientCA)
 	if err != nil {
 		log.Fatal(err)

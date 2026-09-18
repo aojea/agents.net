@@ -161,6 +161,18 @@ var current atomic.Pointer[policy]
 // lookupNetIP resolves permitted hostnames; tests substitute it.
 var lookupNetIP = net.DefaultResolver.LookupNetIP
 
+// pinnedResolver returns a resolver that sends every query to server,
+// bypassing resolv.conf, hosts files, and search domains.
+func pinnedResolver(server string) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, server)
+		},
+	}
+}
+
 func loadPolicyFile(path, generation string) (*policy, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
