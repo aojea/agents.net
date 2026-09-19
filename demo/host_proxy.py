@@ -12,10 +12,11 @@ glance:
     destination in the authority (`CONNECT api.example.com:443`). A known
     DNS mapping preserves the name; otherwise the adapter sends an IP address.
 2. Policy is deny-by-default on that name. Anything not on the allow-list
-   is refused with `403 Forbidden` and a `Boundary-Reason` header, which
-   the guest stack turns into an ordinary ECONNREFUSED -- and the attempt
-    is logged. This demo's sample policy denies IP literals. The Go reference
-    boundary supports explicit address and CIDR allowlists.
+   is refused with `403 Forbidden` and a `Proxy-Status` field (RFC 9209)
+   carrying the reason, which the guest stack turns into an ordinary
+   ECONNREFUSED -- and the attempt is logged. This demo's sample policy
+   denies IP literals. The Go reference boundary supports explicit address
+   and CIDR allowlists.
 3. Every flow -- relayed, injected, answered, or refused -- is written to
    an audit log, the auditing/DLP hook called out in the spec's TLS
    inspection models.
@@ -65,9 +66,9 @@ glance:
 
 It also serves the spec's ingress interface: a public TCP port on the host
 is reverse-proxied into the sandbox over a second Unix socket served by the
-launcher from inside, using the Firecracker hybrid-vsock handshake
-("CONNECT <port>\\n" -> "OK\\n"), so a microVM offers the identical
-protocol with no code change.
+launcher from inside, using the agents.net ingress handshake (HTTP
+`CONNECT 127.0.0.1:<port>` -> 200, spec/draft/ingress.md), so a microVM
+offers the identical protocol with no code change.
 
 This file is deliberately independent of any production implementation:
 it interoperates with the launcher purely through the boundary protocol,
@@ -240,14 +241,38 @@ def audit(decision: str, target: str, detail: str = "") -> None:
 # ---------------------------------------------------------------------------
 # HTTP CONNECT codec (RFC 9110 section 9.3.6). CONNECT only -- the
 # deliberate minimum: the only way out is a named TCP tunnel. Refusals are
-# `403 Forbidden` with a `Boundary-Reason` header, upstream failures `502`.
+# `403 Forbidden` with a `Proxy-Status` field (RFC 9209) naming the error
+# type and reason token, upstream failures `502`.
 # ---------------------------------------------------------------------------
+
+# RFC 9209 proxy error type for each reason token this boundary emits.
+PROXY_ERROR_TYPES = {
+    "not-on-allowlist": "http_request_denied",
+    "ip-literal": "destination_ip_prohibited",
+    "missing-mitm-cert": "proxy_configuration_error",
+    "upstream-refused": "connection_refused",
+    "upstream-unreachable": "destination_unavailable",
+}
+
+
+def proxy_status(reason: str) -> str:
+    error = PROXY_ERROR_TYPES.get(reason, "http_request_error")
+    return f"boundary; error={error}; reason={reason}"
+
+
+def proxy_status_reason(value: str) -> str:
+    """Return the reason parameter of the first Proxy-Status member."""
+    for param in value.split(",")[0].split(";")[1:]:
+        key, _, val = param.strip().partition("=")
+        if key == "reason":
+            return val.strip('"')
+    return ""
 
 
 def send_response(sock: socket.socket, status: str, reason: str = "") -> None:
     head = f"HTTP/1.1 {status}\r\n"
     if reason:
-        head += f"Boundary-Reason: {reason}\r\n"
+        head += f"Proxy-Status: {proxy_status(reason)}\r\n"
     head += "Content-Length: 0\r\n\r\n"
     try:
         sock.sendall(head.encode("latin1"))
@@ -546,22 +571,31 @@ def handle_ingress() -> None:
 
 
 def _dial_sandbox(port: int) -> socket.socket:
-    """The Firecracker hybrid-vsock handshake the launcher serves: connect,
-    send "CONNECT <port>", read "OK". An "ERR ..." line is a refusal."""
+    """The agents.net ingress handshake the launcher serves: connect, send
+    `CONNECT 127.0.0.1:<port> HTTP/1.1`, read a 2xx. Any other status is a
+    refusal whose Proxy-Status names the reason."""
     agent_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     agent_sock.settimeout(10)
     agent_sock.connect(INGRESS_UDS)
-    agent_sock.sendall(f"CONNECT {port}\n".encode())
-    line = b""
-    while not line.endswith(b"\n"):
+    target = f"127.0.0.1:{port}"
+    agent_sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+    head = b""
+    while b"\r\n\r\n" not in head:
         chunk = agent_sock.recv(1)
         if not chunk:
             raise ConnectionError("launcher closed during ingress handshake")
-        line += chunk
-        if len(line) > 64:
+        head += chunk
+        if len(head) > 4096:
             raise ConnectionError("oversized ingress handshake reply")
-    if not line.startswith(b"OK"):
-        raise ConnectionError(f"ingress refused: {line.decode(errors='replace').strip()}")
+    lines = head.partition(b"\r\n\r\n")[0].decode("latin1").split("\r\n")
+    try:
+        status = int(lines[0].split(" ", 2)[1])
+    except (IndexError, ValueError):
+        raise ConnectionError(f"malformed ingress reply: {lines[0]!r}")
+    if not 200 <= status < 300:
+        proxy_status = next((l.partition(":")[2].strip() for l in lines[1:]
+                             if l.lower().startswith("proxy-status:")), "")
+        raise ConnectionError(f"ingress refused: {status} {proxy_status}")
     agent_sock.settimeout(None)
     return agent_sock
 

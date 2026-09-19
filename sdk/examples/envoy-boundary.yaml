@@ -1,0 +1,78 @@
+# Envoy TCP CONNECT example: HTTP/1.1 on :10000 and HTTP/2 with prior
+# knowledge on :10001. Destination names use the dynamic forward proxy.
+# Loopback test configuration only; no workload authorization is configured.
+#
+#   docker run -d --name envoy-connect --network host \
+#     envoyproxy/envoy:v1.32-latest \
+#     --config-yaml "$(cat sdk/examples/envoy-boundary.yaml)"
+#
+# This configuration tests Envoy directly, not a gateway or service mesh.
+static_resources:
+  listeners:
+  # HTTP/1.1 CONNECT terminator (v1 wire)
+  - name: connect_h1
+    address:
+      socket_address: { address: 127.0.0.1, port_value: 10000 }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: connect_h1
+          codec_type: HTTP1
+          route_config: &connect_routes
+            name: connect_routes
+            virtual_hosts:
+            - name: all
+              domains: ["*"]
+              routes:
+              - match:
+                  connect_matcher: {}
+                route:
+                  cluster: dfp
+                  upgrade_configs:
+                  - upgrade_type: CONNECT
+                    connect_config: {}
+          http_filters:
+          - name: envoy.filters.http.dynamic_forward_proxy
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+              dns_cache_config: &dfp_cache
+                name: dfp_cache
+                dns_lookup_family: V4_ONLY
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  # HTTP/2 prior-knowledge CONNECT terminator
+  - name: connect_h2
+    address:
+      socket_address: { address: 127.0.0.1, port_value: 10001 }
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: connect_h2
+          codec_type: HTTP2
+          http2_protocol_options:
+            allow_connect: true
+          route_config: *connect_routes
+          http_filters:
+          - name: envoy.filters.http.dynamic_forward_proxy
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+              dns_cache_config: *dfp_cache
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+  clusters:
+  - name: dfp
+    lb_policy: CLUSTER_PROVIDED
+    cluster_type:
+      name: envoy.clusters.dynamic_forward_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+        dns_cache_config: *dfp_cache
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 19901 }

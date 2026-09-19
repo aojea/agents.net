@@ -57,11 +57,19 @@ echo "${KERNEL_SHA256}  ${KERNEL}" | sha256sum -c - >/dev/null || fail "kernel d
 echo "kernel ${KERNEL} verified"
 
 echo "=== 2. Guest rootfs and host binaries ==="
-if [ ! -f "${ROOTFS}" ] || [ "${REBUILD_ROOTFS:-0}" = 1 ]; then
+# The rootfs embeds the launcher and guest scripts; a cached image older
+# than their sources would test stale code.
+rootfs_stale() {
+    [ ! -f "${ROOTFS}" ] || [ "${REBUILD_ROOTFS:-0}" = 1 ] ||
+        [ -n "$(find "${REPO_ROOT}/sdk/cmd/tun2connect" "${REPO_ROOT}/sdk/pkg" "${REPO_ROOT}/sdk/go.mod" \
+            "${SCRIPT_DIR}/init.sh" "${SCRIPT_DIR}/guest-test.sh" "${SCRIPT_DIR}/build-rootfs.sh" \
+            -newer "${ROOTFS}" -print -quit)" ]
+}
+if rootfs_stale; then
     "${SCRIPT_DIR}/build-rootfs.sh" "${ROOTFS}"
 fi
 mkdir -p "${BIN_DIR}"
-go -C "${REPO_ROOT}/tun2connect" build -o "${BIN_DIR}/connect-proxy" ./cmd/connect-proxy
+go -C "${REPO_ROOT}/sdk" build -o "${BIN_DIR}/connect-proxy" ./cmd/connect-proxy
 go -C "${REPO_ROOT}/scenarios" build -o "${BIN_DIR}/target-server" ./cmd/target-server
 
 rm -rf "${RUN_DIR}"
@@ -101,16 +109,18 @@ fc_put() {
         || fail "firecracker API PUT $2 failed"
 }
 
-# start_boundary NAME GENERATION POLICY-VERSION BOUNDARY_FLAGS...
+# start_boundary NAME GENERATION POLICY-VERSION [RULES-JSON]
 # The boundary listens exactly where Firecracker delivers guest connections
 # to CID 2 port ${BOUNDARY_PORT}. Nothing else is bound under this VM's
-# prefix. The sandbox identity in every audit record is this flag, bound to
-# the listener by the controller (this script). Sets BOUNDARY_PID.
+# prefix. The controller (this script) writes the policy descriptor whose
+# sandbox label and version appear in every audit record. Sets BOUNDARY_PID.
 start_boundary() {
-    local name="$1" generation="$2" version="$3"; shift 3
-    local uds="${RUN_DIR}/${name}.vsock"
+    local name="$1" generation="$2" version="$3" rules="${4:-}"
+    local uds="${RUN_DIR}/${name}.vsock" policy="${RUN_DIR}/${name}.policy${generation}.json"
+    printf '{"agents_net_policy":1,"version":"%s","sandbox":"%s","default":"deny","rules":[%s]}\n' \
+        "${version}" "${name}" "${rules}" > "${policy}"
     "${BIN_DIR}/connect-proxy" -listen "unix://${uds}_${BOUNDARY_PORT}" \
-        -sandbox "${name}" -policy-version "${version}" "$@" \
+        -policy "${policy}" -generation "${generation:-1}" \
         > "${RUN_DIR}/${name}.audit${generation}" 2> "${RUN_DIR}/${name}.boundary${generation}.log" &
     BOUNDARY_PID=$!
     PIDS+=("${BOUNDARY_PID}")
@@ -135,11 +145,11 @@ except OSError as e:
 EOF
 }
 
-# start_vm NAME CID BOUNDARY_FLAGS...
+# start_vm NAME CID [RULES-JSON]
 start_vm() {
-    local name="$1" cid="$2"; shift 2
+    local name="$1" cid="$2" rules="${3:-}"
     local uds="${RUN_DIR}/${name}.vsock" api="${RUN_DIR}/${name}.api"
-    start_boundary "${name}" "" "scenario-09" "$@"
+    start_boundary "${name}" "" "scenario-09" "${rules}"
 
     firecracker --api-sock "${api}" > "${RUN_DIR}/${name}.console" 2>&1 &
     PIDS+=($!)
@@ -183,8 +193,7 @@ result() { # NAME KEY -> value
 echo "=== 5. Boot two sandboxes with different policies ==="
 # vm-a may reach test.example.com on the target port only; the boundary
 # maps the name to the target address.
-start_vm vm-a 3 -allow "test.example.com:${TARGET_PORT}" \
-    -resolve "test.example.com=${TARGET_ADDR}" -allow-ip "${TARGET_ADDR}:${TARGET_PORT}"
+start_vm vm-a 3 "{\"id\":\"target\",\"name\":\"test.example.com\",\"ports\":[${TARGET_PORT}],\"resolve\":[\"${TARGET_ADDR}\"]}"
 VM_A_BOUNDARY_PID="${BOUNDARY_PID}"
 # vm-b has an empty policy: every destination is refused.
 start_vm vm-b 4
@@ -204,7 +213,7 @@ for vm in vm-a vm-b; do
     if python3 "${SCRIPT_DIR}/ingress_probe.py" "${RUN_DIR}/${vm}.vsock" "${INGRESS_PORT}" 22 \
         > "${RUN_DIR}/${vm}.ingress-other" 2>&1; then
         echo "${vm}: ingress to an unpinned port SUCCEEDED"; FAILED=1
-    elif grep -q 'port not permitted' "${RUN_DIR}/${vm}.ingress-other"; then
+    elif grep -q 'reason=port-not-permitted' "${RUN_DIR}/${vm}.ingress-other"; then
         echo "${vm}: ingress to an unpinned port refused by the launcher"
     else
         echo "${vm}: unexpected unpinned-port result: $(cat "${RUN_DIR}/${vm}.ingress-other")"; FAILED=1

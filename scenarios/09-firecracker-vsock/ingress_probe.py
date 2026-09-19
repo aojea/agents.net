@@ -2,9 +2,10 @@
 """Deliver one HTTP request into a Firecracker guest over hybrid vsock.
 
 Host side of the ingress channel: connect to Firecracker's vsock Unix socket,
-ask it for the guest's ingress port ("CONNECT <port>" -> "OK <hostport>"),
-then perform the launcher's own handshake ("CONNECT <loopback port>" ->
-"OK") and send the request. Prints the response body.
+ask it for the guest's ingress port (Firecracker's own "CONNECT <port>" ->
+"OK <hostport>" exchange), then perform the agents.net ingress handshake
+(HTTP `CONNECT 127.0.0.1:<port>` -> 200, spec/draft/ingress.md) and send the
+request. Prints the response body. A refusal prints the Proxy-Status reason.
 """
 import socket
 import sys
@@ -22,6 +23,24 @@ def read_line(sock: socket.socket) -> str:
     return buf.decode(errors="replace").strip()
 
 
+def read_head(sock: socket.socket) -> tuple[int, dict[str, str]]:
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        chunk = sock.recv(1)
+        if not chunk:
+            raise ConnectionError(f"peer closed during handshake after {buf!r}")
+        buf += chunk
+        if len(buf) > 4096:
+            raise ConnectionError("oversized response head")
+    lines = buf.partition(b"\r\n\r\n")[0].decode("latin1").split("\r\n")
+    status = int(lines[0].split(" ", 2)[1])
+    headers = {}
+    for line in lines[1:]:
+        name, _, value = line.partition(":")
+        headers[name.strip().lower()] = value.strip()
+    return status, headers
+
+
 def main() -> int:
     if len(sys.argv) != 4:
         print(f"usage: {sys.argv[0]} <firecracker-vsock-uds> <guest-vsock-port> <loopback-port>", file=sys.stderr)
@@ -35,10 +54,11 @@ def main() -> int:
         if not reply.startswith("OK"):
             print(f"firecracker refused: {reply}", file=sys.stderr)
             return 1
-        sock.sendall(f"CONNECT {loopback_port}\n".encode())
-        reply = read_line(sock)
-        if reply != "OK":
-            print(f"launcher refused: {reply}", file=sys.stderr)
+        target = f"127.0.0.1:{loopback_port}"
+        sock.sendall(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n".encode())
+        status, headers = read_head(sock)
+        if not 200 <= status < 300:
+            print(f"launcher refused: {status} {headers.get('proxy-status', '')}", file=sys.stderr)
             return 1
         sock.sendall(b"GET /index.html HTTP/1.0\r\nHost: guest\r\n\r\n")
         response = b""

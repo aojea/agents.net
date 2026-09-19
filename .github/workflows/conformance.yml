@@ -1,0 +1,57 @@
+name: conformance
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'conformance/**'
+      - 'spec/draft/schema/**'
+      - 'sdk/**'
+      - '.github/workflows/conformance.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'conformance/**'
+      - 'spec/draft/schema/**'
+      - 'sdk/**'
+      - '.github/workflows/conformance.yml'
+
+jobs:
+  boundary:
+    name: Boundary profiles against the reference
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: sdk/go.mod
+          cache-dependency-path: sdk/go.sum
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Fixtures and schemas are valid JSON Schema instances
+        run: |
+          pip install --quiet jsonschema
+          python3 conformance/harness/check_fixtures.py
+
+      # The harness supplies the upstream and the resolver; the driver
+      # builds connect-proxy and starts it per policy descriptor. Every
+      # automated case must pass; manual cases are reported, not run.
+      - name: Run the boundary suite
+        run: |
+          python3 conformance/harness/run_boundary.py \
+            --driver conformance/harness/drivers/connect-proxy.sh \
+            --results conformance-results.jsonl
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: conformance-results
+          path: conformance-results.jsonl

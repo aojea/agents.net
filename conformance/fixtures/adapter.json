@@ -1,0 +1,219 @@
+{
+  "agents_net_conformance": "0.1",
+  "role": "adapter",
+  "environment": {
+    "describe": "The test workload runs inside the sandbox under the adapter under test. The harness boundary runs outside the sandbox on the channel the controller assigned, with the policy named by each case, and records audit lines. Where a case names a harness boundary behavior (2xx variant, interim response, closed socket), the harness boundary produces it.",
+    "policy": {
+      "agents_net_policy": 1,
+      "version": "adapter-v1",
+      "sandbox": "conformance-a",
+      "default": "deny",
+      "rules": [
+        {"id": "named", "name": "allowed.test", "ports": [443], "resolve": ["{target4}"]},
+        {"id": "named6", "name": "allowed6.test", "ports": [443], "resolve": ["{target6}"]},
+        {"id": "lit4", "ip": "{target4}", "ports": [443]},
+        {"id": "lit6", "ip": "{target6}", "ports": [443]},
+        {"id": "udp", "ip": "{target4}", "ports": [5353], "transports": ["udp"]}
+      ],
+      "features": {"udp": "{udp_enabled}", "h2": false}
+    }
+  },
+  "cases": [
+    {
+      "id": "A-PKT-01",
+      "group": "adapter-packet",
+      "title": "An ordinary TCP client connecting by hostname is carried as CONNECT with that hostname",
+      "spec": ["adapters §1", "wire §1(2)", "adapters §2"],
+      "workload": "connect tcp allowed.test:443; write 'ping'; read 'ping'",
+      "expect": {"workload": "success", "audit": {"decision": "allow", "destination": "allowed.test:443", "address": "{target4}:443"}}
+    },
+    {
+      "id": "A-PKT-02",
+      "group": "adapter-packet",
+      "title": "A denied hostname fails within the documented refusal bound and nothing leaves the sandbox",
+      "spec": ["wire §1(6)", "adapters §2"],
+      "workload": "connect tcp denied.test:443 with timeout = documented bound + 1s",
+      "expect": {"workload": "connection-error", "elapsed_max": "documented bound", "audit": {"decision": "block", "reason": "not-on-allowlist"}, "external_packets": 0}
+    },
+    {
+      "id": "A-PKT-03",
+      "group": "adapter-packet",
+      "title": "A literal IPv4 destination is carried as a literal",
+      "spec": ["wire §1(2)"],
+      "workload": "connect tcp {target4}:443",
+      "expect": {"workload": "success", "audit": {"decision": "allow", "destination": "{target4}:443"}}
+    },
+    {
+      "id": "A-PKT-04",
+      "group": "adapter-packet",
+      "title": "A literal IPv6 destination is carried with brackets",
+      "spec": ["wire §1(2)"],
+      "requires": ["ipv6"],
+      "workload": "connect tcp [{target6}]:443",
+      "expect": {"workload": "success", "audit": {"decision": "allow", "destination": "[{target6}]:443"}}
+    },
+    {
+      "id": "A-PKT-05",
+      "group": "adapter-packet",
+      "title": "A denied literal fails and is audited as a literal denial",
+      "spec": ["wire §1(5)"],
+      "workload": "connect tcp 192.0.2.1:443",
+      "expect": {"workload": "connection-error", "audit": {"decision": "block", "reason": "ip-not-on-allowlist"}}
+    },
+    {
+      "id": "A-PKT-06",
+      "group": "adapter-packet",
+      "title": "A client that ignores proxy environment variables is still governed",
+      "spec": ["adapters §1"],
+      "workload": "unset HTTP_PROXY HTTPS_PROXY ALL_PROXY; connect tcp denied.test:443 with a raw socket",
+      "expect": {"workload": "connection-error", "audit": {"decision": "block"}, "external_packets": 0}
+    },
+    {
+      "id": "A-PKT-07",
+      "group": "adapter-packet",
+      "title": "DNS is answered locally: A and AAAA return synthetic or mapped addresses; other types return no data; no DNS reaches the boundary",
+      "spec": ["adapters §2"],
+      "workload": "query A, AAAA, MX, SRV, TXT for allowed.test at the configured resolver",
+      "expect": {"a_or_aaaa": "answered", "mx_srv_txt": "no-data or empty", "audit": {"none_with_transport": "udp", "none_with_port": 53}}
+    },
+    {
+      "id": "A-PKT-08",
+      "group": "adapter-packet",
+      "title": "With UDP disabled, non-DNS UDP fails locally and no datagram leaves the sandbox",
+      "spec": ["wire §1(3)", "adapters §2"],
+      "requires": ["udp_disabled"],
+      "workload": "send udp to {target4}:5353; wait 2s",
+      "expect": {"workload": "no-reply-or-error", "external_packets": 0, "audit": {"none": true}}
+    },
+    {
+      "id": "A-PKT-09",
+      "group": "adapter-packet",
+      "title": "The adapter treats any 2xx CONNECT response as success",
+      "spec": ["RFC 9110 9.3.6", "wire §3"],
+      "harness_boundary": {"respond": "HTTP/1.1 202 Accepted"},
+      "workload": "connect tcp allowed.test:443; write 'ping'; read 'ping'",
+      "expect": {"workload": "success"}
+    },
+    {
+      "id": "A-PKT-10",
+      "group": "adapter-packet",
+      "title": "The adapter skips a 1xx interim response before the final 200",
+      "spec": ["RFC 9110 15.2", "wire §3"],
+      "harness_boundary": {"respond": ["HTTP/1.1 100 Continue", "HTTP/1.1 200 OK"]},
+      "workload": "connect tcp allowed.test:443; write 'ping'; read 'ping'",
+      "expect": {"workload": "success"}
+    },
+    {
+      "id": "A-PKT-11",
+      "group": "adapter-packet",
+      "title": "A 403 from the boundary is a connection failure; retries do not bypass",
+      "spec": ["wire §1(6)"],
+      "harness_boundary": {"respond": "HTTP/1.1 403 Forbidden", "reason": "not-on-allowlist"},
+      "workload": "connect tcp allowed.test:443 three times",
+      "expect": {"workload": "connection-error x3", "boundary_requests": 3, "external_packets": 0}
+    },
+    {
+      "id": "A-PKT-12",
+      "group": "adapter-packet",
+      "title": "An unavailable boundary is a connection failure, not a direct path",
+      "spec": ["wire §1(7)", "lifecycle §2"],
+      "harness_boundary": {"state": "closed"},
+      "workload": "connect tcp allowed.test:443",
+      "expect": {"workload": "connection-error", "external_packets": 0}
+    },
+    {
+      "id": "A-PKT-13",
+      "group": "adapter-packet",
+      "title": "A synthetic address whose name is no longer known is forwarded as a literal and denied",
+      "spec": ["adapters §2"],
+      "requires": ["synthetic_dns"],
+      "workload": "resolve allowed.test; evict the mapping per the compatibility statement (or restart the adapter in a fresh generation); connect to the cached address",
+      "expect": {"workload": "connection-error", "audit": {"decision": "block", "reason": "ip-not-on-allowlist", "destination_in": "synthetic ranges"}}
+    },
+    {
+      "id": "A-PKT-14",
+      "group": "adapter-packet",
+      "title": "Denial is observable as a connection failure, not as application data",
+      "spec": ["wire §1(6)", "adapters §2"],
+      "workload": "connect tcp denied.test:443; if connected, read up to 1024 bytes",
+      "expect": {"workload": "connection-error or EOF", "bytes_read": 0}
+    },
+    {
+      "id": "A-UDP-01",
+      "group": "adapter-udp",
+      "title": "With UDP enabled, a datagram to an allowed destination is carried through connect-udp and the reply returns",
+      "spec": ["wire §1(3)", "RFC 9298"],
+      "requires": ["udp_enabled"],
+      "workload": "send udp 'ping' to {target4}:5353; receive 'ping'",
+      "expect": {"workload": "success", "audit": {"decision": "allow", "transport": "udp", "destination": "{target4}:5353"}}
+    },
+    {
+      "id": "A-UDP-02",
+      "group": "adapter-udp",
+      "title": "A denied UDP destination is dropped and audited",
+      "spec": ["adapters §2"],
+      "requires": ["udp_enabled"],
+      "workload": "send udp to 192.0.2.1:5353; wait 2s",
+      "expect": {"workload": "no-reply-or-error", "audit": {"decision": "block", "transport": "udp"}}
+    },
+    {
+      "id": "A-EXP-01",
+      "group": "adapter-explicit",
+      "title": "A proxy-aware client using the environment variables reaches an allowed destination",
+      "spec": ["adapters §3"],
+      "workload": "curl --fail https://allowed.test/ (HTTPS_PROXY set by the adapter)",
+      "expect": {"workload": "success", "audit": {"decision": "allow", "destination": "allowed.test:443"}}
+    },
+    {
+      "id": "A-EXP-02",
+      "group": "adapter-explicit",
+      "title": "A denied destination returns the boundary's 403 and reason fields to the client",
+      "spec": ["adapters §3", "wire §4"],
+      "workload": "curl -v https://denied.test/",
+      "expect": {"workload": "CONNECT tunnel failed, response 403", "response_fields": ["Proxy-Status: boundary; error=http_request_denied; reason=not-on-allowlist"]}
+    },
+    {
+      "id": "A-EXP-03",
+      "group": "adapter-explicit",
+      "title": "A connection that bypasses the endpoint fails",
+      "spec": ["adapters §3", "identity §2"],
+      "workload": "connect tcp {target4}:443 directly, ignoring proxy variables",
+      "expect": {"workload": "connection-error", "external_packets": 0}
+    },
+    {
+      "id": "A-EXP-04",
+      "group": "adapter-explicit",
+      "title": "The endpoint forwards the authority unchanged and adds no authority",
+      "spec": ["adapters §3"],
+      "workload": "raw CONNECT denied.test:443 with 'Sandbox-Id: conformance-b' to the endpoint",
+      "expect": {"status": 403, "reason": "not-on-allowlist", "audit": {"sandbox": "conformance-a"}}
+    },
+    {
+      "id": "A-EXP-05",
+      "group": "adapter-explicit",
+      "title": "A SOCKS5 endpoint, when offered, produces the same decisions",
+      "spec": ["adapters §3"],
+      "requires": ["socks5"],
+      "workload": "curl --socks5-hostname <endpoint> https://allowed.test/ and https://denied.test/",
+      "expect": {"allowed": "success", "denied": "failure", "audit": [{"decision": "allow", "destination": "allowed.test:443"}, {"decision": "block", "destination": "denied.test:443"}]}
+    },
+    {
+      "id": "A-DIAG-01",
+      "group": "adapter-diagnostics",
+      "title": "After a denial, the diagnostics endpoint lists it with reason and policy version",
+      "spec": ["adapters §5"],
+      "requires": ["diagnostics"],
+      "workload": "connect tcp denied.test:443; GET $AGENTS_NET_DIAGNOSTICS/denials",
+      "expect": {"denials_contains": {"destination": "denied.test:443", "reason": "not-on-allowlist", "policy": "adapter-v1"}}
+    },
+    {
+      "id": "A-DIAG-02",
+      "group": "adapter-diagnostics",
+      "title": "The diagnostics endpoint is read-only and scoped to this sandbox",
+      "spec": ["adapters §5"],
+      "requires": ["diagnostics", "two_sandboxes"],
+      "workload": "sandbox B denies a request; sandbox A reads its endpoint; A sends POST/PUT/DELETE",
+      "expect": {"a_sees_b": false, "write_methods": "405 or connection refused"}
+    }
+  ]
+}

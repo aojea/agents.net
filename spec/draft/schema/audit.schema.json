@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agents.net/schema/audit/1",
+  "title": "agents.net audit record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["ts", "sandbox", "policy", "wire", "decision"],
+  "properties": {
+    "agents_net_audit": {"const": 1},
+    "ts": {"type": "string", "format": "date-time"},
+    "listener": {"type": "string"},
+    "sandbox": {"type": "string", "minLength": 1},
+    "generation": {"type": "string"},
+    "policy": {"type": "string", "minLength": 1},
+    "wire": {"enum": ["h1", "h2"]},
+    "transport": {"enum": ["tcp", "udp"]},
+    "direction": {"enum": ["egress", "ingress"], "default": "egress"},
+    "destination": {"type": "string", "minLength": 1},
+    "address": {"type": "string", "minLength": 1},
+    "peer": {"type": "string"},
+    "connection": {"type": "string"},
+    "rule": {"type": "string"},
+    "decision": {"enum": ["allow", "block", "fail"]},
+    "reason": {"type": "string", "pattern": "^[a-z0-9-]{1,32}$"},
+    "meta": {
+      "type": "object",
+      "additionalProperties": {"type": "string"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"decision": {"enum": ["block", "fail"]}}},
+      "then": {"required": ["reason"]}
+    },
+    {
+      "if": {"properties": {"decision": {"const": "allow"}}},
+      "then": {"required": ["address", "transport", "destination"]}
+    }
+  ]
+}

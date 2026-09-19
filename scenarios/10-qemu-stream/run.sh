@@ -29,22 +29,30 @@ if [[ "${1:-}" == fixtures ]]; then
     children+=($!)
     "${RUN_DIR}/bin/target-server" -host '[2001:db8::10]' -port 18080 >"${RUN_DIR}/target6.log" 2>&1 &
     children+=($!)
+    cat >"${RUN_DIR}/vm-a.policy.json" <<'POLICY'
+{"agents_net_policy":1,"version":"initial","sandbox":"vm-a","default":"deny","rules":[
+  {"id":"www","name":"www.example.com","ports":[18080],"resolve":["192.0.2.10"]},
+  {"id":"v6","name":"v6.example.com","ports":[18080],"resolve":["2001:db8::10"]},
+  {"id":"lit4","ip":"192.0.2.10","ports":[18080]},
+  {"id":"lit6","ip":"2001:db8::10","ports":[18080]}
+]}
+POLICY
+    echo '{"agents_net_policy":1,"version":"empty","sandbox":"vm-b","default":"deny","rules":[]}' >"${RUN_DIR}/vm-b.policy.json"
+    echo '{"agents_net_policy":1,"version":"revoked","sandbox":"vm-a","default":"deny","rules":[]}' >"${RUN_DIR}/vm-a.revoked.policy.json"
     "${RUN_DIR}/bin/connect-proxy" -listen "unix://${RUN_DIR}/vm-a.boundary/egress.sock" \
-        -sandbox vm-a -policy-version initial -allow www.example.com:18080,v6.example.com:18080 \
-        -allow-ip '192.0.2.10:18080,[2001:db8::10]:18080' \
-        -resolve 'www.example.com=192.0.2.10,v6.example.com=2001:db8::10' \
+        -policy "${RUN_DIR}/vm-a.policy.json" -generation 1 \
         >"${RUN_DIR}/vm-a.audit" 2>"${RUN_DIR}/vm-a.boundary.log" &
     boundary_pid=$!
     children+=("$boundary_pid")
     "${RUN_DIR}/bin/connect-proxy" -listen "unix://${RUN_DIR}/vm-b.boundary/egress.sock" \
-        -sandbox vm-b -policy-version empty >"${RUN_DIR}/vm-b.audit" 2>"${RUN_DIR}/vm-b.boundary.log" &
+        -policy "${RUN_DIR}/vm-b.policy.json" -generation 1 >"${RUN_DIR}/vm-b.audit" 2>"${RUN_DIR}/vm-b.boundary.log" &
     children+=($!)
     read -r command <"${RUN_DIR}/fixtures.control"
     [[ "$command" == revoke ]] || exit 1
     kill "$boundary_pid"
     wait "$boundary_pid" || true
     "${RUN_DIR}/bin/connect-proxy" -listen "unix://${RUN_DIR}/vm-a.boundary/egress.sock" \
-        -sandbox vm-a -policy-version revoked >"${RUN_DIR}/vm-a.revoked.audit" 2>"${RUN_DIR}/vm-a.revoked.log" &
+        -policy "${RUN_DIR}/vm-a.revoked.policy.json" -generation 2 >"${RUN_DIR}/vm-a.revoked.audit" 2>"${RUN_DIR}/vm-a.revoked.log" &
     children+=($!)
     wait
     exit
@@ -91,8 +99,8 @@ chmod +x "${RUN_DIR}/root/init"
 pushd "${RUN_DIR}/root" >/dev/null
 find . -print0 | cpio --null -o --format=newc --owner=0:0 >"${RUN_DIR}/initramfs" 2>"${RUN_DIR}/cpio.log"
 popd >/dev/null
-CGO_ENABLED=0 go -C "${REPO_ROOT}/tun2connect" build -o "${RUN_DIR}/bin/qemuproxy" ./cmd/qemuproxy
-CGO_ENABLED=0 go -C "${REPO_ROOT}/tun2connect" build -o "${RUN_DIR}/bin/connect-proxy" ./cmd/connect-proxy
+CGO_ENABLED=0 go -C "${REPO_ROOT}/sdk" build -o "${RUN_DIR}/bin/qemuproxy" ./cmd/qemuproxy
+CGO_ENABLED=0 go -C "${REPO_ROOT}/sdk" build -o "${RUN_DIR}/bin/connect-proxy" ./cmd/connect-proxy
 go -C "${REPO_ROOT}/scenarios" build -o "${RUN_DIR}/bin/target-server" ./cmd/target-server
 for vm in vm-a vm-b; do
     mkdir -m 700 "${RUN_DIR}/${vm}.packets" "${RUN_DIR}/${vm}.boundary"

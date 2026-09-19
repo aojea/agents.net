@@ -237,7 +237,7 @@ func handleConnection(conn net.Conn) {
 		// Also allow if target matches (e.g. host:port)
 		if !allowedHosts[strings.ToLower(target)] {
 			recordAudit("BLOCK not-on-allowlist", target, capsuleID)
-			fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nBoundary-Reason: not-on-allowlist\r\nContent-Length: 0\r\n\r\n")
+			fmt.Fprintf(conn, "HTTP/1.1 403 Forbidden\r\nProxy-Status: boundary; error=http_request_denied; reason=not-on-allowlist\r\nContent-Length: 0\r\n\r\n")
 			return
 		}
 	}
@@ -251,7 +251,7 @@ func handleConnection(conn net.Conn) {
 	upstream, err := net.DialTimeout("tcp", dialTarget, 5*time.Second)
 	if err != nil {
 		recordAudit("DIAL-FAIL", target, capsuleID)
-		fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nBoundary-Reason: dial-failed\r\nContent-Length: 0\r\n\r\n")
+		fmt.Fprintf(conn, "HTTP/1.1 502 Bad Gateway\r\nProxy-Status: boundary; error=destination_unavailable; reason=dial-failed\r\nContent-Length: 0\r\n\r\n")
 		return
 	}
 	defer upstream.Close()

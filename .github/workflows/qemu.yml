@@ -6,14 +6,14 @@ on:
     paths:
       - 'scenarios/10-qemu-stream/**'
       - 'scenarios/cmd/target-server/**'
-      - 'tun2connect/**'
+      - 'sdk/**'
       - '.github/workflows/qemu.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'scenarios/10-qemu-stream/**'
       - 'scenarios/cmd/target-server/**'
-      - 'tun2connect/**'
+      - 'sdk/**'
       - '.github/workflows/qemu.yml'
 
 jobs:
@@ -25,9 +25,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version-file: tun2connect/go.mod
+          go-version-file: sdk/go.mod
           cache-dependency-path: |
-            tun2connect/go.sum
+            sdk/go.sum
             scenarios/go.sum
       - name: Install tools
         run: |
@@ -46,7 +46,7 @@ jobs:
           path: ~/.cache/agents.net
           key: firecracker-guest-kernel-6.18.41
       - name: Packet adapter tests
-        run: go -C tun2connect test -race -count=1 ./pkg/qemuproxy ./cmd/qemuproxy
+        run: go -C sdk test -race -count=1 ./pkg/qemuproxy ./cmd/qemuproxy
       - name: Run QEMU integration
         env:
           KEEP_RUN_DIR: '1'

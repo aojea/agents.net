@@ -13,14 +13,14 @@ on:
     paths:
       - 'scenarios/09-firecracker-vsock/**'
       - 'scenarios/cmd/target-server/**'
-      - 'tun2connect/**'
+      - 'sdk/**'
       - '.github/workflows/firecracker.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'scenarios/09-firecracker-vsock/**'
       - 'scenarios/cmd/target-server/**'
-      - 'tun2connect/**'
+      - 'sdk/**'
       - '.github/workflows/firecracker.yml'
 
 env:
@@ -39,9 +39,9 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: tun2connect/go.mod
+          go-version-file: sdk/go.mod
           cache-dependency-path: |
-            tun2connect/go.sum
+            sdk/go.sum
             scenarios/go.sum
 
       - name: Enable KVM for the runner user

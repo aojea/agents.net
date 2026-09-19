@@ -6,13 +6,13 @@ on:
     paths:
       - 'demo/**'
       # The demo injects the launcher built from these sources.
-      - 'tun2connect/**'
+      - 'sdk/**'
       - '.github/workflows/demo.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'demo/**'
-      - 'tun2connect/**'
+      - 'sdk/**'
       - '.github/workflows/demo.yml'
 
 jobs:
@@ -34,8 +34,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version-file: tun2connect/go.mod
-          cache-dependency-path: tun2connect/go.sum
+          go-version-file: sdk/go.mod
+          cache-dependency-path: sdk/go.sum
 
       - name: Run Demo Presubmit Test
         run: |

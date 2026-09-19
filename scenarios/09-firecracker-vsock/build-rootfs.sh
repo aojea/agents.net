@@ -18,7 +18,7 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
 
 echo "=== Building launcher (CGO_ENABLED=0) ==="
-CGO_ENABLED=0 go -C "${REPO_ROOT}/tun2connect" build -ldflags='-s -w' \
+CGO_ENABLED=0 go -C "${REPO_ROOT}/sdk" build -ldflags='-s -w' \
     -o "${WORK}/tun2connect" ./cmd/tun2connect
 cp "${SCRIPT_DIR}/init.sh" "${WORK}/init.sh"
 

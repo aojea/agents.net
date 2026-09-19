@@ -1,0 +1,113 @@
+{
+  "agents_net_conformance": "0.1",
+  "role": "controller",
+  "environment": {
+    "describe": "Two sandboxes A and B are created by the controller under test with the policies below. The harness runs a workload probe inside each sandbox and observes boundary sockets, audit output, process state, and, where stated, packet captures on every host interface other than the boundary channels."
+  },
+  "policies": {
+    "a": {"agents_net_policy": 1, "version": "a-v1", "sandbox": "sandbox-a", "default": "deny",
+      "rules": [{"id": "svc", "name": "svc.test", "ports": [443], "resolve": ["{target4}"]}]},
+    "a-revoked": {"agents_net_policy": 1, "version": "a-v2", "sandbox": "sandbox-a", "default": "deny", "rules": []},
+    "b": {"agents_net_policy": 1, "version": "b-v1", "sandbox": "sandbox-b", "default": "deny", "rules": []}
+  },
+  "cases": [
+    {
+      "id": "C-LOCAL-01",
+      "group": "controller-local",
+      "title": "The workload is not started before the boundary answers under its policy",
+      "spec": ["isolation §2", "lifecycle §2", "isolation §6.1"],
+      "procedure": "Instrument the workload entrypoint to record its start time; connect to A's boundary socket from the harness immediately after the controller reports readiness and send CONNECT denied.test:443.",
+      "expect": {"harness_connect": "accepted", "status": 403, "workload_started_before_readiness": false}
+    },
+    {
+      "id": "C-LOCAL-02",
+      "group": "controller-local",
+      "title": "Neither sandbox can reach the other's boundary socket; a forged request on one channel is decided under that channel's policy",
+      "spec": ["isolation §1", "identity §2", "isolation §6.1"],
+      "procedure": "From A, attempt to connect to B's socket path as seen from the host and as guessed inside A's mount namespace; from A's channel send CONNECT svc.test:443 with Sandbox-Id: sandbox-b; from B's channel send the same request.",
+      "expect": {"a_to_b_socket": "ENOENT or EACCES", "a_request": {"status": 200}, "b_request": {"status": 403, "reason": "not-on-allowlist"}, "audit": {"b": {"sandbox": "sandbox-b"}}}
+    },
+    {
+      "id": "C-LOCAL-03",
+      "group": "controller-local",
+      "title": "Revoking A while a transfer is active ends the transfer, refuses the old socket, and leaves B unaffected",
+      "spec": ["lifecycle §2", "isolation §6.1"],
+      "procedure": "Start a rate-limited download in A through svc.test; revoke A; connect to A's old socket path; send a request on B's channel.",
+      "expect": {"a_transfer": "terminated with a transport error", "a_old_socket": "ECONNREFUSED or ENOENT", "b_request": {"status": 403}, "revocation_reported_only_after": "A's boundary process exited or all A flows closed"}
+    },
+    {
+      "id": "C-LOCAL-04",
+      "group": "controller-local",
+      "title": "A replacement boundary on the same path with a new policy decides the next request and audits the new version",
+      "spec": ["lifecycle §2", "lifecycle §1"],
+      "procedure": "After C-LOCAL-03, start A's boundary with policy a-revoked on the same path; from A connect svc.test:443.",
+      "expect": {"a_request": {"status": 403, "reason": "not-on-allowlist"}, "audit": {"a": {"policy": "a-v2"}}}
+    },
+    {
+      "id": "C-LOCAL-05",
+      "group": "controller-local",
+      "title": "Stopping the adapter and changing guest routes creates no external path",
+      "spec": ["lifecycle §2", "isolation §6.1(4)"],
+      "procedure": "Stop A's adapter; inside A add a default route via any local interface; connect tcp {target4}:443 and send udp to {target4}:5353; capture on all host interfaces other than boundary channels.",
+      "expect": {"workload": "connection-error", "external_packets_from_a": 0}
+    },
+    {
+      "id": "C-LOCAL-06",
+      "group": "controller-local",
+      "title": "A connection accepted before revocation cannot reach the replacement boundary",
+      "spec": ["lifecycle §2", "isolation §6.1"],
+      "procedure": "Open a tunnel on A's channel; revoke A; start the replacement; send a new request on the old connection.",
+      "expect": {"old_connection": "EOF or reset", "audit_replacement": {"none_for_old_connection": true}}
+    },
+    {
+      "id": "C-LOCAL-07",
+      "group": "controller-local",
+      "title": "Namespace adapter confinement beyond the network namespace (checklist)",
+      "spec": ["identity §2", "adapters §2"],
+      "procedure": "Runtime audit checklist items 1-8 for the adapter process.",
+      "expect": {"checklist": "all items recorded"}
+    },
+    {
+      "id": "C-VM-01",
+      "group": "controller-vm",
+      "title": "A VM channel port that the controller did not bind is unreachable",
+      "spec": ["index §2", "identity §6"],
+      "procedure": "From guest A connect to the host CID on a port other than the boundary and ingress ports.",
+      "expect": {"guest_connect": "reset or refused", "audit": {"none": true}}
+    },
+    {
+      "id": "C-VM-02",
+      "group": "controller-vm",
+      "title": "Per-VM listeners decide the same request under disjoint policies",
+      "spec": ["isolation §6.1", "identity §6"],
+      "procedure": "From guests A and B send CONNECT svc.test:443 on the boundary port.",
+      "expect": {"a": {"status": 200}, "b": {"status": 403}}
+    },
+    {
+      "id": "C-VM-03",
+      "group": "controller-vm",
+      "title": "An identifier (CID, VM ID, socket prefix) is not reused until the previous binding is revoked",
+      "spec": ["identity §1", "identity §2", "identity §6"],
+      "procedure": "Revoke A; start a new VM that would receive A's identifier; confirm the controller records revocation before the new binding.",
+      "expect": {"binding_order": "revoke-then-bind", "new_vm_policy": "its own"}
+    },
+    {
+      "id": "C-SNAP-01",
+      "group": "controller-snapshot",
+      "title": "A synthetic address cached before a snapshot does not reach a different destination after restore",
+      "spec": ["lifecycle §3"],
+      "requires": ["snapshot"],
+      "procedure": "In A resolve svc.test (synthetic S) and other.test (synthetic T); snapshot; restore under a fresh adapter generation; in the restored guest connect to S and T without re-resolving.",
+      "expect": {"connections": "each either reaches its original name or fails", "misdirected": 0, "audit": {"generation": "new value"}}
+    },
+    {
+      "id": "C-SNAP-02",
+      "group": "controller-snapshot",
+      "title": "Restore is refused or re-bound when adapter state cannot be restored",
+      "spec": ["lifecycle §3"],
+      "requires": ["snapshot"],
+      "procedure": "Restore a snapshot whose adapter state is unavailable.",
+      "expect": {"outcome": "refused, or fresh adapter with a disjoint pool and new generation in audit"}
+    }
+  ]
+}

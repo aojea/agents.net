@@ -1,0 +1,2555 @@
+{
+  "agents_net_conformance": "0.1",
+  "role": "boundary",
+  "placeholders": {
+    "{port}": "upstream port chosen by the harness",
+    "{upstream4}": "127.0.0.1:{port}",
+    "{upstream6}": "[::1]:{port}",
+    "{payload}": "the bytes 'after-head' sent immediately after the request head",
+    "{nested}": "a nested CONNECT request line and Host field sent as tunnel payload",
+    "{pad}": "70000 bytes of 'a'"
+  },
+  "policies": {
+    "core": {
+      "descriptor": {
+        "agents_net_policy": 1,
+        "version": "core-v1",
+        "sandbox": "conformance-a",
+        "default": "deny",
+        "rules": [
+          {
+            "id": "lit4",
+            "ip": "127.0.0.1",
+            "ports": [
+              "{port}"
+            ]
+          },
+          {
+            "id": "lit6",
+            "cidr": "::1/128",
+            "ports": [
+              "{port}"
+            ]
+          },
+          {
+            "id": "named",
+            "name": "allowed.test",
+            "ports": [
+              "{port}"
+            ],
+            "resolve": [
+              "127.0.0.1"
+            ]
+          },
+          {
+            "id": "loop",
+            "name": "localhost",
+            "ports": [
+              "{port}"
+            ]
+          }
+        ],
+        "features": {
+          "udp": false,
+          "h2": false
+        }
+      }
+    },
+    "core-budget1": {
+      "descriptor": {
+        "agents_net_policy": 1,
+        "version": "budget-v1",
+        "sandbox": "conformance-a",
+        "default": "deny",
+        "rules": [
+          {
+            "id": "lit4",
+            "ip": "127.0.0.1",
+            "ports": [
+              "{port}"
+            ]
+          }
+        ],
+        "features": {
+          "udp": false,
+          "h2": false
+        }
+      },
+      "iut": {
+        "max_connections": 1
+      }
+    },
+    "names-only": {
+      "descriptor": {
+        "agents_net_policy": 1,
+        "version": "names-v1",
+        "sandbox": "conformance-a",
+        "default": "deny",
+        "rules": [
+          {
+            "id": "loop",
+            "name": "localhost",
+            "ports": [
+              "{port}"
+            ]
+          }
+        ],
+        "features": {
+          "udp": false,
+          "h2": false
+        }
+      }
+    },
+    "loopback-exception": {
+      "descriptor": {
+        "agents_net_policy": 1,
+        "version": "loop-v1",
+        "sandbox": "conformance-a",
+        "default": "deny",
+        "rules": [
+          {
+            "id": "loop",
+            "name": "localhost",
+            "ports": [
+              "{port}"
+            ]
+          }
+        ],
+        "resolved_addresses": [
+          {
+            "cidr": "127.0.0.0/8",
+            "ports": [
+              "{port}"
+            ]
+          },
+          {
+            "cidr": "::1/128",
+            "ports": [
+              "{port}"
+            ]
+          }
+        ],
+        "features": {
+          "udp": false,
+          "h2": false
+        }
+      }
+    },
+    "any": {
+      "descriptor": {
+        "agents_net_policy": 1,
+        "version": "any-v1",
+        "sandbox": "conformance-a",
+        "default": "deny",
+        "rules": [
+          {
+            "id": "any",
+            "name": "*",
+            "ports": [
+              "{port}"
+            ]
+          }
+        ],
+        "resolved_addresses": [
+          {
+            "cidr": "127.0.0.0/8",
+            "ports": [
+              "{port}"
+            ]
+          },
+          {
+            "cidr": "::1/128",
+            "ports": [
+              "{port}"
+            ]
+          }
+        ],
+        "features": {
+          "udp": false,
+          "h2": false
+        }
+      }
+    },
+    "suffix": {
+      "descriptor": {
+        "agents_net_policy": 1,
+        "version": "suffix-v1",
+        "sandbox": "conformance-a",
+        "default": "deny",
+        "rules": [
+          {
+            "id": "sfx",
+            "suffix": "suffix.test",
+            "ports": [
+              "{port}"
+            ]
+          },
+          {
+            "id": "one",
+            "suffix": "depth.test",
+            "depth": 1,
+            "ports": [
+              "{port}"
+            ]
+          }
+        ],
+        "resolved_addresses": [
+          {
+            "cidr": "127.0.0.0/8",
+            "ports": [
+              "{port}"
+            ]
+          }
+        ],
+        "features": {
+          "udp": false,
+          "h2": false
+        }
+      }
+    },
+    "udp": {
+      "descriptor": {
+        "agents_net_policy": 1,
+        "version": "udp-v1",
+        "sandbox": "conformance-a",
+        "default": "deny",
+        "rules": [
+          {
+            "id": "both",
+            "ip": "127.0.0.1",
+            "ports": [
+              "{port}"
+            ],
+            "transports": [
+              "tcp",
+              "udp"
+            ]
+          },
+          {
+            "id": "tcp-only",
+            "ip": "127.0.0.2",
+            "ports": [
+              "{port}"
+            ]
+          }
+        ],
+        "features": {
+          "udp": true,
+          "h2": true
+        }
+      }
+    }
+  },
+  "cases": [
+    {
+      "id": "B-CORE-01",
+      "group": "boundary-core",
+      "title": "Authority-form CONNECT to a listed literal succeeds and relays bytes sent after the head",
+      "spec": [
+        "wire §1(1)",
+        "wire §2",
+        "wire §3"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow",
+          "transport": "tcp",
+          "destination": "{upstream4}",
+          "address": "{upstream4}",
+          "sandbox": "conformance-a",
+          "policy": "core-v1"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-02",
+      "group": "boundary-core",
+      "title": "HTTP/1.0 CONNECT without Host is accepted",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.0\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-03",
+      "group": "boundary-core",
+      "title": "Content-Length on CONNECT is ignored; bytes after the head are tunnel data",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\nContent-Length: 3\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-04",
+      "group": "boundary-core",
+      "title": "HTTP/1.1 without Host is refused",
+      "spec": [
+        "wire §2",
+        "registries §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "missing-host",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "missing-host",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-05",
+      "group": "boundary-core",
+      "title": "Duplicate Host fields are refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "duplicate-host",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "duplicate-host",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-06",
+      "group": "boundary-core",
+      "title": "Host naming a different host is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: 192.0.2.1:{port}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "authority-mismatch",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "authority-mismatch",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-07",
+      "group": "boundary-core",
+      "title": "Host naming a different port is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: 127.0.0.1:443\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "authority-mismatch",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "authority-mismatch",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-08",
+      "group": "boundary-core",
+      "title": "Host using a different address text for the same address is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:{port}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "authority-mismatch",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "authority-mismatch",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-09",
+      "group": "boundary-core",
+      "title": "Authority without a port is refused",
+      "spec": [
+        "wire §1(1)",
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT 127.0.0.1 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-target",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-target",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-10",
+      "group": "boundary-core",
+      "title": "Port zero is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT 127.0.0.1:0 HTTP/1.1\r\nHost: 127.0.0.1:0\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-port",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-port",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-11",
+      "group": "boundary-core",
+      "title": "Port above 65535 is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT 127.0.0.1:65536 HTTP/1.1\r\nHost: 127.0.0.1:65536\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-port",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-port",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-12",
+      "group": "boundary-core",
+      "title": "A service name in place of a port is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT 127.0.0.1:http HTTP/1.1\r\nHost: 127.0.0.1:http\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-port",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-port",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-13",
+      "group": "boundary-core",
+      "title": "Userinfo in the authority is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT user@{upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-target",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-target",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-14",
+      "group": "boundary-core",
+      "title": "A path after the authority is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4}/admin HTTP/1.1\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-target",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-target",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-15",
+      "group": "boundary-core",
+      "title": "A query after the authority is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4}?x=1 HTTP/1.1\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-target",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-target",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-16",
+      "group": "boundary-core",
+      "title": "Absolute-form request-target is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT http://{upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-target",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-target",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-17",
+      "group": "boundary-core",
+      "title": "Empty authority is refused as a malformed request line",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT  HTTP/1.1\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-request-line",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-request-line",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-18",
+      "group": "boundary-core",
+      "title": "Unbracketed IPv6 authority is refused",
+      "spec": [
+        "wire §1(2)",
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT ::1:{port} HTTP/1.1\r\nHost: {upstream6}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-target",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-target",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-19",
+      "group": "boundary-core",
+      "title": "Bracketed IPv6 without a port is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT [::1] HTTP/1.1\r\nHost: [::1]\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-target",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-target",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-20",
+      "group": "boundary-core",
+      "title": "HTTP/2.0 request line on the cleartext HTTP/1 listener is refused",
+      "spec": [
+        "wire §2",
+        "registries §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/2.0\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": 505,
+        "reason": "unsupported-version",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "unsupported-version"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-21",
+      "group": "boundary-core",
+      "title": "HTTP/0.9-style request line is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-request-line",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-request-line",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-22",
+      "group": "boundary-core",
+      "title": "Two spaces in the request line are refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4}  HTTP/1.1\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-request-line",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-request-line",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-23",
+      "group": "boundary-core",
+      "title": "A tab separating method and target is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT\t{upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-request-line",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-request-line",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-24",
+      "group": "boundary-core",
+      "title": "Lowercase method is not CONNECT",
+      "spec": [
+        "wire §2",
+        "registries §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "connect {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": "connect-only",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "connect-only"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-25",
+      "group": "boundary-core",
+      "title": "GET without an upgrade is refused",
+      "spec": [
+        "wire §2",
+        "registries §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "GET / HTTP/1.1\r\nHost: boundary\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": "connect-only",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "connect-only"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-26",
+      "group": "boundary-core",
+      "title": "Whitespace before a header colon is refused",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\nBad Header: x\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-header",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-header",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-27",
+      "group": "boundary-core",
+      "title": "Oversized request head is refused before policy",
+      "spec": [
+        "lifecycle §4",
+        "registries §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\nX-Pad: {pad}\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "head-too-large",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "head-too-large",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-28",
+      "group": "boundary-core",
+      "title": "A WebSocket upgrade is not a tunnel request",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "GET / HTTP/1.1\r\nHost: boundary\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": "connect-only",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "connect-only"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-30",
+      "group": "boundary-core",
+      "title": "Unlisted literal is denied and bytes after the head never reach an upstream",
+      "spec": [
+        "wire §1(5)",
+        "wire §1(6)",
+        "wire §5"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT 192.0.2.1:443 HTTP/1.1\r\nHost: 192.0.2.1:443\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "ip-not-on-allowlist",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "ip-not-on-allowlist",
+          "destination": "192.0.2.1:443",
+          "transport": "tcp"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-31",
+      "group": "boundary-core",
+      "title": "Listed literal on an unlisted port is denied",
+      "spec": [
+        "wire §1(5)",
+        "wire §5"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT 127.0.0.1:1 HTTP/1.1\r\nHost: 127.0.0.1:1\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "port-not-allowed",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "port-not-allowed"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-32",
+      "group": "boundary-core",
+      "title": "IPv6 literal authorized by a prefix rule succeeds",
+      "spec": [
+        "wire §1(2)",
+        "wire §5"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "requires": [
+        "ipv6"
+      ],
+      "request": {
+        "raw": "CONNECT {upstream6} HTTP/1.1\r\nHost: {upstream6}\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow",
+          "destination": "{upstream6}",
+          "address": "{upstream6}"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-33",
+      "group": "boundary-core",
+      "title": "Unlisted IPv6 loopback literal on a listed port is denied",
+      "spec": [
+        "wire §5"
+      ],
+      "policy": "core-budget1",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT [::1]:{port} HTTP/1.1\r\nHost: [::1]:{port}\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "ip-not-on-allowlist",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "ip-not-on-allowlist"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-34",
+      "group": "boundary-core",
+      "title": "IPv4-mapped IPv6 literal is normalized to the listed IPv4 address",
+      "spec": [
+        "wire §2",
+        "wire §5"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT [::ffff:127.0.0.1]:{port} HTTP/1.1\r\nHost: [::ffff:127.0.0.1]:{port}\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow",
+          "address": "{upstream4}"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-35",
+      "group": "boundary-core",
+      "title": "IPv6 literal with a zone identifier fails explicitly",
+      "spec": [
+        "wire §2",
+        "wire §5"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT [fe80::1%25eth0]:{port} HTTP/1.1\r\nHost: [fe80::1%25eth0]:{port}\r\n\r\n"
+      },
+      "expect": {
+        "status": [
+          400,
+          403
+        ],
+        "reason": [
+          "scoped-ip",
+          "malformed-target"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-36",
+      "group": "boundary-core",
+      "title": "Allowed hostname with a static resolution succeeds; audit records name and dialed address",
+      "spec": [
+        "wire §1(2)",
+        "wire §5",
+        "policy §2",
+        "audit"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT allowed.test:{port} HTTP/1.1\r\nHost: allowed.test:{port}\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow",
+          "destination": "allowed.test:{port}",
+          "address": "{upstream4}"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-37",
+      "group": "boundary-core",
+      "title": "Hostname matching no rule is denied without resolution or dial",
+      "spec": [
+        "wire §1(5)",
+        "wire §5"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT denied.test:{port} HTTP/1.1\r\nHost: denied.test:{port}\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "not-on-allowlist",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "not-on-allowlist",
+          "destination": "denied.test:{port}"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-38",
+      "group": "boundary-core",
+      "title": "Allowed hostname on an unlisted port is denied",
+      "spec": [
+        "wire §1(5)",
+        "wire §5"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT allowed.test:1 HTTP/1.1\r\nHost: allowed.test:1\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "port-not-allowed",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "port-not-allowed"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-39",
+      "group": "boundary-core",
+      "title": "Allowed hostname resolving only to loopback is denied when loopback is not listed",
+      "spec": [
+        "wire §5"
+      ],
+      "policy": "names-only",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "resolved-address-denied",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "resolved-address-denied",
+          "destination": "localhost:{port}"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-40",
+      "group": "boundary-core",
+      "title": "Allowed hostname resolving to a listed special-purpose address succeeds",
+      "spec": [
+        "wire §5",
+        "policy §2"
+      ],
+      "policy": "loopback-exception",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow",
+          "destination": "localhost:{port}"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-60",
+      "group": "boundary-core",
+      "title": "A literal rule also admits the same address as a resolution result for that port",
+      "spec": [
+        "wire §5"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow",
+          "destination": "localhost:{port}"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-61",
+      "group": "boundary-core",
+      "title": "Suffix rule with depth 1 matches one label and not two",
+      "spec": [
+        "wire §6",
+        "policy §2"
+      ],
+      "policy": "suffix",
+      "harness": "dns",
+      "request": {
+        "raw": "CONNECT one.depth.test:{port} HTTP/1.1\r\nHost: one.depth.test:{port}\r\n\r\n{payload}",
+        "dns": {
+          "one.depth.test": [
+            "127.0.0.1"
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow",
+          "rule": "one"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-62",
+      "group": "boundary-core",
+      "title": "Suffix rule with depth 1 does not match two labels",
+      "spec": [
+        "wire §6",
+        "policy §2"
+      ],
+      "policy": "suffix",
+      "harness": "dns",
+      "request": {
+        "raw": "CONNECT a.b.depth.test:{port} HTTP/1.1\r\nHost: a.b.depth.test:{port}\r\n\r\n",
+        "dns": {
+          "a.b.depth.test": [
+            "127.0.0.1"
+          ]
+        }
+      },
+      "expect": {
+        "status": 403,
+        "reason": "not-on-allowlist",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "not-on-allowlist"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-41",
+      "group": "boundary-core",
+      "title": "Hostname case and trailing dot are normalized before matching",
+      "spec": [
+        "wire §2",
+        "wire §6"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT ALLOWED.TEST.:{port} HTTP/1.1\r\nHost: allowed.test:{port}\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-42",
+      "group": "boundary-core",
+      "title": "The wildcard name rule matches names but never literals",
+      "spec": [
+        "wire §6"
+      ],
+      "policy": "any",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT 192.0.2.1:{port} HTTP/1.1\r\nHost: 192.0.2.1:{port}\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "ip-not-on-allowlist",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "ip-not-on-allowlist"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-43",
+      "group": "boundary-core",
+      "title": "The wildcard name rule with a resolved-address exception admits a loopback name",
+      "spec": [
+        "wire §5",
+        "wire §6"
+      ],
+      "policy": "any",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-44",
+      "group": "boundary-core",
+      "title": "Resolution failure of an allowed name is reported as 502",
+      "spec": [
+        "registries §2"
+      ],
+      "policy": "any",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT nxdomain.invalid:{port} HTTP/1.1\r\nHost: nxdomain.invalid:{port}\r\n\r\n"
+      },
+      "expect": {
+        "status": 502,
+        "reason": "resolve-failed",
+        "dials": 0,
+        "audit": {
+          "decision": "fail",
+          "reason": "resolve-failed"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-45",
+      "group": "boundary-core",
+      "title": "A resolved-address exception does not authorize the same address as a literal",
+      "spec": [
+        "policy §2"
+      ],
+      "policy": "loopback-exception",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "ip-not-on-allowlist",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "ip-not-on-allowlist"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-46",
+      "group": "boundary-core",
+      "title": "A nested CONNECT inside an established tunnel is opaque payload",
+      "spec": [
+        "wire §9"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n{nested}"
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-47",
+      "group": "boundary-core",
+      "title": "A forged identity header neither selects policy nor changes the audited identity",
+      "spec": [
+        "identity §1",
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "CONNECT denied.test:{port} HTTP/1.1\r\nHost: denied.test:{port}\r\nSandbox-Id: conformance-b\r\nProxy-Authorization: Basic Zm9v\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "not-on-allowlist",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "not-on-allowlist",
+          "sandbox": "conformance-a"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-48",
+      "group": "boundary-core",
+      "title": "Connection budget exhaustion is refused with 503 before the head is read",
+      "spec": [
+        "lifecycle §4",
+        "registries §2"
+      ],
+      "policy": "core-budget1",
+      "harness": "h1-busy",
+      "request": {
+        "hold": 1,
+        "raw": ""
+      },
+      "expect": {
+        "status": 503,
+        "reason": "busy",
+        "dials": 0,
+        "audit": {
+          "decision": "fail",
+          "reason": "busy"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-49",
+      "group": "boundary-core",
+      "title": "A stalled request head is closed at the documented deadline without a dial",
+      "spec": [
+        "wire §1(7)",
+        "lifecycle §4"
+      ],
+      "policy": "core",
+      "harness": "manual",
+      "request": {
+        "describe": "Send the request line and one header byte per second; observe the connection close at the implementation statement's head deadline."
+      },
+      "expect": {
+        "describe": "Connection closed by the boundary; no upstream dial; no 2xx."
+      }
+    },
+    {
+      "id": "B-CORE-50",
+      "group": "boundary-core",
+      "title": "connect-udp upgrade on a listener without UDP is denied",
+      "spec": [
+        "wire §1(3)",
+        "registries §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "GET /.well-known/masque/udp/127.0.0.1/{port}/ HTTP/1.1\r\nHost: boundary\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "udp-disabled",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "udp-disabled",
+          "transport": "udp"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-51",
+      "group": "boundary-core",
+      "title": "connect-udp upgrade without Connection: Upgrade is malformed",
+      "spec": [
+        "wire §2"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "GET /.well-known/masque/udp/127.0.0.1/{port}/ HTTP/1.1\r\nHost: boundary\r\nUpgrade: connect-udp\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-upgrade",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-upgrade",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-52",
+      "group": "boundary-core",
+      "title": "connect-udp upgrade with a path outside the template is malformed",
+      "spec": [
+        "wire §2",
+        "wire §8"
+      ],
+      "policy": "core",
+      "harness": "h1",
+      "request": {
+        "raw": "GET /masque/udp/127.0.0.1/{port}/ HTTP/1.1\r\nHost: boundary\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\n\r\n"
+      },
+      "expect": {
+        "status": "4xx",
+        "reason": [
+          "malformed-template",
+          "malformed-request"
+        ],
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": [
+            "malformed-template",
+            "malformed-request"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-53",
+      "group": "boundary-core",
+      "title": "Every failure response carries Proxy-Status with a registered error and the reason token",
+      "spec": [
+        "wire §4"
+      ],
+      "policy": "core",
+      "harness": "h1-proxystatus",
+      "request": {
+        "raw": "CONNECT denied.test:{port} HTTP/1.1\r\nHost: denied.test:{port}\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "not-on-allowlist",
+        "dials": 0,
+        "proxy_status": {
+          "error": "http_request_denied",
+          "reason": "not-on-allowlist"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-54",
+      "group": "boundary-core",
+      "title": "Suffix rule matches a subdomain",
+      "spec": [
+        "wire §6"
+      ],
+      "policy": "suffix",
+      "harness": "dns",
+      "request": {
+        "raw": "CONNECT a.suffix.test:{port} HTTP/1.1\r\nHost: a.suffix.test:{port}\r\n\r\n{payload}",
+        "dns": {
+          "a.suffix.test": [
+            "127.0.0.1"
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow",
+          "rule": "sfx"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-55",
+      "group": "boundary-core",
+      "title": "Suffix rule does not match the suffix itself",
+      "spec": [
+        "wire §6"
+      ],
+      "policy": "suffix",
+      "harness": "dns",
+      "request": {
+        "raw": "CONNECT suffix.test:{port} HTTP/1.1\r\nHost: suffix.test:{port}\r\n\r\n",
+        "dns": {
+          "suffix.test": [
+            "127.0.0.1"
+          ]
+        }
+      },
+      "expect": {
+        "status": 403,
+        "reason": "not-on-allowlist",
+        "dials": 0,
+        "audit": {
+          "decision": "block",
+          "reason": "not-on-allowlist"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-56",
+      "group": "boundary-core",
+      "title": "Suffix rule matches at any depth",
+      "spec": [
+        "wire §6"
+      ],
+      "policy": "suffix",
+      "harness": "dns",
+      "request": {
+        "raw": "CONNECT a.b.suffix.test:{port} HTTP/1.1\r\nHost: a.b.suffix.test:{port}\r\n\r\n{payload}",
+        "dns": {
+          "a.b.suffix.test": [
+            "127.0.0.1"
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-57",
+      "group": "boundary-core",
+      "title": "Mixed public and special-purpose resolution results: the special-purpose address is never dialed",
+      "spec": [
+        "wire §5"
+      ],
+      "policy": "suffix",
+      "harness": "dns",
+      "request": {
+        "raw": "CONNECT mixed.suffix.test:{port} HTTP/1.1\r\nHost: mixed.suffix.test:{port}\r\n\r\n",
+        "dns": {
+          "mixed.suffix.test": [
+            "127.0.0.1",
+            "169.254.169.254",
+            "10.0.0.1"
+          ]
+        }
+      },
+      "expect": {
+        "status": [
+          200,
+          403
+        ],
+        "reason": [
+          null,
+          "resolved-address-denied"
+        ],
+        "dials_max": 1,
+        "audit": {
+          "address_not_in": [
+            "169.254.169.254",
+            "10.0.0.1"
+          ]
+        }
+      }
+    },
+    {
+      "id": "B-CORE-58",
+      "group": "boundary-core",
+      "title": "Rebinding: a second resolution returning a special-purpose address is never consulted",
+      "spec": [
+        "wire §5"
+      ],
+      "policy": "suffix",
+      "harness": "dns",
+      "request": {
+        "raw": "CONNECT rebind.suffix.test:{port} HTTP/1.1\r\nHost: rebind.suffix.test:{port}\r\n\r\n{payload}",
+        "dns": {
+          "rebind.suffix.test": [
+            [
+              "127.0.0.1"
+            ],
+            [
+              "169.254.169.254"
+            ]
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "dns_queries_max": 1,
+        "audit": {
+          "decision": "allow",
+          "address": "{upstream4}"
+        }
+      }
+    },
+    {
+      "id": "B-CORE-59",
+      "group": "boundary-core",
+      "title": "Internationalized name is converted to A-labels before matching",
+      "spec": [
+        "wire §6"
+      ],
+      "policy": "suffix",
+      "harness": "dns",
+      "request": {
+        "raw": "CONNECT xn--bcher-kva.suffix.test:{port} HTTP/1.1\r\nHost: xn--bcher-kva.suffix.test:{port}\r\n\r\n{payload}",
+        "dns": {
+          "xn--bcher-kva.suffix.test": [
+            "127.0.0.1"
+          ]
+        }
+      },
+      "expect": {
+        "status": 200,
+        "reason": null,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow",
+          "destination": "xn--bcher-kva.suffix.test:{port}"
+        }
+      }
+    },
+    {
+      "id": "B-H2-01",
+      "group": "boundary-h2",
+      "title": "Prior-knowledge HTTP/2 CONNECT to an allowed destination succeeds with a 2xx status",
+      "spec": [
+        "wire §1(1)",
+        "wire §7"
+      ],
+      "policy": "core",
+      "harness": "h2",
+      "request": {
+        "h2": {
+          ":method": "CONNECT",
+          ":authority": "{upstream4}"
+        }
+      },
+      "expect": {
+        "status": "2xx",
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow",
+          "wire": "h2"
+        }
+      }
+    },
+    {
+      "id": "B-H2-02",
+      "group": "boundary-h2",
+      "title": "Concurrent streams on one session are decided independently",
+      "spec": [
+        "wire §2",
+        "wire §7"
+      ],
+      "policy": "core",
+      "harness": "h2",
+      "request": {
+        "h2_streams": [
+          {
+            ":method": "CONNECT",
+            ":authority": "{upstream4}"
+          },
+          {
+            ":method": "CONNECT",
+            ":authority": "denied.test:{port}"
+          }
+        ]
+      },
+      "expect": {
+        "statuses": [
+          "2xx",
+          403
+        ],
+        "reasons": [
+          null,
+          "not-on-allowlist"
+        ],
+        "dials": 1
+      }
+    },
+    {
+      "id": "B-H2-03",
+      "group": "boundary-h2",
+      "title": "Ordinary CONNECT carrying :scheme or :path is rejected",
+      "spec": [
+        "wire §2",
+        "wire §7"
+      ],
+      "policy": "core",
+      "harness": "h2",
+      "request": {
+        "h2": {
+          ":method": "CONNECT",
+          ":authority": "{upstream4}",
+          ":scheme": "https",
+          ":path": "/"
+        }
+      },
+      "expect": {
+        "status": [
+          400,
+          "RST_STREAM:PROTOCOL_ERROR"
+        ],
+        "dials": 0
+      }
+    },
+    {
+      "id": "B-H2-04",
+      "group": "boundary-h2",
+      "title": "A forged identity header on a stream does not change the session identity",
+      "spec": [
+        "identity §1",
+        "wire §7"
+      ],
+      "policy": "core",
+      "harness": "h2",
+      "request": {
+        "h2": {
+          ":method": "CONNECT",
+          ":authority": "denied.test:{port}",
+          "sandbox-id": "conformance-b"
+        }
+      },
+      "expect": {
+        "status": 403,
+        "reason": "not-on-allowlist",
+        "audit": {
+          "sandbox": "conformance-a"
+        }
+      }
+    },
+    {
+      "id": "B-H2-05",
+      "group": "boundary-h2",
+      "title": "Extended CONNECT with an unsupported :protocol is rejected",
+      "spec": [
+        "wire §2",
+        "wire §7"
+      ],
+      "policy": "udp",
+      "harness": "h2",
+      "request": {
+        "h2": {
+          ":method": "CONNECT",
+          ":protocol": "websocket",
+          ":scheme": "https",
+          ":authority": "boundary",
+          ":path": "/"
+        }
+      },
+      "expect": {
+        "status": [
+          400,
+          501
+        ],
+        "reason": "unsupported-protocol",
+        "dials": 0
+      }
+    },
+    {
+      "id": "B-H2-06",
+      "group": "boundary-h2",
+      "title": "Extended CONNECT sent before SETTINGS_ENABLE_CONNECT_PROTOCOL is rejected",
+      "spec": [
+        "RFC 8441",
+        "wire §7"
+      ],
+      "policy": "udp",
+      "harness": "h2",
+      "request": {
+        "h2": {
+          ":method": "CONNECT",
+          ":protocol": "connect-udp",
+          ":scheme": "https",
+          ":authority": "boundary",
+          ":path": "/.well-known/masque/udp/127.0.0.1/{port}/"
+        },
+        "before_settings": true
+      },
+      "expect": {
+        "status": [
+          400,
+          "RST_STREAM:PROTOCOL_ERROR",
+          "GOAWAY:PROTOCOL_ERROR"
+        ],
+        "dials": 0
+      }
+    },
+    {
+      "id": "B-H2-07",
+      "group": "boundary-h2",
+      "title": "Stream budget exhaustion refuses further streams without affecting established ones",
+      "spec": [
+        "lifecycle §4",
+        "wire §7"
+      ],
+      "policy": "core",
+      "harness": "h2",
+      "request": {
+        "h2_flood": {
+          "streams": "max_streams + 1",
+          ":authority": "{upstream4}"
+        }
+      },
+      "expect": {
+        "status": [
+          "RST_STREAM:REFUSED_STREAM",
+          503
+        ],
+        "established_unaffected": true
+      }
+    },
+    {
+      "id": "B-H2-08",
+      "group": "boundary-h2",
+      "title": "A nested CONNECT inside DATA frames of an established stream is opaque payload",
+      "spec": [
+        "wire §9"
+      ],
+      "policy": "core",
+      "harness": "h2",
+      "request": {
+        "h2": {
+          ":method": "CONNECT",
+          ":authority": "{upstream4}"
+        },
+        "data": "{nested}"
+      },
+      "expect": {
+        "status": "2xx",
+        "dials": 1,
+        "echoed": true
+      }
+    },
+    {
+      "id": "B-UDP-01",
+      "group": "boundary-udp",
+      "title": "HTTP/1.1 connect-udp upgrade to an allowed destination returns 101 and relays a datagram in both directions",
+      "spec": [
+        "wire §1(3)",
+        "RFC 9298",
+        "wire §8"
+      ],
+      "policy": "udp",
+      "harness": "udp",
+      "request": {
+        "raw": "GET /.well-known/masque/udp/127.0.0.1/{port}/ HTTP/1.1\r\nHost: boundary\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n",
+        "datagram": "ping"
+      },
+      "expect": {
+        "status": 101,
+        "upgrade": "connect-udp",
+        "datagram_echoed": true,
+        "audit": {
+          "decision": "allow",
+          "transport": "udp"
+        }
+      }
+    },
+    {
+      "id": "B-UDP-02",
+      "group": "boundary-udp",
+      "title": "HTTP/2 extended CONNECT connect-udp to an allowed destination succeeds",
+      "spec": [
+        "RFC 8441",
+        "RFC 9298",
+        "wire §8"
+      ],
+      "policy": "udp",
+      "harness": "udp",
+      "request": {
+        "h2": {
+          ":method": "CONNECT",
+          ":protocol": "connect-udp",
+          ":scheme": "https",
+          ":authority": "boundary",
+          ":path": "/.well-known/masque/udp/127.0.0.1/{port}/",
+          "capsule-protocol": "?1"
+        },
+        "datagram": "ping"
+      },
+      "expect": {
+        "status": "2xx",
+        "datagram_echoed": true,
+        "audit": {
+          "decision": "allow",
+          "transport": "udp",
+          "wire": "h2"
+        }
+      }
+    },
+    {
+      "id": "B-UDP-03",
+      "group": "boundary-udp",
+      "title": "connect-udp to an unlisted destination is denied before any socket is opened",
+      "spec": [
+        "wire §1(5)",
+        "wire §8"
+      ],
+      "policy": "udp",
+      "harness": "udp",
+      "request": {
+        "raw": "GET /.well-known/masque/udp/192.0.2.1/53/ HTTP/1.1\r\nHost: boundary\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "ip-not-on-allowlist",
+        "udp_sockets": 0,
+        "audit": {
+          "decision": "block",
+          "transport": "udp"
+        }
+      }
+    },
+    {
+      "id": "B-UDP-04",
+      "group": "boundary-udp",
+      "title": "connect-udp to a destination whose rule permits only TCP is denied",
+      "spec": [
+        "registries §2",
+        "policy §2"
+      ],
+      "policy": "udp",
+      "harness": "udp",
+      "request": {
+        "raw": "GET /.well-known/masque/udp/127.0.0.2/{port}/ HTTP/1.1\r\nHost: boundary\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\n\r\n"
+      },
+      "expect": {
+        "status": 403,
+        "reason": "transport-not-allowed",
+        "udp_sockets": 0
+      }
+    },
+    {
+      "id": "B-UDP-05",
+      "group": "boundary-udp",
+      "title": "A capsule whose declared length exceeds the documented limit closes the stream without sending a datagram",
+      "spec": [
+        "lifecycle §4",
+        "wire §8"
+      ],
+      "policy": "udp",
+      "harness": "udp",
+      "request": {
+        "raw": "GET /.well-known/masque/udp/127.0.0.1/{port}/ HTTP/1.1\r\nHost: boundary\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\n\r\n",
+        "capsule": {
+          "type": 0,
+          "length": 1048576
+        }
+      },
+      "expect": {
+        "status": 101,
+        "stream_closed": true,
+        "datagrams_sent": 0
+      }
+    },
+    {
+      "id": "B-UDP-06",
+      "group": "boundary-udp",
+      "title": "An unknown capsule type is skipped and the session continues",
+      "spec": [
+        "RFC 9297",
+        "wire §8"
+      ],
+      "policy": "udp",
+      "harness": "udp",
+      "request": {
+        "raw": "GET /.well-known/masque/udp/127.0.0.1/{port}/ HTTP/1.1\r\nHost: boundary\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\n\r\n",
+        "capsules": [
+          {
+            "type": 4611686018427387903,
+            "payload": "x"
+          },
+          {
+            "type": 0,
+            "context": 0,
+            "payload": "ping"
+          }
+        ]
+      },
+      "expect": {
+        "status": 101,
+        "datagram_echoed": true
+      }
+    },
+    {
+      "id": "B-UDP-07",
+      "group": "boundary-udp",
+      "title": "Datagrams from a third party are not delivered to the client",
+      "spec": [
+        "lifecycle §4",
+        "wire §8"
+      ],
+      "policy": "udp",
+      "harness": "udp",
+      "request": {
+        "raw": "GET /.well-known/masque/udp/127.0.0.1/{port}/ HTTP/1.1\r\nHost: boundary\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\n\r\n",
+        "datagram": "ping",
+        "inject_from": "127.0.0.3"
+      },
+      "expect": {
+        "status": 101,
+        "datagram_echoed": true,
+        "injected_delivered": false
+      }
+    },
+    {
+      "id": "B-UDP-08",
+      "group": "boundary-udp",
+      "title": "A template component that is percent-encoded twice is malformed",
+      "spec": [
+        "wire §2",
+        "wire §8"
+      ],
+      "policy": "udp",
+      "harness": "udp",
+      "request": {
+        "raw": "GET /.well-known/masque/udp/127%252E0.0.1/{port}/ HTTP/1.1\r\nHost: boundary\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\n\r\n"
+      },
+      "expect": {
+        "status": 400,
+        "reason": "malformed-template",
+        "udp_sockets": 0
+      }
+    },
+    {
+      "id": "B-TLS-01",
+      "group": "boundary-tls",
+      "title": "A valid client certificate mapped to a policy succeeds and its identity is audited",
+      "spec": [
+        "identity §4.1",
+        "identity §4"
+      ],
+      "policy": "core",
+      "harness": "tls",
+      "request": {
+        "client_cert": "valid-mapped",
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n{payload}"
+      },
+      "expect": {
+        "status": 200,
+        "dials": 1,
+        "echoed": true,
+        "audit": {
+          "decision": "allow",
+          "peer": "spiffe://conformance/sandbox-a"
+        }
+      }
+    },
+    {
+      "id": "B-TLS-02",
+      "group": "boundary-tls",
+      "title": "A missing client certificate fails the handshake and is audited",
+      "spec": [
+        "identity §4.1",
+        "identity §4"
+      ],
+      "policy": "core",
+      "harness": "tls",
+      "request": {
+        "client_cert": null,
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "handshake": "fail",
+        "dials": 0,
+        "audit": {
+          "decision": "fail",
+          "reason": "tls-failed"
+        }
+      }
+    },
+    {
+      "id": "B-TLS-03",
+      "group": "boundary-tls",
+      "title": "A certificate from an unknown issuer fails",
+      "spec": [
+        "identity §4.1(3)"
+      ],
+      "policy": "core",
+      "harness": "tls",
+      "request": {
+        "client_cert": "wrong-issuer"
+      },
+      "expect": {
+        "handshake": "fail",
+        "dials": 0
+      }
+    },
+    {
+      "id": "B-TLS-04",
+      "group": "boundary-tls",
+      "title": "An expired certificate fails",
+      "spec": [
+        "identity §4.1(3)"
+      ],
+      "policy": "core",
+      "harness": "tls",
+      "request": {
+        "client_cert": "expired"
+      },
+      "expect": {
+        "handshake": "fail",
+        "dials": 0
+      }
+    },
+    {
+      "id": "B-TLS-05",
+      "group": "boundary-tls",
+      "title": "A certificate without clientAuth extended key usage fails",
+      "spec": [
+        "identity §4.1(1)"
+      ],
+      "policy": "core",
+      "harness": "tls",
+      "request": {
+        "client_cert": "server-eku"
+      },
+      "expect": {
+        "handshake": "fail",
+        "dials": 0
+      }
+    },
+    {
+      "id": "B-TLS-06",
+      "group": "boundary-tls",
+      "title": "A valid certificate whose identity has no policy mapping is refused before authorization",
+      "spec": [
+        "identity §4",
+        "registries §2"
+      ],
+      "policy": "core",
+      "harness": "tls",
+      "request": {
+        "client_cert": "valid-unmapped",
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n"
+      },
+      "expect": {
+        "status": [
+          403,
+          "handshake-fail"
+        ],
+        "reason": [
+          null,
+          "identity-unknown"
+        ],
+        "dials": 0
+      }
+    },
+    {
+      "id": "B-TLS-07",
+      "group": "boundary-tls",
+      "title": "TLS 1.1 or lower is refused",
+      "spec": [
+        "identity §4.1(4)"
+      ],
+      "policy": "core",
+      "harness": "tls",
+      "request": {
+        "client_cert": "valid-mapped",
+        "max_version": "1.1"
+      },
+      "expect": {
+        "handshake": "fail"
+      }
+    },
+    {
+      "id": "B-TLS-08",
+      "group": "boundary-tls",
+      "title": "ALPN other than h2 on an HTTP/2 TLS listener is refused",
+      "spec": [
+        "identity §4.1(4)",
+        "wire §7"
+      ],
+      "policy": "core",
+      "harness": "tls",
+      "request": {
+        "client_cert": "valid-mapped",
+        "alpn": [
+          "http/1.1"
+        ],
+        "h2": true
+      },
+      "expect": {
+        "handshake": "fail"
+      }
+    },
+    {
+      "id": "B-TLS-09",
+      "group": "boundary-tls",
+      "title": "A modified TLS record terminates the tunnel without echoing modified data",
+      "spec": [
+        "identity §4.1",
+        "isolation §6.1"
+      ],
+      "policy": "core",
+      "harness": "tls",
+      "request": {
+        "client_cert": "valid-mapped",
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n",
+        "corrupt_record_after_tunnel": true
+      },
+      "expect": {
+        "status": 200,
+        "tunnel_closed": true,
+        "corrupted_bytes_echoed": false
+      }
+    },
+    {
+      "id": "B-MULTI-01",
+      "group": "boundary-multi",
+      "title": "Two listeners in one process decide the same request under their own policies",
+      "spec": [
+        "isolation §1",
+        "identity §5"
+      ],
+      "policy": "core",
+      "harness": "multi",
+      "request": {
+        "listeners": {
+          "a": "core",
+          "b": "core-budget1"
+        },
+        "raw": "CONNECT allowed.test:{port} HTTP/1.1\r\nHost: allowed.test:{port}\r\n\r\n{payload}"
+      },
+      "expect": {
+        "a": {
+          "status": 200
+        },
+        "b": {
+          "status": 403,
+          "reason": "not-on-allowlist"
+        },
+        "audit": {
+          "a": {
+            "sandbox": "conformance-a",
+            "policy": "core-v1"
+          },
+          "b": {
+            "policy": "budget-v1"
+          }
+        }
+      }
+    },
+    {
+      "id": "B-MULTI-02",
+      "group": "boundary-multi",
+      "title": "Exhausting one listener's connection budget does not refuse connections on another",
+      "spec": [
+        "lifecycle §4",
+        "identity §5"
+      ],
+      "policy": "core",
+      "harness": "multi",
+      "request": {
+        "listeners": {
+          "a": "core-budget1",
+          "b": "core"
+        },
+        "hold_on": "a",
+        "hold": 1,
+        "raw": "CONNECT {upstream4} HTTP/1.1\r\nHost: {upstream4}\r\n\r\n{payload}"
+      },
+      "expect": {
+        "a": {
+          "status": 503,
+          "reason": "busy"
+        },
+        "b": {
+          "status": 200
+        }
+      }
+    },
+    {
+      "id": "B-MULTI-03",
+      "group": "boundary-multi",
+      "title": "Closing one listener terminates its tunnels and leaves another listener's tunnels intact",
+      "spec": [
+        "lifecycle §2",
+        "identity §5"
+      ],
+      "policy": "core",
+      "harness": "multi",
+      "request": {
+        "listeners": {
+          "a": "core",
+          "b": "core"
+        },
+        "establish_on": [
+          "a",
+          "b"
+        ],
+        "close_listener": "a"
+      },
+      "expect": {
+        "a": {
+          "tunnel_closed": true,
+          "new_connection": "refused"
+        },
+        "b": {
+          "tunnel_open": true
+        }
+      }
+    },
+    {
+      "id": "B-MULTI-04",
+      "group": "boundary-multi",
+      "title": "Replacing one listener's policy is atomic and audited with the new version",
+      "spec": [
+        "lifecycle §1",
+        "identity §5"
+      ],
+      "policy": "core",
+      "harness": "multi",
+      "request": {
+        "listeners": {
+          "a": "core",
+          "b": "core"
+        },
+        "replace_policy": {
+          "a": "core-budget1"
+        },
+        "raw": "CONNECT allowed.test:{port} HTTP/1.1\r\nHost: allowed.test:{port}\r\n\r\n"
+      },
+      "expect": {
+        "a": {
+          "status": 403,
+          "reason": "not-on-allowlist"
+        },
+        "b": {
+          "status": 200
+        },
+        "audit": {
+          "a": {
+            "policy": "budget-v1"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -80,7 +80,7 @@ main() {
     for helper in boundary-proxy target-server vsock-forwarder; do
         go -C "${REPO_ROOT}" build -o "${SCRIPT_DIR}/bin/${helper}" "./scenarios/cmd/${helper}"
     done
-    CGO_ENABLED=0 go -C "${REPO_ROOT}" build -o "${REPO_ROOT}/demo/tun2connect" ./tun2connect/cmd/tun2connect
+    CGO_ENABLED=0 go -C "${REPO_ROOT}" build -o "${REPO_ROOT}/demo/tun2connect" ./sdk/cmd/tun2connect
 
     run_scenario "${run_dir}" 01 01-container-in-capsule
     run_scenario "${run_dir}" 02 02-container-boundary
