@@ -32,7 +32,7 @@ which of them harness 0.1 automates.
 
 | Profile | Group | Cases | Fixture | Automated in 0.1 |
 | --- | --- | --- | --- | --- |
-| `boundary-core` | B-CORE | 01–62 | [boundary.json](fixtures/boundary.json) | All except B-CORE-49 (`manual`) |
+| `boundary-core` | B-CORE | 01–62 except 29 | [boundary.json](fixtures/boundary.json) | All except B-CORE-49 (`manual`) |
 | `boundary-h2` | B-H2 | 01–08 | boundary.json | No |
 | `boundary-udp` | B-UDP | 01–08 | boundary.json | No |
 | `boundary-tls` | B-TLS | 01–09 | boundary.json | No |
@@ -98,12 +98,15 @@ and `localhost` reaches loopback through the system hosts file.
 
 The driver writes the IUT's audit lines to the file the harness names.
 After each case the harness reads the lines appended during that case
-and validates each one against
-[audit.schema.json](../spec/draft/schema/audit.schema.json).
+and checks each one for the required fields, the field allowlist, the
+`wire`, `decision`, and `transport` enumerations, and the reason token
+syntax of [audit.schema.json](../spec/draft/schema/audit.schema.json).
+It does not load the schema itself; `check_fixtures.py` does that for
+the audit examples in the fixtures.
 
-The clients are raw HTTP/1.1 over TCP, HTTP/2 with prior knowledge, a
-connect-udp capsule client, and a TLS client that presents the
-certificate set the case names.
+Harness 0.1 has one client, raw HTTP/1.1 over TCP. The groups that need
+HTTP/2 with prior knowledge, a connect-udp capsule client, or a TLS
+client presenting a named certificate set are not automated yet.
 
 The driver follows this contract:
 
@@ -116,10 +119,15 @@ driver stop
     IUT exited; audit file complete
 ```
 
-`listen-url` is either `tcp://127.0.0.1:PORT` or `unix:///path`. The
-hints file is a JSON object that may contain `max_connections`,
-`max_streams`, `wire` (`h1` or `h2`), `dns`, and `tls` (the paths of the
-server certificate, key, and client CA that `boundary-tls` uses).
+The harness runs the driver with `AGENTS_NET_DRIVER_STATE` set to a
+private directory the driver may use for its pid file, logs, and built
+binaries. `listen-url` is `tcp://127.0.0.1:PORT` in harness 0.1; the
+contract also allows `unix:///path` for later groups. The hints file is a
+JSON object that may contain `max_connections`, `max_streams`, `wire`
+(`h1` or `h2`), `generation`, `dns`, and `tls` (the paths of the server
+certificate, key, and client CA that `boundary-tls` uses). Harness 0.1
+sends `dns` and the keys of the policy's `iut` object, which in
+`boundary.json` is only `max_connections`.
 
 ### 3.2 Adapter Role
 
@@ -210,12 +218,13 @@ The harness marks an automated case `pass` when all of the following hold:
 2. Every non-2xx response carries exactly one `Proxy-Status` field with one
    member whose name is an sf-token, an `error` parameter from the HTTP
    Proxy Error Types registry, and a `reason` parameter matching
-   `[a-z0-9-]{1,32}`; the reason token matches `expect.reason`.
+   `[a-z0-9-]{1,32}`; the reason token matches `expect.reason`. A 2xx
+   response carries no `Proxy-Status` field.
 3. Upstream accepts equal `expect.dials` (or do not exceed `dials_max`).
 4. For 2xx with `expect.echoed`, the bytes sent after the head come back
    unchanged; for non-2xx no bytes follow the response head.
-5. Every audit line written during the case validates against the schema,
-   and the last one contains `expect.audit`.
+5. Every audit line written during the case passes the field checks in
+   section 3.1, and the last one contains `expect.audit`.
 
 If the driver exits 3 for a case's descriptor, the case is
 `unsupported`. In a conformance claim for that profile, `unsupported`

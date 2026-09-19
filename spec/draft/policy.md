@@ -39,18 +39,19 @@ against the descriptor as defined in
 
 `agents_net_policy` is the schema version. A boundary MUST reject a
 descriptor with an unknown version. `version` is an opaque string, and the
-boundary copies it into every audit record. `sandbox` is the identity label
-that appears in audit records; it does not select policy. `default` MUST be
-`deny`.
+boundary copies it into every audit record. `sandbox` is required; it is
+the identity label that appears in audit records, and it does not select
+policy. `default` MUST be `deny`.
 
 Each rule has exactly one of `name`, `suffix`, `ip`, `cidr`. `ports` is a
-list of integers or `"a-b"` ranges within 1-65535; when it is absent, the
-rule covers every port. `transports` is a subset of `["tcp", "udp"]` and
-defaults to `["tcp"]`. `resolve` is permitted only with a `name` other than
-`"*"`. It lists the addresses the boundary uses for that name instead of
-DNS, and those addresses are authorized for the rule's ports and transports
-without a `resolved_addresses` entry. `depth` is permitted only with
-`suffix` and bounds the number of labels before the suffix
+list whose entries are integers, decimal strings, or `"a-b"` ranges within
+1-65535; when it is absent, the rule covers every port. `transports` is a
+subset of `["tcp", "udp"]` and defaults to `["tcp"]`. `resolve` is
+permitted only with a `name` other than `"*"`. It lists the addresses the
+boundary uses for that name instead of DNS, and those addresses are
+authorized for the rule's ports and transports without a
+`resolved_addresses` entry. `depth` is permitted only with `suffix`, takes
+a value from 1 to 126, and bounds the number of labels before the suffix
 ([wire.md Section 6](wire.md#6-name-normalization-and-matching)). `id` is
 optional; when present, it appears in the `rule` field of the audit record.
 Rules are unordered, and a request is allowed when any rule allows it.

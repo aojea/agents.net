@@ -106,6 +106,7 @@ func TestDescriptorValidation(t *testing.T) {
 		"exception spans ranges": policyJSON(``, `,"resolved_addresses":[{"cidr":"192.0.0.0/8"}]`),
 		"depth on name":          policyJSON(`{"name":"a.example","depth":1}`, ""),
 		"depth negative":         policyJSON(`{"suffix":"example","depth":-1}`, ""),
+		"depth too large":        policyJSON(`{"suffix":"example","depth":127}`, ""),
 		"id too long":            policyJSON(`{"id":"`+strings.Repeat("i", 65)+`","name":"a.example"}`, ""),
 	} {
 		if _, err := loadDescriptor([]byte(bad), ""); err == nil {

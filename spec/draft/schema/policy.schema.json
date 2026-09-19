@@ -4,7 +4,7 @@
   "title": "agents.net policy descriptor",
   "type": "object",
   "additionalProperties": false,
-  "required": ["agents_net_policy", "version", "default", "rules"],
+  "required": ["agents_net_policy", "version", "sandbox", "default", "rules"],
   "properties": {
     "agents_net_policy": {"const": 1},
     "version": {"type": "string", "minLength": 1, "maxLength": 256},

@@ -50,8 +50,11 @@ token. On top of that, a seccomp filter on the command denies `ptrace`,
 sockets (only `socketpair`) unless the policy grants them. With networking
 disabled it denies `connect`, `bind`, `listen`, `accept`, `sendto`, and every
 socket family except `AF_UNIX`. The namespace removes external egress, and
-the filter closes the paths a namespace does not cover, which this
-specification lists as runtime responsibilities in Section 4.3. Only clients
+the filter closes the paths a namespace does not cover, which
+[isolation.md Section 5](../spec/draft/isolation.md#5-software-integrity-and-attestation)
+lists as recommended controls and item 4 of the
+[runtime audit checklist](../conformance/README.md#6-runtime-audit-checklist)
+asks a controller claim to show. Only clients
 that honor the proxy variables reach the proxy. The Codex documentation says
 that hostnames resolving to local or private addresses are rejected by a
 best-effort lookup and that DNS rebinding is not fully prevented. By contrast,

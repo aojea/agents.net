@@ -127,9 +127,9 @@ policy sorts allowed hostnames into four tiers:
 
 | Tier | Example hosts | What happens | Configured via |
 | --- | --- | --- | --- |
-| **Fake-response** | `example.com` | Never forwarded. TLS terminated locally with the demo CA; a canned success body is returned. | `FAKE_RESPONSE_HOSTS` (hardcoded to the demo's task target) |
+| **Fake-response** | `example.com` | Never forwarded. TLS terminated locally with the demo CA; a canned success body is returned. | `FAKE_RESPONSE_HOSTS` (hardcoded to `example.com` and `httpbin.org`) |
 | **Local-provider** | `ollama` (symbolic) | No TLS termination, no credential. A plain byte relay from the sandbox's symbolic hostname to a real `host:port` on the operator's own machine -- the sandbox can never resolve or route to it on its own. | `AGENT_PROXY_LOCAL_PROVIDERS="symbolic=host:port,..."` (default `ollama=127.0.0.1:11434`) |
-| **Passthrough** | `registry.npmjs.org` | No TLS termination, no injection -- a plain byte-for-byte relay straight to the real host. Used for a harness's own housekeeping (package installs, update checks, telemetry) that carries no secret. | `AGENT_PROXY_PASSTHROUGH="host,host,..."` (default `registry.npmjs.org`) |
+| **Passthrough** | `registry.npmjs.org` | No TLS termination, no injection -- a plain byte-for-byte relay straight to the real host. Used for a harness's own housekeeping (package installs, update checks, telemetry) that carries no secret. | `AGENT_PROXY_PASSTHROUGH="host,host,..."` (default `registry.npmjs.org,models.dev`) |
 | **Credential-inject**, opt-in | `api.openai.com` | TLS terminated locally, the agent's `Authorization` header (empty, placeholder, or garbage) is stripped and replaced with the real `Bearer <token>`, then genuinely relayed upstream with the real system trust store. Empty/unconfigured by default -- see the cloud-migration section at the end of this tutorial. | `AGENT_PROXY_TOKENS="host=ENV_VAR_NAME,..."` |
 
 Anything not on the four lists is refused with `403 Forbidden` and a
@@ -356,7 +356,7 @@ The container wasn't started with `--network none`. The launcher refuses to run 
 The `docker run` line is missing `--cap-add NET_ADMIN`, `--device /dev/net/tun`, or both.
 
 **`dropping CAP_NET_ADMIN after TUN setup: ...`**
-Once the tun exists, the launcher removes `CAP_NET_ADMIN` from itself and from the agent's bounding set, and refuses to start the agent if that fails. Dropping the capability needs `CAP_SETPCAP` (part of the default container set; don't `--cap-drop SETPCAP`) and a launcher built with `CGO_ENABLED=0`, as in Lab 1.
+Once the tun exists, the launcher removes `CAP_NET_ADMIN` from itself and from the agent's bounding set, and refuses to start the agent if that fails. Dropping the capability needs `CAP_SETPCAP` (part of the default container set; don't `--cap-drop SETPCAP`) and a launcher built with `CGO_ENABLED=0`, as in Lab 3.
 
 **`[!] no demo MITM cert (run gen_certs.sh) -- refusing`**
 The boundary (Lab 4) was started before the certificates (Lab 2) existed. Run `./demo/gen_certs.sh` and restart `host_proxy.py`.
@@ -367,7 +367,7 @@ This only comes up in the cloud-migration bonus, and it fails closed on purpose.
 **Container hangs or every flow fails instantly**
 Check that the socket directory you mounted is the one `host_proxy.py` is listening in (`/tmp/agent-sockets` on the host by default) and that the boundary process is still running.
 
-**`[INGRESS ERROR] ... ERR the agent is not listening`**
+**`[INGRESS ERROR] Is the agent listening? ...`**
 The agent's loopback listener isn't up, or it listens on a different port from the boundary's `AGENT_INGRESS_PORT` (default `8081`).
 
 ## Automated Testing
@@ -384,8 +384,9 @@ The script runs, in order:
 2. Certificate generation (`gen_certs.sh`).
 3. Launcher build (`tun2connect`) and container build.
 4. A fail-closed check: the image with no launcher and no network makes zero connections.
-5. The launcher-injected run: fake-response over TLS, local-provider relay, and a refused host observed as `ECONNREFUSED`.
-6. Host boundary audit trail verification.
+5. Launcher-injected runs with `curl`: the fake-response tier over real TLS, then a refused host observed as an immediate connection failure.
+6. Ingress: an agent serving on its loopback port receives a webhook through the reverse channel while also making an egress request.
+7. Host boundary audit trail verification (`ALLOW-FAKE`, `BLOCK`, and `INGRESS` lines).
 
 The same suite runs on GitHub Actions presubmit for all pull requests and pushes to `main`.
 

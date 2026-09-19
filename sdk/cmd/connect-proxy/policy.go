@@ -270,8 +270,8 @@ func (p *policy) addRule(dr descriptorRule) error {
 			r.resolve = append(r.resolve, address.Unmap())
 		}
 	}
-	if dr.Depth != 0 && (dr.Suffix == "" || dr.Depth < 0) {
-		return errors.New("depth requires a suffix and a positive value")
+	if dr.Depth != 0 && (dr.Suffix == "" || dr.Depth < 0 || dr.Depth > 126) {
+		return errors.New("depth requires a suffix and a value from 1 to 126")
 	}
 	switch {
 	case dr.Name == "*":

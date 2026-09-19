@@ -290,8 +290,10 @@ destination after the check. As a result, `{"name": "*"}` still cannot reach
 authorizes a literal. Names are lowercased, stripped of a trailing dot, and
 converted to A-labels before matching. Ports must be numeric and in the range
 1-65535. Denials carry `not-on-allowlist`, `port-not-allowed`,
-`transport-not-allowed`, `ip-not-on-allowlist`, or `resolved-address-denied`
-in the `reason` parameter of `Proxy-Status`, for example
+`transport-not-allowed`, `ip-not-on-allowlist`, `resolved-address-denied`,
+`scoped-ip` (a zoned IPv6 literal), or `udp-disabled` (a connect-udp
+request under a descriptor without `features.udp`) in the `reason`
+parameter of `Proxy-Status`, for example
 `Proxy-Status: boundary; error=http_request_denied; reason=not-on-allowlist`.
 A listener with no descriptor loaded answers 503 `policy-unavailable`, and
 the command refuses to start without `-policy`.
@@ -328,20 +330,21 @@ Every decision is written to standard output as one JSON object in the
 [audit record format](../spec/draft/audit.md). The fields are `ts`,
 `listener`, `sandbox`, `generation`, `policy`, `wire`, `transport`,
 `destination` (as requested, after normalization), `address` (as dialed),
-`peer` (the mTLS identity when there is one), `rule` (the `id` of the rule
-that allowed the request), `decision` (`allow`, `block`, or `fail`), and
-`reason`. Every refused request is recorded, including non-CONNECT methods
-and connections turned away for budget. Values supplied by the guest are
-encoded as JSON strings, so they cannot inject fields or lines. The Python
-demo keeps its hostname-only allowlist as a sample policy and dials names
-directly, without a resolved-address or port check.
+`peer` (the mTLS identity when there is one), `connection` (an id shared by
+every record of one accepted connection or HTTP/2 session), `rule` (the
+`id` of the rule that allowed the request), `decision` (`allow`, `block`,
+or `fail`), and `reason`. Every refused request is recorded, including
+non-CONNECT methods and connections turned away for budget. Values supplied
+by the guest are encoded as JSON strings, so they cannot inject fields or
+lines. The Python demo keeps its hostname-only allowlist as a sample policy
+and dials names directly, without a resolved-address or port check.
 
 Incomplete TLS flag combinations are rejected before the boundary listens:
 `-tls-client-ca` requires both `-tls-cert` and `-tls-key`, and setting it
 makes verified client certificates mandatory. TLS requires at least version
-1.2 and gives the handshake 15 seconds. Certificate identities are still
-audit-only for HTTP/2; the command applies one destination policy to every
-peer rather than authorizing per identity.
+1.2 and gives the handshake 15 seconds. Certificate identities are
+audit-only on both HTTP/1.1 and HTTP/2; the command applies one destination
+policy to every peer rather than authorizing per identity.
 
 One process with one listener is enough to serve the fixed per-sandbox
 policy of the baseline. On its own that is not a complete secure deployment.
