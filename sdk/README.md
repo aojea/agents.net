@@ -92,8 +92,12 @@ refuses to start the agent. Other capabilities, the container UID, and
 
 Where the container entrypoint has to stay as it is, or in a Kubernetes pod,
 the launcher can run instead as a sidecar process that shares the sandbox's
-network namespace. If the sidecar terminates, the agent keeps running but
-loses its only network path, so it fails closed.
+network namespace. Give `run` no command (`tun2connect run [flags]
+<boundary-socket>`) and it sets up the device the same way, then serves until
+SIGINT or SIGTERM. A sidecar with its own root filesystem writes its own
+`/etc/resolv.conf`, not the agent's, so point the agent's resolver at
+`100.127.255.253` (any pool address works). If the sidecar terminates, the
+agent keeps running but loses its only network path, so it fails closed.
 
 In a microVM (Firecracker, Cloud-Hypervisor), the networking daemon
 (`tun2connect` in the reference) runs as the guest init process
