@@ -64,8 +64,13 @@ resolving new names, and it never hands out the same address twice in one
 lifetime. If a guest dials a cached address whose name has been evicted, the
 reverse lookup misses, the adapter forwards the destination as a literal
 inside the synthetic range, and the boundary denies it. The next resolution
-of that name gets a fresh address. After about 4.19 million distinct names
-the IPv4 pool runs out and further queries get `SERVFAIL`.
+of that name gets a fresh address. Pairings last only as long as the
+adapter. A restarted adapter allocates from the start of the pool again, so
+an address cached across the restart can now belong to a different name.
+Answers carry a 30-second TTL by default (set it with `-dns-ttl` or
+`VirtualDNS.TTL`), so a client that honors it drops either kind of stale
+address quickly. After about 4.19 million distinct names the IPv4 pool runs
+out and further queries get `SERVFAIL`.
 
 These DNS limits, together with UDP being optional, mean the current adapters
 do not yet work with every networking application.
