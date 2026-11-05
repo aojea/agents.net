@@ -1,8 +1,9 @@
-// Launcher mode: `tun2connect run <boundary-socket> <cmd> [args...]`
+// Launcher mode: `tun2connect run <boundary-socket> [<cmd> [args...]]`
 // builds the sandbox's only route (a TUN terminated in userspace, every
 // flow leaving as an HTTP CONNECT tunnel on the boundary socket),
 // then runs the agent as its child with the PID 1 duties: reap orphans,
-// forward signals, exit with the agent's status.
+// forward signals, exit with the agent's status. With no command it just
+// serves, so it can run as a sidecar next to the agent.
 package main
 
 import (
@@ -46,12 +47,16 @@ const (
 
 func runUsage(fs *flag.FlagSet) func() {
 	return func() {
-		fmt.Fprintf(os.Stderr, `Usage: tun2connect run [flags] <boundary-socket> <command> [args...]
+		fmt.Fprintf(os.Stderr, `Usage: tun2connect run [flags] <boundary-socket> [<command> [args...]]
 
 Runs <command> in a sandbox whose only network path is a TUN device
 terminated in userspace; every flow reaches the boundary socket as a
 HTTP CONNECT tunnel with a hostname or IP target. Flags stop at the first positional argument:
 everything after the boundary socket belongs to the command.
+
+With no command, it sets up the device the same way and serves until
+SIGINT or SIGTERM, for a sidecar or system service that shares the
+sandbox's network namespace with the agent.
 
 The boundary socket is a Unix socket path (or unix:///path, tcp://host:port).
 
@@ -72,14 +77,10 @@ func runLauncher(args []string) {
 	sandboxID := fs.String("sandbox-id", "", "value for the Sandbox-Id header on every tunnel request")
 	fs.Usage = runUsage(fs)
 	fs.Parse(args)
-	rest := fs.Args()
-	if len(rest) < 2 {
+	boundary, argv, ok := parseRunArgs(fs.Args())
+	if !ok {
 		fs.Usage()
 		os.Exit(2)
-	}
-	boundary, argv := rest[0], rest[1:]
-	if !strings.Contains(boundary, "://") {
-		boundary = "unix://" + boundary
 	}
 	pinned, err := parsePinnedPorts(*ingressPorts)
 	if *ingress != "" && (err != nil || len(pinned) == 0) {
@@ -146,8 +147,26 @@ func runLauncher(args []string) {
 		go serveIngress(ingressListener, pinned)
 	}
 
+	if len(argv) == 0 {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+		log.Printf("launcher up: device=%s boundary=%s, no agent: serving until SIGINT or SIGTERM", *device, boundary)
+		<-sig
+		return
+	}
 	log.Printf("launcher up: device=%s boundary=%s agent=%q", *device, boundary, argv)
 	os.Exit(runChild(argv))
+}
+
+func parseRunArgs(args []string) (boundary string, command []string, ok bool) {
+	if len(args) == 0 {
+		return "", nil, false
+	}
+	boundary, command = args[0], args[1:]
+	if !strings.Contains(boundary, "://") {
+		boundary = "unix://" + boundary
+	}
+	return boundary, command, true
 }
 
 // dropNetAdmin removes CAP_NET_ADMIN, which only TUN setup needed, from
