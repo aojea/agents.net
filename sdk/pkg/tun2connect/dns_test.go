@@ -3,8 +3,10 @@ package tun2connect
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/netip"
 	"testing"
+	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
@@ -170,10 +172,50 @@ func TestHandleQueryA(t *testing.T) {
 	if len(answers) != 1 {
 		t.Fatalf("want 1 answer, got %d", len(answers))
 	}
+	if ttl := answers[0].Header.TTL; ttl != 30 {
+		t.Fatalf("answer TTL = %d, want the 30s default", ttl)
+	}
 	a := answers[0].Body.(*dnsmessage.AResource)
 	got := netip.AddrFrom4(a.A)
 	if name, ok := d.Reverse(got); !ok || name != "model.example" {
 		t.Fatalf("answer %v does not reverse to the queried name (got %q, %v)", got, name, ok)
+	}
+}
+
+func TestHandleQueryTTL(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		ttl  time.Duration
+		want uint32
+	}{
+		{name: "custom", ttl: 5 * time.Minute, want: 300},
+		{name: "zero asks clients not to cache", ttl: 0, want: 0},
+		{name: "rounded down to whole seconds", ttl: 1500 * time.Millisecond, want: 1},
+		{name: "negative is zero", ttl: -time.Second, want: 0},
+		{name: "capped at 2^31-1", ttl: 100 * 365 * 24 * time.Hour, want: math.MaxInt32},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d := NewVirtualDNS()
+			d.TTL = test.ttl
+			resp, err := d.HandleQuery(buildQuery(t, "model.example.", dnsmessage.TypeAAAA))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var p dnsmessage.Parser
+			if _, err := p.Start(resp); err != nil {
+				t.Fatal(err)
+			}
+			if err := p.SkipAllQuestions(); err != nil {
+				t.Fatal(err)
+			}
+			answers, err := p.AllAnswers()
+			if err != nil || len(answers) != 1 {
+				t.Fatalf("want 1 answer, got %d (%v)", len(answers), err)
+			}
+			if got := answers[0].Header.TTL; got != test.want {
+				t.Fatalf("answer TTL = %d, want %d", got, test.want)
+			}
+		})
 	}
 }
 

@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/mdlayher/vsock"
 	"golang.org/x/sys/unix"
@@ -111,6 +112,15 @@ func boundaryDialer(proxy string) (func(ctx context.Context) (net.Conn, error), 
 	}
 }
 
+func virtualDNS(ttl time.Duration) *tun2connect.VirtualDNS {
+	if ttl < 0 {
+		log.Fatalf("-dns-ttl must not be negative (got %v)", ttl)
+	}
+	resolver := tun2connect.NewVirtualDNS()
+	resolver.TTL = ttl
+	return resolver
+}
+
 func main() {
 	// Launcher mode: build the TUN, become the agent's supervisor, and
 	// exit with its status. Daemon mode (below) only runs the engine.
@@ -123,8 +133,10 @@ func main() {
 	mtu := flag.Uint("mtu", 1500, "TUN MTU")
 	proxy := flag.String("proxy", "unix:///tmp/boundary.sock", "boundary address (unix:///path or tcp://host:port)")
 	udp := flag.Bool("udp", false, "tunnel UDP sessions via connect-udp (DNS is always answered locally)")
+	dnsTTL := flag.Duration("dns-ttl", tun2connect.DefaultTTL, "TTL on synthetic DNS answers, in whole seconds (0 asks clients not to cache)")
 	sandboxID := flag.String("sandbox-id", "", "value for the Sandbox-Id header on every tunnel request")
 	flag.Parse()
+	dns := virtualDNS(*dnsTTL)
 
 	dial, err := boundaryDialer(*proxy)
 	if err != nil {
@@ -145,7 +157,7 @@ func main() {
 	eng, err := tun2connect.New(tun2connect.Config{
 		Device:    dev,
 		Dialer:    client,
-		DNS:       tun2connect.NewVirtualDNS(),
+		DNS:       dns,
 		EnableUDP: *udp,
 	})
 	if err != nil {

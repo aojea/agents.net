@@ -3,9 +3,11 @@ package tun2connect
 import (
 	"container/list"
 	"errors"
+	"math"
 	"net/netip"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/dns/dnsmessage"
 )
@@ -31,6 +33,10 @@ var (
 // recently resolved or dialed name is forgotten first.
 const maxSyntheticNames = 1 << 16
 
+// DefaultTTL is short so clients soon drop an address that went stale,
+// either because its name was forgotten or because the resolver restarted.
+const DefaultTTL = 30 * time.Second
+
 // ErrPoolExhausted is returned when a pool has no addresses left; the
 // DNS codec turns it into SERVFAIL, which fails closed.
 var ErrPoolExhausted = errors.New("tun2connect: synthetic address pool exhausted")
@@ -46,6 +52,9 @@ var ErrPoolExhausted = errors.New("tun2connect: synthetic address pool exhausted
 // it. A stale cache therefore fails closed instead of reaching the name
 // that would otherwise have inherited the address.
 type VirtualDNS struct {
+	// TTL is sent in whole seconds. Set it before the first query.
+	TTL time.Duration
+
 	mu      sync.Mutex
 	v4, v6  family
 	reverse map[netip.Addr]*list.Element
@@ -65,6 +74,7 @@ type binding struct {
 
 func NewVirtualDNS() *VirtualDNS {
 	return &VirtualDNS{
+		TTL:     DefaultTTL,
 		v4:      family{pool: v4Pool, reserved: v4Reserved, last: v4Pool.Addr(), names: make(map[string]*list.Element)},
 		v6:      family{pool: v6Pool, reserved: v6Reserved, last: v6Pool.Addr(), names: make(map[string]*list.Element)},
 		reverse: make(map[netip.Addr]*list.Element),
@@ -190,7 +200,7 @@ func (d *VirtualDNS) HandleQuery(query []byte) ([]byte, error) {
 		if err := b.StartAnswers(); err != nil {
 			return nil, err
 		}
-		rh := dnsmessage.ResourceHeader{Name: q.Name, Type: q.Type, Class: q.Class, TTL: 3600}
+		rh := dnsmessage.ResourceHeader{Name: q.Name, Type: q.Type, Class: q.Class, TTL: ttlSeconds(d.TTL)}
 		if q.Type == dnsmessage.TypeA {
 			err = b.AResource(rh, dnsmessage.AResource{A: addr.As4()})
 		} else {
@@ -201,4 +211,9 @@ func (d *VirtualDNS) HandleQuery(query []byte) ([]byte, error) {
 		}
 	}
 	return b.Finish()
+}
+
+// RFC 2181 caps a DNS TTL at 2^31-1 seconds.
+func ttlSeconds(ttl time.Duration) uint32 {
+	return uint32(min(max(ttl/time.Second, 0), math.MaxInt32))
 }

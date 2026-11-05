@@ -66,6 +66,7 @@ func runLauncher(args []string) {
 	device := fs.String("device", "tun0", "TUN device name to create")
 	mtu := fs.Uint("mtu", 1500, "TUN MTU")
 	udp := fs.Bool("udp", false, "tunnel UDP sessions via connect-udp (DNS is always answered locally)")
+	dnsTTL := fs.Duration("dns-ttl", tun2connect.DefaultTTL, "TTL on synthetic DNS answers, in whole seconds (0 asks clients not to cache)")
 	ingress := fs.String("ingress-socket", "", "serve the ingress channel (HTTP CONNECT 127.0.0.1:<port> or [::1]:<port>) on this Unix socket path or vsock://PORT; requires -ingress-port")
 	ingressPorts := fs.String("ingress-port", "", "comma-separated loopback ports ingress streams may be joined to (1-65535); nothing else is reachable")
 	sandboxID := fs.String("sandbox-id", "", "value for the Sandbox-Id header on every tunnel request")
@@ -84,6 +85,7 @@ func runLauncher(args []string) {
 	if *ingress != "" && (err != nil || len(pinned) == 0) {
 		log.Fatal("-ingress-socket requires -ingress-port listing one or more ports in the range 1-65535: the controller, not the caller, chooses which local services ingress reaches")
 	}
+	dns := virtualDNS(*dnsTTL)
 
 	// Refuse to start if the namespace has any interface besides loopback:
 	// a half-configured sandbox must be a startup error, not a second route.
@@ -132,7 +134,7 @@ func runLauncher(args []string) {
 	eng, err := tun2connect.New(tun2connect.Config{
 		Device:    dev,
 		Dialer:    client,
-		DNS:       tun2connect.NewVirtualDNS(),
+		DNS:       dns,
 		EnableUDP: *udp,
 	})
 	if err != nil {
