@@ -17,6 +17,9 @@
 # - certs/agent-ca.pem / agent-ca.key -- the demo root CA. Mount agent-ca.pem
 #   into the sandbox as /var/run/agent-ca.pem so the sandbox can trust the
 #   boundary's locally terminated TLS (the spec's TLS inspection model).
+#   Its name constraints permit only $HOSTS, so even its key can't sign a
+#   certificate the sandbox accepts for any other host. Adding a host makes
+#   a new CA, and the image that trusts the old one has to be rebuilt.
 # - certs/agent-mitm.pem / agent-mitm.key -- the one leaf cert host_proxy.py
 #   loads, covering every host in $HOSTS via SAN.
 #
@@ -31,23 +34,31 @@ mkdir -p "$DIR"
 
 HOSTS="example.com $*"
 SAN=""
+PERMITTED=""
 for host in $HOSTS; do
   SAN="${SAN}DNS:$host,"
+  PERMITTED="${PERMITTED}permitted;DNS:$host,"
 done
 SAN="${SAN%,}"
 
 openssl genrsa -out "$DIR/agent-ca.key" 2048
 openssl req -x509 -new -nodes -key "$DIR/agent-ca.key" -sha256 -days 3650 \
   -subj "/O=agents.net demo/CN=agents.net Demo Root CA" \
+  -addext "basicConstraints=critical,CA:TRUE,pathlen:0" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" \
+  -addext "nameConstraints=critical,${PERMITTED}excluded;IP:0.0.0.0/0.0.0.0,excluded;IP:::/::" \
   -out "$DIR/agent-ca.pem"
 
 openssl genrsa -out "$DIR/agent-mitm.key" 2048
 openssl req -new -key "$DIR/agent-mitm.key" \
-  -subj "/CN=agents.net demo MITM cert" \
+  -subj "/CN=example.com" \
   -out "$DIR/agent-mitm.csr"
 
 cat > "$DIR/agent-mitm.ext" <<EOF
 subjectAltName = $SAN
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
 EOF
 
 openssl x509 -req -in "$DIR/agent-mitm.csr" \

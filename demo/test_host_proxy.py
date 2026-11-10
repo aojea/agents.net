@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # Add demo directory to sys.path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -210,15 +211,189 @@ class ConfigTestCase(unittest.TestCase):
         self.assertTrue(resp.endswith(b"Hello World"))
 
     def test_inject_auth_replaces_placeholder(self):
-        raw = host_proxy.inject_auth(
-            "POST /v1/chat HTTP/1.1",
-            [("Host", "api.openai.com"), ("Authorization", "Bearer placeholder")],
-            b"{}",
+        fields = host_proxy.inject_auth(
+            [("Host", "api.openai.com"), ("authorization", "Bearer placeholder")],
             "real-token",
         )
-        self.assertIn(b"Authorization: Bearer real-token\r\n", raw)
-        self.assertNotIn(b"placeholder", raw)
-        self.assertTrue(raw.startswith(b"POST /v1/chat HTTP/1.1\r\n"))
+        self.assertEqual(
+            fields, [("Host", "api.openai.com"), ("Authorization", "Bearer real-token")]
+        )
+
+
+class RecordingBackend(BaseHTTPRequestHandler):
+    """An HTTP/1.1 upstream that answers with what it received."""
+
+    protocol_version = "HTTP/1.1"
+
+    def do_GET(self):
+        self.server.seen.append(
+            (self.command, self.path, self.headers.get("Authorization"))
+        )
+        if self.path == "/stream":
+            self.send_response(200)
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            for part in (b"first ", b"second"):
+                self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
+            self.wfile.write(b"0\r\n\r\n")
+            return
+        body = self.headers.get("Authorization", "").encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length)
+        self.server.seen.append(
+            (self.command, self.path, self.headers.get("Authorization"))
+        )
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class InjectTestCase(BoundaryTestCase):
+    """The credential-inject tier over plain HTTP, which takes the same
+    per-request path as the TLS-terminated one."""
+
+    def setUp(self):
+        super().setUp()
+        self.backend = ThreadingHTTPServer(("127.0.0.1", 0), RecordingBackend)
+        self.backend.seen = []
+        threading.Thread(target=self.backend.serve_forever, daemon=True).start()
+        self.addCleanup(self.backend.server_close)
+        self.addCleanup(self.backend.shutdown)
+        self.port = self.backend.server_address[1]
+        self.authority = f"localhost:{self.port}"
+        original = dict(host_proxy.CREDENTIAL_HOSTS)
+        host_proxy.CREDENTIAL_HOSTS["localhost"] = "real-token"
+        self.addCleanup(
+            lambda: (
+                host_proxy.CREDENTIAL_HOSTS.clear(),
+                host_proxy.CREDENTIAL_HOSTS.update(original),
+            )
+        )
+
+    def tunnel(self):
+        client = self.connect()
+        status, _ = connect_request(client, self.authority)
+        self.assertEqual(status, 200)
+        return client, host_proxy.Reader(client)
+
+    def exchange(self, client, reader, request: bytes):
+        client.sendall(request)
+        status_line, fields = host_proxy.parse_head(reader.head())
+        framing = host_proxy.body_framing(fields)
+
+        class Sink:
+            data = b""
+
+            def sendall(self, b):
+                self.data += b
+
+        sink = Sink()
+        host_proxy.copy_body(reader, sink, framing)
+        return int(status_line.split(" ")[1]), sink.data
+
+    def test_every_request_on_a_reused_connection_gets_the_credential(self):
+        client, reader = self.tunnel()
+        for _ in range(2):
+            status, body = self.exchange(
+                client,
+                reader,
+                (
+                    f"GET /v1/models HTTP/1.1\r\nHost: {self.authority}\r\n"
+                    "Authorization: Bearer placeholder\r\n\r\n"
+                ).encode(),
+            )
+            self.assertEqual((status, body), (200, b"Bearer real-token"))
+        status, body = self.exchange(
+            client,
+            reader,
+            (
+                f"POST /v1/chat HTTP/1.1\r\nHost: {self.authority}\r\n"
+                "Content-Length: 5\r\n\r\nhello"
+            ).encode(),
+        )
+        self.assertEqual((status, body), (200, b"hello"))
+        self.assertEqual(
+            self.backend.seen,
+            [
+                ("GET", "/v1/models", "Bearer real-token"),
+                ("GET", "/v1/models", "Bearer real-token"),
+                ("POST", "/v1/chat", "Bearer real-token"),
+            ],
+        )
+
+    def test_chunked_response_is_streamed(self):
+        client, reader = self.tunnel()
+        status, body = self.exchange(
+            client,
+            reader,
+            (f"GET /stream HTTP/1.1\r\nHost: {self.authority}\r\n\r\n").encode(),
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"6\r\nfirst \r\n6\r\nsecond\r\n0\r\n\r\n")
+
+    def test_refused_requests_get_no_credential(self):
+        tests = [
+            (
+                "another host",
+                f"GET / HTTP/1.1\r\nHost: other.example:{self.port}\r\n\r\n",
+                421,
+            ),
+            ("another port", "GET / HTTP/1.1\r\nHost: localhost:1\r\n\r\n", 421),
+            ("no host", "GET / HTTP/1.1\r\n\r\n", 400),
+            (
+                "two hosts",
+                f"GET / HTTP/1.1\r\nHost: {self.authority}\r\nHost: {self.authority}\r\n\r\n",
+                400,
+            ),
+            (
+                "absolute form",
+                f"GET http://other.example/ HTTP/1.1\r\nHost: {self.authority}\r\n\r\n",
+                400,
+            ),
+            (
+                "upgrade",
+                f"GET / HTTP/1.1\r\nHost: {self.authority}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                501,
+            ),
+            (
+                "two framings",
+                f"POST / HTTP/1.1\r\nHost: {self.authority}\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n",
+                400,
+            ),
+        ]
+        for name, request, want in tests:
+            with self.subTest(name):
+                client, reader = self.tunnel()
+                status, _ = self.exchange(client, reader, request.encode())
+                self.assertEqual(status, want)
+                self.assertEqual(client.recv(1), b"")
+        self.assertEqual(self.backend.seen, [])
+
+    def test_refusal_after_an_allowed_request_closes_the_tunnel(self):
+        client, reader = self.tunnel()
+        status, _ = self.exchange(
+            client,
+            reader,
+            (f"GET / HTTP/1.1\r\nHost: {self.authority}\r\n\r\n").encode(),
+        )
+        self.assertEqual(status, 200)
+        status, _ = self.exchange(
+            client,
+            reader,
+            (f"GET / HTTP/1.1\r\nHost: other.example:{self.port}\r\n\r\n").encode(),
+        )
+        self.assertEqual(status, 421)
+        self.assertEqual(len(self.backend.seen), 1)
 
 
 if __name__ == "__main__":

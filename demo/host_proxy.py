@@ -44,8 +44,8 @@ glance:
      who wants to swap the free local model for a paid one. These are
      genuinely relayed to the real internet, but this boundary *also*
      terminates TLS for them and injects the real `Authorization` header
-     itself, sourced only from the HOST's own environment (see
-     AGENT_PROXY_TOKENS below). The sandboxed agent is never given the
+     into every request itself, sourced only from the HOST's own
+     environment (see AGENT_PROXY_TOKENS below). The sandboxed agent is never given the
      real credential -- it can hold an empty or placeholder value, or none
      at all. This decouples the agent from the secret entirely: an admin
      can mint, scope, and revoke a distinct token per sandbox instance
@@ -353,53 +353,187 @@ def relay(client_sock, out_sock) -> None:
             other.sendall(chunk)
 
 
-def read_http_message(sock, initial: bytes = b""):
-    """Read one HTTP request (headers + body) from sock, starting from any
-    bytes already read (`initial`). Returns (request_line, headers, body)
-    where headers is a list of (name, value) tuples. Inside a CONNECT
-    tunnel the agent believes it is talking directly to the origin server,
-    so the inner request line is already origin-form -- nothing to
-    rewrite."""
-    buf = initial
-    while b"\r\n\r\n" not in buf:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        buf += chunk
-    head, _, rest = buf.partition(b"\r\n\r\n")
+# ---------------------------------------------------------------------------
+# HTTP/1.1 inside a TLS-terminated tunnel, for the credential-inject tier.
+# The agent can send many requests on one connection, so the boundary
+# parses and checks each of them. Authorizing the first request on a
+# connection authorizes nothing after it (spec/draft/gateway.md section 2).
+# ---------------------------------------------------------------------------
+
+MAX_INNER_HEAD = 64 * 1024
+# How long the boundary waits for the agent's next request, and for the
+# upstream, which can take minutes to start a model's answer.
+INJECT_IDLE_TIMEOUT = 60
+UPSTREAM_TIMEOUT = 300
+
+
+class BadRequest(Exception):
+    """A request the boundary refuses. The tunnel closes after the reply,
+    so a refused request never reaches the upstream."""
+
+    def __init__(self, status: str, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+class Reader:
+    """Buffered reads of HTTP framing from a socket."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.buf = b""
+
+    def _fill(self) -> bool:
+        chunk = self.sock.recv(65536)
+        self.buf += chunk
+        return bool(chunk)
+
+    def head(self):
+        """Return the next message head without its final CRLF CRLF, or
+        None when the peer closed the connection between messages."""
+        while b"\r\n\r\n" not in self.buf:
+            if len(self.buf) > MAX_INNER_HEAD:
+                raise BadRequest(
+                    "431 Request Header Fields Too Large", "request head too large"
+                )
+            if not self._fill():
+                if self.buf:
+                    raise ConnectionError("connection closed mid-head")
+                return None
+        head, _, self.buf = self.buf.partition(b"\r\n\r\n")
+        return head
+
+    def line(self) -> bytes:
+        while b"\r\n" not in self.buf:
+            if len(self.buf) > MAX_INNER_HEAD:
+                raise ConnectionError("chunk line too long")
+            if not self._fill():
+                raise ConnectionError("connection closed mid-chunk")
+        line, _, self.buf = self.buf.partition(b"\r\n")
+        return line + b"\r\n"
+
+    def some(self, limit: int) -> bytes:
+        if not self.buf and not self._fill():
+            return b""
+        data, self.buf = self.buf[:limit], self.buf[limit:]
+        return data
+
+
+def parse_head(head: bytes):
+    """Split a message head into its start line and (name, value) fields."""
     lines = head.decode("latin1").split("\r\n")
-    request_line = lines[0] if lines else ""
-    headers = []
+    fields = []
     for line in lines[1:]:
-        if ":" in line:
-            k, _, v = line.partition(":")
-            headers.append((k.strip(), v.strip()))
-    content_length = 0
-    for k, v in headers:
-        if k.lower() == "content-length":
+        name, sep, value = line.partition(":")
+        if not sep or not name or name != name.strip():
+            raise BadRequest("400 Bad Request", "malformed header field")
+        fields.append((name, value.strip()))
+    return lines[0], fields
+
+
+def field_values(fields: list, name: str) -> list:
+    return [v for k, v in fields if k.lower() == name]
+
+
+def body_framing(fields: list):
+    """Return "chunked", a byte count, or None for a body that runs until
+    the connection closes (responses only). Requests that frame their body
+    two ways are refused: the upstream could read it differently."""
+    te = field_values(fields, "transfer-encoding")
+    cl = set(field_values(fields, "content-length"))
+    if te and cl:
+        raise BadRequest("400 Bad Request", "both Transfer-Encoding and Content-Length")
+    if te:
+        if ",".join(te).replace(" ", "").lower() != "chunked":
+            raise BadRequest("501 Not Implemented", "unsupported transfer coding")
+        return "chunked"
+    if len(cl) > 1:
+        raise BadRequest("400 Bad Request", "conflicting Content-Length")
+    if cl:
+        value = cl.pop()
+        if not value.isdigit():
+            raise BadRequest("400 Bad Request", "malformed Content-Length")
+        return int(value)
+    return None
+
+
+def copy_body(src: Reader, dst, framing) -> None:
+    """Stream one body from src to dst as it arrives, so long model
+    answers reach the agent token by token."""
+    if framing == "chunked":
+        while True:
+            line = src.line()
+            dst.sendall(line)
             try:
-                content_length = int(v)
+                size = int(line.split(b";", 1)[0].strip(), 16)
             except ValueError:
-                content_length = 0
-            break
-    body = rest
-    while len(body) < content_length:
-        chunk = sock.recv(4096)
+                raise ConnectionError("malformed chunk size")
+            if size == 0:
+                while True:  # trailer fields end with an empty line
+                    trailer = src.line()
+                    dst.sendall(trailer)
+                    if trailer == b"\r\n":
+                        return
+            copy_body(src, dst, size + 2)  # the chunk and its CRLF
+        return
+    if framing is None:
+        while chunk := src.some(65536):
+            dst.sendall(chunk)
+        return
+    remaining = framing
+    while remaining:
+        chunk = src.some(min(remaining, 65536))
         if not chunk:
-            break
-        body += chunk
-    return request_line, headers, body
+            raise ConnectionError("connection closed mid-body")
+        dst.sendall(chunk)
+        remaining -= len(chunk)
 
 
-def build_request(request_line: str, headers: list, body: bytes) -> bytes:
-    header_block = "".join(f"{k}: {v}\r\n" for k, v in headers)
-    return f"{request_line}\r\n{header_block}\r\n".encode("latin1") + body
+def normalize_host(name: str) -> str:
+    return name.strip().lower().rstrip(".")
 
 
-def inject_auth(request_line: str, headers: list, body: bytes, token: str) -> bytes:
-    headers = [(k, v) for k, v in headers if k.lower() != "authorization"]
-    headers.append(("Authorization", f"Bearer {token}"))
-    return build_request(request_line, headers, body)
+def check_request(request_line: str, fields: list, host: str, port: int) -> str:
+    """Refuse a request that could carry the credential somewhere other
+    than the destination the CONNECT named. Returns the method."""
+    parts = request_line.split(" ")
+    if len(parts) != 3 or parts[2] not in ("HTTP/1.1", "HTTP/1.0"):
+        raise BadRequest("400 Bad Request", "malformed request line")
+    method, target, _ = parts
+    if not target.startswith("/"):
+        raise BadRequest("400 Bad Request", "the request target must be a path")
+    if field_values(fields, "upgrade"):
+        raise BadRequest("501 Not Implemented", "protocol upgrades are not supported")
+    hosts = field_values(fields, "host")
+    if len(hosts) != 1:
+        raise BadRequest("400 Bad Request", "the request needs one Host field")
+    name, sep, port_s = hosts[0].rpartition(":")
+    if not sep or not port_s.isdigit():
+        name, port_s = hosts[0], str(port)
+    if normalize_host(name) != host or int(port_s) != port:
+        raise BadRequest(
+            "421 Misdirected Request", "the request names another host than its tunnel"
+        )
+    return method
+
+
+def inject_auth(fields: list, token: str) -> list:
+    """Replace the agent's Authorization field with the real one. Expect is
+    answered by the boundary itself, which reads the body before sending
+    the request on."""
+    fields = [(k, v) for k, v in fields if k.lower() not in ("authorization", "expect")]
+    fields.append(("Authorization", f"Bearer {token}"))
+    return fields
+
+
+def build_head(start_line: str, fields: list) -> bytes:
+    return (
+        start_line + "\r\n" + "".join(f"{k}: {v}\r\n" for k, v in fields) + "\r\n"
+    ).encode("latin1")
+
+
+def wants_close(fields: list) -> bool:
+    return any("close" in v.lower() for v in field_values(fields, "connection"))
 
 
 def http_response(status_line: bytes, body: bytes) -> bytes:
@@ -462,29 +596,103 @@ def serve_inject(client_sock: socket.socket, target: str, host: str, port: int, 
         return
 
     tunnel_established(client_sock)
-    if port == 443:
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(MITM_CERT, MITM_KEY)
-        agent_side = ctx.wrap_socket(client_sock, server_side=True)
-    else:
-        agent_side = client_sock
+    agent_side = client_sock
+    upstream = None
     try:
-        request_line, headers, body = read_http_message(agent_side)
-        if not request_line:
-            return
-        out_request = inject_auth(request_line, headers, body, token)
-        with socket.create_connection((host, port), timeout=15) as raw:
-            if port == 443:
-                upstream_ctx = ssl.create_default_context()  # verify against the REAL trust store
-                with upstream_ctx.wrap_socket(raw, server_hostname=host) as upstream:
-                    upstream.sendall(out_request)
-                    relay(agent_side, upstream)
-            else:
-                raw.sendall(out_request)
-                relay(agent_side, raw)
+        if port == 443:
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            ctx.load_cert_chain(MITM_CERT, MITM_KEY)
+            ctx.set_alpn_protocols(["http/1.1"])
+            ctx.sni_callback = require_server_name(host)
+            agent_side = ctx.wrap_socket(client_sock, server_side=True)
+        agent_side.settimeout(INJECT_IDLE_TIMEOUT)
+        agent = Reader(agent_side)
+        while True:
+            try:
+                head = agent.head()
+                if head is None:
+                    return
+                request_line, fields = parse_head(head)
+                method = check_request(request_line, fields, host, port)
+                framing = body_framing(fields)
+            except BadRequest as exc:
+                audit("BLOCK-INJECT", target, detail=exc.status.split()[0])
+                agent_side.sendall(
+                    http_response(
+                        f"HTTP/1.1 {exc.status}".encode(), f"{exc}\n".encode()
+                    )
+                )
+                return
+            if upstream is None or upstream_closed(upstream):
+                if upstream is not None:
+                    upstream.sock.close()
+                upstream = Reader(dial_upstream(host, port))
+            if "100-continue" in (v.lower() for v in field_values(fields, "expect")):
+                agent_side.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+            upstream.sock.sendall(build_head(request_line, inject_auth(fields, token)))
+            copy_body(agent, upstream.sock, 0 if framing is None else framing)
+            if not relay_response(upstream, agent_side, method) or wants_close(fields):
+                return
+    except OSError as exc:
+        print(f"[!] inject tunnel {target}: {exc}")
     finally:
+        if upstream is not None:
+            upstream.sock.close()
         if agent_side is not client_sock:
             agent_side.close()
+
+
+def require_server_name(host: str):
+    """Refuse a TLS server name other than the CONNECT host, so the agent
+    can't pick which certificate the boundary presents."""
+
+    def check(_sslobj, name, _ctx):
+        if name and normalize_host(name) != host:
+            return ssl.ALERT_DESCRIPTION_UNRECOGNIZED_NAME
+        return None
+
+    return check
+
+
+def dial_upstream(host: str, port: int):
+    raw = socket.create_connection((host, port), timeout=15)
+    raw.settimeout(UPSTREAM_TIMEOUT)
+    if port != 443:
+        return raw
+    ctx = ssl.create_default_context()  # verify against the REAL trust store
+    ctx.set_alpn_protocols(["http/1.1"])
+    return ctx.wrap_socket(raw, server_hostname=host)
+
+
+def upstream_closed(upstream: Reader) -> bool:
+    """Report whether an idle upstream connection closed or sent bytes
+    nobody asked for; either way the next request needs a new one."""
+    if upstream.buf:
+        return True
+    readable, _, _ = select.select([upstream.sock], [], [], 0)
+    return bool(readable)
+
+
+def relay_response(upstream: Reader, agent_side, method: str) -> bool:
+    """Stream one response to the agent. Returns whether the connection
+    can carry another request."""
+    try:
+        while True:
+            head = upstream.head()
+            if head is None:
+                raise ConnectionError("upstream closed before answering")
+            status_line, fields = parse_head(head)
+            status = int(status_line.split(" ")[1])
+            agent_side.sendall(head + b"\r\n\r\n")
+            if status >= 200:
+                break
+        framing = (
+            0 if method == "HEAD" or status in (204, 304) else body_framing(fields)
+        )
+    except (BadRequest, ValueError, IndexError) as exc:
+        raise ConnectionError(f"malformed upstream response: {exc}")
+    copy_body(upstream, agent_side, framing)
+    return framing is not None and not wants_close(fields)
 
 
 def serve_local_provider(client_sock: socket.socket, target: str, real_addr: tuple) -> None:

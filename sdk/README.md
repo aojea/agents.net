@@ -371,7 +371,7 @@ network of its own, confined by the injected `tun2connect` launcher:
 ![agents.net terminal demo](../demo/terminal-demo.gif)
 
 - [demo/README.md](../demo/README.md): how to build and run the sandbox, step by step.
-- [demo/host_proxy.py](../demo/host_proxy.py): a Python host boundary with a four-tier allowlist (fake responses, a relay to local Ollama, cloud credential injection, and uninspected passthrough). Credential injection rewrites only the first request on each tunnel; later requests on a reused connection pass through unchanged, which a production gateway must not allow ([gateway.md](../spec/draft/gateway.md#2-credential-placement-and-tenant-isolation)).
+- [demo/host_proxy.py](../demo/host_proxy.py): a Python host boundary with a four-tier allowlist (fake responses, a relay to local Ollama, cloud credential injection, and uninspected passthrough). Credential injection rewrites every request on a tunnel and refuses requests that name another host ([gateway.md](../spec/draft/gateway.md#2-credential-placement-and-tenant-isolation)).
 - [demo/agent.py](../demo/agent.py): a sample ReAct agent that reasons autonomously, runs tools, and handles connection refusals.
 - [demo/gen_certs.sh](../demo/gen_certs.sh): generates the demo root CA and multi-SAN leaf certificates.
 - [demo/Dockerfile](../demo/Dockerfile): a Debian-based container image for the agent.
