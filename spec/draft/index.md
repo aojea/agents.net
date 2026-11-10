@@ -133,7 +133,6 @@ the [conformance suite](../../conformance/README.md) verifies.
 - [RFC 8441](https://www.rfc-editor.org/rfc/rfc8441.html): extended CONNECT over HTTP/2.
 - [RFC 9297](https://www.rfc-editor.org/rfc/rfc9297.html): HTTP Datagrams and capsule framing.
 - [RFC 9298](https://www.rfc-editor.org/rfc/rfc9298.html): UDP proxying over HTTP.
-- [RFC 5280](https://www.rfc-editor.org/rfc/rfc5280.html): X.509 certificates, including name and path length constraints.
 - [RFC 8446](https://www.rfc-editor.org/rfc/rfc8446.html): TLS 1.3 authentication and record protection.
 - [RFC 9325](https://www.rfc-editor.org/rfc/rfc9325.html): recommendations for secure TLS use.
 - [RFC 9525](https://www.rfc-editor.org/rfc/rfc9525.html): service identity verification with TLS.
