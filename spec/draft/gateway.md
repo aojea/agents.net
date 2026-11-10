@@ -38,16 +38,24 @@ instructions, terminates TLS at the gateway. The arrangement has four parts.
    AGENT_CA_CERT=/var/run/agent-ca.pem
    ```
 
-2. The sandbox SHOULD trust the gateway's CA in addition to its existing
-   roots:
-   - `NODE_EXTRA_CA_CERTS` adds to the Node.js trust store and can name
-     `$AGENT_CA_CERT`.
-   - `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` replace the trust store, so
-     they MUST NOT name the gateway's CA alone. They SHOULD name a bundle of
-     the image's roots and the gateway's CA. When the image already sets
-     them, the bundle SHOULD keep the certificates of the image's file.
-   - Tools that read only the system trust store, such as git, need the CA
-     added to that store.
+2. The sandbox environment SHOULD make common runtimes trust the gateway's
+   CA in addition to the public roots. `NODE_EXTRA_CA_CERTS` adds to the
+   roots of Node.js, but `SSL_CERT_FILE` (OpenSSL, Go, Python) and
+   `REQUESTS_CA_BUNDLE` (Python `requests`) replace them, so they SHOULD
+   name a bundle that holds both. For example, on Debian:
+
+   ```bash
+   cat "${SSL_CERT_FILE:-/etc/ssl/certs/ca-certificates.crt}" "$AGENT_CA_CERT" \
+       > /tmp/agent-ca-bundle.pem
+   export NODE_EXTRA_CA_CERTS=$AGENT_CA_CERT
+   export SSL_CERT_FILE=/tmp/agent-ca-bundle.pem
+   export REQUESTS_CA_BUNDLE=/tmp/agent-ca-bundle.pem
+   ```
+
+   An image can instead add the CA to its system store with
+   `update-ca-certificates` and point the variables at that store, as the
+   [demo](../../demo/Dockerfile) does. Tools that read only the system store,
+   such as git, need this.
 3. The application gateway can then attach host-held credentials to
    authorized requests, inspect or redact content, and return
    application-level errors or rate limits.
