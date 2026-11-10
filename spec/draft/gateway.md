@@ -62,17 +62,7 @@ inspecting gateways apply.
 
 The CA's key MUST NOT be readable from any sandbox. The gateway SHOULD keep
 the key in memory and create a new CA each time it starts, so that a copied
-key stops working once the sandboxes that trust it end. The CA certificate
-SHOULD have a path length constraint of zero.
-
-The CA certificate MAY carry name constraints
-([RFC 5280 Section 4.2.1.10](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.10))
-that permit only the inspected hosts and exclude all IP addresses. Clients
-then reject a certificate for any other host, even one signed with the CA's
-key, so the key can't be used to impersonate uninspected destinations such
-as package registries. This matters most when the CA certificate can reach
-trust stores outside the sandbox. A constrained CA has to be replaced when
-the inspected hosts change.
+key stops working once the sandboxes that trust it end.
 
 ## 2. Credential Placement and Tenant Isolation
 
@@ -100,13 +90,15 @@ on later requests over a reused connection. Bearer tokens, private keys, and
 sensitive request bodies MUST NOT appear in logs, error responses, shared
 files, or workload environments.
 
-Before it attaches a credential, the gateway MUST check that the TLS server
-name, when the client sends one, and the `Host` field or `:authority` of
-every request name the destination the boundary authorized. A CDN or shared
-front end routes by `Host`, so a request that names another host can carry
-the credential to another origin. The gateway SHOULD refuse such a request
-with 421 (Misdirected Request), and SHOULD refuse request targets that are
-not in origin form.
+A request on an authorized tunnel can still name another site. For example,
+after `CONNECT api.example.com:443`, the workload sends `Host: other.example`.
+The gateway dials api.example.com, but if a CDN serves both sites there and
+routes by `Host`, the request and its credential reach other.example. An
+absolute-form target (`GET https://other.example/ HTTP/1.1`) has the same
+effect, because servers prefer it to `Host`. The gateway MUST attach a
+credential only to a request whose `Host` (`:authority` in HTTP/2) and
+target name the authorized destination. It SHOULD refuse other requests with
+421 (Misdirected Request).
 
 Separate sockets provide attribution and endpoint access control. They do not
 isolate process memory, so a compromised process that holds keys for several
