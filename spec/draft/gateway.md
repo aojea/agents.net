@@ -38,24 +38,16 @@ instructions, terminates TLS at the gateway. The arrangement has four parts.
    AGENT_CA_CERT=/var/run/agent-ca.pem
    ```
 
-2. The sandbox environment SHOULD make common runtimes trust the gateway's
-   CA in addition to the roots they already trust. Some environment
-   variables add certificates to a runtime's default trust store, and others
-   replace it:
-   - `NODE_EXTRA_CA_CERTS` adds to the trust store of Node.js, so it can
-     name `$AGENT_CA_CERT`.
-   - `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` replace the trust store of
-     OpenSSL, Go, and Python `requests`. They MUST NOT name the gateway's CA
-     alone, because TLS to every uninspected destination would then fail.
-     They SHOULD name a bundle that holds the roots the image trusts and the
-     gateway's CA.
-   - Tools that read only the system trust store, such as git, trust the CA
-     once it is added to that store, for example with
-     `update-ca-certificates`.
-
-   When the image already sets one of these variables, for example to trust
-   a corporate root, the file that the sandbox gets SHOULD hold the
-   certificates of the image's file and the gateway's CA.
+2. The sandbox SHOULD trust the gateway's CA in addition to its existing
+   roots:
+   - `NODE_EXTRA_CA_CERTS` adds to the Node.js trust store and can name
+     `$AGENT_CA_CERT`.
+   - `SSL_CERT_FILE` and `REQUESTS_CA_BUNDLE` replace the trust store, so
+     they MUST NOT name the gateway's CA alone. They SHOULD name a bundle of
+     the image's roots and the gateway's CA. When the image already sets
+     them, the bundle SHOULD keep the certificates of the image's file.
+   - Tools that read only the system trust store, such as git, need the CA
+     added to that store.
 3. The application gateway can then attach host-held credentials to
    authorized requests, inspect or redact content, and return
    application-level errors or rate limits.
