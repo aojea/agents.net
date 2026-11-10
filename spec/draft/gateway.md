@@ -92,13 +92,11 @@ files, or workload environments.
 
 A request on an authorized tunnel can still name another site. For example,
 after `CONNECT api.example.com:443`, the workload sends `Host: other.example`.
-The gateway dials api.example.com, but if a CDN serves both sites there and
-routes by `Host`, the request and its credential reach other.example. An
-absolute-form target such as `GET https://other.example/ HTTP/1.1` has the
-same effect, because servers prefer it to `Host`. The gateway MUST attach a
-credential only to a request whose target and `Host` name the authorized
-destination. In HTTP/2, the `:authority` pseudo-header takes the place of
-`Host`. The gateway SHOULD refuse other requests with status 421.
+If the upstream routes by `Host`, as a CDN does, the request and its
+credential reach other.example, though it was not authorized. The gateway
+MUST check that both the request target and `Host` name the tunnel's
+destination before it attaches a credential. It SHOULD refuse other requests
+with status 421.
 
 Separate sockets provide attribution and endpoint access control. They do not
 isolate process memory, so a compromised process that holds keys for several
