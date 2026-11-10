@@ -17,9 +17,8 @@
 # - certs/agent-ca.pem / agent-ca.key -- the demo root CA. Mount agent-ca.pem
 #   into the sandbox as /var/run/agent-ca.pem so the sandbox can trust the
 #   boundary's locally terminated TLS (the spec's TLS inspection model).
-#   Its name constraints permit only $HOSTS, so even its key can't sign a
-#   certificate the sandbox accepts for any other host. Adding a host makes
-#   a new CA, and the image that trusts the old one has to be rebuilt.
+#   Its name constraints permit only $HOSTS, so adding a host makes a new
+#   CA and needs an image rebuild.
 # - certs/agent-mitm.pem / agent-mitm.key -- the one leaf cert host_proxy.py
 #   loads, covering every host in $HOSTS via SAN.
 #

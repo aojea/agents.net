@@ -83,7 +83,7 @@ The host boundary terminates TLS locally for its fake-response tier, so it needs
 
 This creates:
 
-- `demo/certs/agent-ca.pem` / `agent-ca.key`: the demo root CA. The [Dockerfile](Dockerfile) bakes `agent-ca.pem` into the image's system trust store at build time (the trust-store coordination described in the spec's [TLS inspection models](../spec/draft/gateway.md#1-tls-inspection-and-verification-models)), so run this lab **before** Lab 5. The CA's name constraints permit only the hosts the boundary terminates TLS for, so its key can't sign a certificate the sandbox accepts for any other host. Adding a host therefore makes a new CA, and the image has to be rebuilt.
+- `demo/certs/agent-ca.pem` / `agent-ca.key`: the demo root CA. The [Dockerfile](Dockerfile) bakes `agent-ca.pem` into the image's system trust store at build time (the trust-store coordination described in the spec's [TLS inspection models](../spec/draft/gateway.md#1-tls-inspection-and-verification-models)), so run this lab **before** Lab 5. Its name constraints permit only the hosts the boundary terminates TLS for, so adding a host makes a new CA and needs an image rebuild.
 - `demo/certs/agent-mitm.pem` / `agent-mitm.key`: one leaf certificate with a `SAN` entry for each host the boundary terminates TLS for (`example.com` by default). The leaf stays on the host and never enters the image.
 
 The script lists exact hostnames as `SAN` entries rather than using a wildcard, because `*.example.com` matches one subdomain label and not the bare apex `example.com`. A private demo CA isn't bound by the CA/Browser Forum's wildcard rules, so exact names are the simpler choice and cover any host you add. Pass extra hostnames as arguments, for example `./demo/gen_certs.sh api.openai.com`; you'll need that only for the cloud-migration bonus.
@@ -94,13 +94,7 @@ The script lists exact hostnames as `SAN` entries rather than using a wildcard, 
 openssl x509 -in demo/certs/agent-mitm.pem -noout -text | grep -A1 "Subject Alternative Name"
 ```
 
-Expected output includes `DNS:example.com`. To see the CA's limits:
-
-```bash
-openssl x509 -in demo/certs/agent-ca.pem -noout -ext nameConstraints
-```
-
-Expected output lists `DNS:example.com` under `Permitted` and every IPv4 and IPv6 address under `Excluded`.
+Expected output includes `DNS:example.com`.
 
 ## Lab 3: Build the Launcher
 
@@ -136,7 +130,7 @@ policy sorts allowed hostnames into four tiers:
 | **Fake-response** | `example.com` | Never forwarded. TLS terminated locally with the demo CA; a canned success body is returned. | `FAKE_RESPONSE_HOSTS` (hardcoded to `example.com` and `httpbin.org`) |
 | **Local-provider** | `ollama` (symbolic) | No TLS termination, no credential. A plain byte relay from the sandbox's symbolic hostname to a real `host:port` on the operator's own machine -- the sandbox can never resolve or route to it on its own. | `AGENT_PROXY_LOCAL_PROVIDERS="symbolic=host:port,..."` (default `ollama=127.0.0.1:11434`) |
 | **Passthrough** | `registry.npmjs.org` | No TLS termination, no injection -- a plain byte-for-byte relay straight to the real host. Used for a harness's own housekeeping (package installs, update checks, telemetry) that carries no secret. | `AGENT_PROXY_PASSTHROUGH="host,host,..."` (default `registry.npmjs.org,models.dev`) |
-| **Credential-inject**, opt-in | `api.openai.com` | TLS terminated locally. On every request of the connection, the agent's `Authorization` header (empty, placeholder, or garbage) is stripped and replaced with the real `Bearer <token>`, then the request is genuinely relayed upstream with the real system trust store. A request that names another host gets `421` and no token. Empty/unconfigured by default -- see the cloud-migration section at the end of this tutorial. | `AGENT_PROXY_TOKENS="host=ENV_VAR_NAME,..."` |
+| **Credential-inject**, opt-in | `api.openai.com` | TLS terminated locally. On every request, the agent's `Authorization` header (empty, placeholder, or garbage) is replaced with the real `Bearer <token>`, then the request is relayed upstream with the real system trust store. A request that names another host gets `421`. Empty/unconfigured by default -- see the cloud-migration section at the end of this tutorial. | `AGENT_PROXY_TOKENS="host=ENV_VAR_NAME,..."` |
 
 Anything not on the four lists is refused with `403 Forbidden` and a
 `Proxy-Status` field that carries the reason, and the refusal is logged. Inside
@@ -256,10 +250,10 @@ The boundary dials the sandbox's ingress socket and performs the [ingress handsh
 
 ## Bonus: Migrate to a Real Cloud Model -- Without Touching the Sandbox
 
-Everything above ran against the local provider. To switch the same sandbox to a hosted backend such as `api.openai.com`, use the credential-inject tier. The Dockerfile, the `docker run` command, and the agent stay the same. The image is rebuilt only to trust the new demo CA.
+Everything above ran against the local provider. To switch the same sandbox to a hosted backend such as `api.openai.com`, use the credential-inject tier. The Dockerfile, the `docker run` command, and the agent stay the same.
 
 ```bash
-# 1. Make a CA and leaf cert that cover the host, and rebuild the image to trust the new CA:
+# 1. Make a CA that covers the host, and rebuild the image to trust it:
 ./demo/gen_certs.sh api.openai.com
 docker build -t agentsnet-demo demo/
 
@@ -268,7 +262,7 @@ export OPENAI_API_KEY=sk-...           # exists only in the HOST's shell
 AGENT_PROXY_TOKENS="api.openai.com=OPENAI_API_KEY" python3 demo/host_proxy.py
 ```
 
-The startup banner now lists the host with a non-secret fingerprint (`sha256:...`), and `ALLOW-INJECT` audit lines carry the same fingerprint, so you can confirm that a key rotation took effect without the log ever holding a secret. The sandboxed agent may send an empty, placeholder, or garbage `Authorization` header; the boundary strips it and injects the real one into every request on the connection. Before it does, it checks that the TLS server name and the request's `Host` field name the host the tunnel was opened to, because a CDN in front of the provider could route a request that names another host to another origin. The real credential never enters the sandbox, and the only process that holds it is the boundary.
+The startup banner now lists the host with a non-secret fingerprint (`sha256:...`), and `ALLOW-INJECT` audit lines carry the same fingerprint, so you can confirm that a key rotation took effect without the log ever holding a secret. The sandboxed agent may send an empty, placeholder, or garbage `Authorization` header; the boundary replaces it on every request whose `Host` names the tunnel's host. The real credential never enters the sandbox, and the only process that holds it is the boundary.
 
 ## Implementation Examples
 
@@ -369,7 +363,7 @@ Once the tun exists, the launcher removes `CAP_NET_ADMIN` from itself and from t
 The boundary (Lab 4) was started before the certificates (Lab 2) existed. Run `./demo/gen_certs.sh` and restart `host_proxy.py`.
 
 **`certificate verify failed` for a host you added with `gen_certs.sh`**
-Each run of `gen_certs.sh` makes a new CA, and the image still trusts the old one. Rebuild the image (Lab 5).
+Each run makes a new CA, and the image still trusts the old one. Rebuild it (Lab 5).
 
 **`AGENT_PROXY_TOKENS: '<VAR>' is not set on the host -- '<host>' will NOT be reachable`**
 This only comes up in the cloud-migration bonus, and it fails closed on purpose. Export the named environment variable in the *host's* shell (not the container's) before starting `host_proxy.py`.
