@@ -58,6 +58,31 @@ limits. These functions are separate from CONNECT tunneling. The
 requirements of [wire.md Section 9](wire.md#9-untrusted-tunnel-content) on
 inspecting gateways apply.
 
+### 1.3 The Gateway's Certificate Authority
+
+A sandbox that trusts the gateway's CA accepts every certificate the CA
+signs. Whoever holds the CA's key can therefore impersonate any server to the
+sandbox, and to any other client that trusts the CA. The following limits
+narrow what the CA can sign:
+
+- The CA certificate SHOULD carry a critical name constraints extension
+  ([RFC 5280 Section 4.2.1.10](https://www.rfc-editor.org/rfc/rfc5280.html#section-4.2.1.10))
+  that permits only the DNS names of the inspected destinations and excludes
+  all IPv4 and IPv6 addresses. A permitted name also covers its subdomains.
+  A client that checks name constraints then rejects a certificate for any
+  other name, even one signed with the CA's key.
+- The CA certificate SHOULD have a path length constraint of zero, so that
+  the CA cannot issue intermediate CAs.
+- Each leaf certificate SHOULD name only the destination it serves.
+
+The CA's key MUST NOT be readable from any sandbox. A CA SHOULD serve one
+deployment, and its certificate SHOULD NOT be added to trust stores outside
+the sandboxes that use the gateway. A gateway SHOULD keep the key in memory
+and create a new CA each time it starts, so that a copied key stops being
+useful once the sandboxes that trust it end. When the inspected destinations
+change, the controller gives the sandbox the new CA certificate at the start
+of its next generation ([lifecycle.md](lifecycle.md)).
+
 ## 2. Credential Placement and Tenant Isolation
 
 | Component | Permitted authority |
@@ -80,9 +105,22 @@ An application gateway MUST remove the guest credentials it replaces and
 attach its own credentials only after authorization and upstream
 authentication. It MUST prevent credentials from being forwarded to
 unauthorized redirects, alternate origins, or upgraded protocols, including
-on later requests over a reused connection. Bearer tokens, private keys, and
-sensitive request bodies MUST NOT appear in logs, error responses, shared
-files, or workload environments.
+on later requests over a reused connection.
+
+Before it attaches a credential to a request, the gateway MUST check that the
+request names the destination that the CONNECT request named and the
+boundary authorized. The check covers the TLS server name when the client
+sends one, and the `Host` field or `:authority` pseudo-header of every
+request on the connection. Servers behind a shared CDN or front end choose
+the origin by the `Host` field, so a request on an authorized tunnel that
+names another host can carry the credential to another origin. The gateway
+MUST NOT attach a credential to such a request, and SHOULD refuse it with
+421 (Misdirected Request). It SHOULD also refuse request targets that are
+not in origin form, because some servers choose the origin by an
+absolute-form target.
+
+Bearer tokens, private keys, and sensitive request bodies MUST NOT appear in
+logs, error responses, shared files, or workload environments.
 
 Separate sockets provide attribution and endpoint access control. They do not
 isolate process memory, so a compromised process that holds keys for several
