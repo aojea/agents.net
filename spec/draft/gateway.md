@@ -90,13 +90,12 @@ on later requests over a reused connection. Bearer tokens, private keys, and
 sensitive request bodies MUST NOT appear in logs, error responses, shared
 files, or workload environments.
 
-A request on an authorized tunnel can still name another site. For example,
+A request on a tunnel can name another site than the tunnel's. For example,
 after `CONNECT api.example.com:443`, the workload sends `Host: other.example`.
 If the upstream routes by `Host`, as a CDN does, the request and its
-credential reach other.example, though it was not authorized. The gateway
-MUST check that both the request target and `Host` name the tunnel's
-destination before it attaches a credential. It SHOULD refuse other requests
-with status 421.
+credential reach other.example. The gateway MUST refuse, with status 421, a
+request whose `Host` or request target names a host other than the tunnel's
+destination.
 
 Separate sockets provide attribution and endpoint access control. They do not
 isolate process memory, so a compromised process that holds keys for several
