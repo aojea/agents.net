@@ -296,7 +296,9 @@ func listenIngress(spec string) (net.Listener, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid vsock port %q: %w", rawPort, err)
 		}
-		return vsock.Listen(uint32(port), nil)
+		// vsock.Listen looks up the guest's address in /dev/vsock, which containers
+		// often don't have. Listening on any address needs no lookup.
+		return vsock.ListenContextID(unix.VMADDR_CID_ANY, uint32(port), nil)
 	}
 	path := strings.TrimPrefix(spec, "unix://")
 	os.Remove(path)
