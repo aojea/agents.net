@@ -71,6 +71,12 @@ limits. These functions are separate from CONNECT tunneling. The
 requirements of [wire.md Section 9](wire.md#9-untrusted-tunnel-content) on
 inspecting gateways apply.
 
+### 1.3 The Gateway's Certificate Authority
+
+The CA's key MUST NOT be readable from any sandbox. The gateway SHOULD keep
+the key in memory and create a new CA each time it starts, so that a copied
+key stops working once the sandboxes that trust it end.
+
 ## 2. Credential Placement and Tenant Isolation
 
 | Component | Permitted authority |
@@ -96,6 +102,13 @@ unauthorized redirects, alternate origins, or upgraded protocols, including
 on later requests over a reused connection. Bearer tokens, private keys, and
 sensitive request bodies MUST NOT appear in logs, error responses, shared
 files, or workload environments.
+
+A request on a tunnel can name another site than the tunnel's. For example,
+after `CONNECT api.example.com:443`, the workload sends `Host: other.example`.
+If the upstream routes by `Host`, as a CDN does, the request and its
+credential reach other.example. The gateway MUST refuse, with status 421, a
+request whose `Host` or request target names a host other than the tunnel's
+destination.
 
 Separate sockets provide attribution and endpoint access control. They do not
 isolate process memory, so a compromised process that holds keys for several
