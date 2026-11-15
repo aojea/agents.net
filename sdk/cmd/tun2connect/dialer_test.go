@@ -83,7 +83,9 @@ func TestIngressOnlyReachesPinnedPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go serveIngress(ln, map[uint16]bool{pinned: true})
+	pinnedPorts := &portSet{}
+	pinnedPorts.add(pinned)
+	go serveIngress(ln, pinnedPorts, false)
 
 	handshake := func(head string) (status int, reason, rest string) {
 		conn, err := net.Dial("unix", socket)

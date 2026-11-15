@@ -28,7 +28,10 @@ flowchart LR
    server on loopback. It joins streams only to the ports the controller
    pinned when it started the adapter. The port named in the handshake must
    be one of those ports and cannot select another service. A controller MAY
-   pin several ports for a sandbox that serves several local services.
+   pin several ports, or ranges of ports, for a sandbox that serves several
+   local services. A controller MAY also have the adapter join streams on
+   the sandbox's own interface address instead of loopback, so that, as
+   behind a NIC, services listening only on loopback stay unreachable.
 4. The agent learns its listening port and public callback URL from
    environment variables that the controller sets:
 
@@ -50,7 +53,9 @@ The gateway connects to the sandbox's ingress channel and sends
 `CONNECT 127.0.0.1:<port> HTTP/1.1` or `CONNECT [::1]:<port> HTTP/1.1` with
 a matching `Host` field. When `<port>` is one of the ports the controller
 pinned, the adapter answers 200 and then relays the stream verbatim to the
-requested loopback address and port. Otherwise it answers 403 with a
+requested loopback address and port, or, when the controller chose it, to
+that port on the sandbox's own interface address of the same family.
+Otherwise it answers 403 with a
 `Proxy-Status` field carrying `reason=port-not-permitted`
 ([wire.md Section 4](wire.md#4-failure-signaling)). The adapter MUST NOT
 connect to any other address or port. A request whose first line is not an
