@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/mdlayher/vsock"
+	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
 	"github.com/aojea/agents.net/sdk/pkg/tun2connect"
@@ -42,6 +43,15 @@ func openTUN(name string, mtu uint32) (int, error) {
 	if err := unix.IoctlIfreq(fd, unix.TUNSETIFF, ifr); err != nil {
 		unix.Close(fd)
 		return -1, fmt.Errorf("TUNSETIFF %s: %w", name, err)
+	}
+	link, err := netlink.LinkByName(name)
+	if err != nil {
+		unix.Close(fd)
+		return -1, err
+	}
+	if err := netlink.LinkSetMTU(link, int(mtu)); err != nil {
+		unix.Close(fd)
+		return -1, fmt.Errorf("set %s mtu %d: %w", name, mtu, err)
 	}
 	if err := unix.SetNonblock(fd, true); err != nil {
 		unix.Close(fd)
