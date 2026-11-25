@@ -1,0 +1,228 @@
+# Copyright 2026 The Kubernetes Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# All-in-one installation manifest for dra-agents-net (driver: dra.agents.net):
+#   - ServiceAccount, ClusterRole, and ClusterRoleBinding (kube-system)
+#   - GA Kubernetes DRA DeviceClass "dra.agents.net" (DRAConsumableCapacity)
+#   - Node DaemonSet (DRA kubelet plugin + containerd NRI plugin)
+#
+# Install:
+#   kubectl apply -f https://raw.githubusercontent.com/aojea/agents.net/main/kubernetes/install.yaml
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: dra-agents-net
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: dra-agents-net
+rules:
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceslices"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims"]
+    verbs: ["get"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims/status"]
+    verbs: ["patch"]
+  - apiGroups: ["resource.k8s.io"]
+    resources: ["resourceclaims/driver"]
+    resourceNames: ["dra.agents.net"]
+    verbs: ["associated-node:patch", "associated-node:update"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch", "update"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get"]
+  - apiGroups: ["certificates.k8s.io"]
+    resources: ["clustertrustbundles"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: dra-agents-net
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: dra-agents-net
+subjects:
+  - kind: ServiceAccount
+    name: dra-agents-net
+    namespace: kube-system
+---
+# Kubernetes DRA DeviceClass for dra-agents-net (driver: dra.agents.net).
+# Pairs with DRAConsumableCapacity (Beta, enabled by default since Kubernetes 1.36):
+# each node publishes a single shared "agents-net" device whose requestPolicy defaults
+# to consuming 1 sandbox unit per ResourceClaim.
+# Cluster-admin datapath defaults (confinementMode, nicBlockMode, adapterMode,
+# proxy port/noProxy, connection limits, and optional cluster-wide TLS/CA/auth defaults)
+# live here under dra.agents.net/v1alpha1 DriverConfig. Workloads layer per-claim
+# dra.agents.net/v1alpha1 DriverConfig overrides (such as policyEnforcementPoint,
+# caTrust, and custom metadata) via standard Kubernetes ResourceClaimTemplate or
+# ResourceClaim objects.
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: dra.agents.net
+spec:
+  selectors:
+    - cel:
+        expression: device.driver == "dra.agents.net"
+  config:
+    - opaque:
+        driver: dra.agents.net
+        parameters:
+          apiVersion: dra.agents.net/v1alpha1
+          kind: DriverConfig
+          confinementMode: PodNetworkIsolated
+          nicBlockMode: DropAll
+          adapterMode: ExplicitProxy
+          proxy:
+            port: 15001
+          maxConnections: 1024
+          idleTimeoutSeconds: 300
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: dra-agents-net
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: dra-agents-net
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: dra-agents-net
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: dra-agents-net
+    spec:
+      serviceAccountName: dra-agents-net
+      hostNetwork: true
+      hostPID: true
+      dnsPolicy: ClusterFirstWithHostNet
+      priorityClassName: system-node-critical
+      terminationGracePeriodSeconds: 330
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: dra-agents-net
+          image: ghcr.io/aojea/agents.net/dra-agents-net:latest
+          args:
+            - --driver-name=dra.agents.net
+            - --socket-root=/run/dra-agents-net/pods
+            - --checkpoint-path=/run/dra-agents-net/state.db
+            - --kubelet-root-dir=/var/lib/kubelet
+            - --metrics-addr=:9102
+            - --ingress-addr=:15080
+          env:
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+          ports:
+            - name: metrics
+              containerPort: 9102
+              protocol: TCP
+            - name: ingress
+              containerPort: 15080
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 512Mi
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            failureThreshold: 20
+            periodSeconds: 5
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            periodSeconds: 5
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: kubelet-plugins
+              mountPath: /var/lib/kubelet/plugins
+            - name: kubelet-plugins-registry
+              mountPath: /var/lib/kubelet/plugins_registry
+            - name: kubelet-pods
+              mountPath: /var/lib/kubelet/pods
+              readOnly: true
+              mountPropagation: HostToContainer
+            - name: netns
+              mountPath: /var/run/netns
+              readOnly: true
+              mountPropagation: HostToContainer
+            - name: nri-sock
+              mountPath: /var/run/nri
+            - name: dra-agents-net-run
+              mountPath: /run/dra-agents-net
+            - name: node-token
+              mountPath: /var/run/secrets/dra-agents-net
+              readOnly: true
+      volumes:
+        - name: kubelet-plugins
+          hostPath:
+            path: /var/lib/kubelet/plugins
+            type: DirectoryOrCreate
+        - name: kubelet-plugins-registry
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry
+            type: DirectoryOrCreate
+        - name: kubelet-pods
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory
+        - name: netns
+          hostPath:
+            path: /var/run/netns
+            type: DirectoryOrCreate
+        - name: nri-sock
+          hostPath:
+            path: /var/run/nri
+            type: DirectoryOrCreate
+        - name: dra-agents-net-run
+          hostPath:
+            path: /run/dra-agents-net
+            type: DirectoryOrCreate
+        - name: node-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  audience: agents.net/upstream
+                  expirationSeconds: 3600
+                  path: token
