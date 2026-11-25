@@ -629,7 +629,7 @@ func (l *sandboxListener) acceptLoop(ln net.Listener) {
 		if len(l.active) >= l.maxConns {
 			l.mu.Unlock()
 			metrics.TunnelsTotal.WithLabelValues("tcp", l.authMode, "deny", "max_connections").Inc()
-			writeH1Deny(conn, l.manager.headTimeout, http.StatusTooManyRequests, "max-connections-exceeded")
+			writeH1Deny(conn, l.manager.headTimeout, http.StatusServiceUnavailable, "busy")
 			_ = conn.Close()
 			continue
 		}

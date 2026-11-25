@@ -40,6 +40,8 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/hpack"
 	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/aojea/agents.net/kubernetes/pkg/apis"
@@ -240,11 +242,14 @@ func TestTunnelHTTP2MTLSForwardingDenyAndRevoke(t *testing.T) {
 		t.Fatalf("EnsureListener: %v", err)
 	}
 
-	// 1. Upstream denial propagates status 403 + Boundary-Reason + Proxy-Status header back to sandbox.
+	// 1. Upstream denial propagates status 403 and RFC 9209 Proxy-Status back to sandbox.
 	denyResp := sendRawRequest(t, paths.EgressSocketPath,
 		"CONNECT blocked.example:443 HTTP/1.1\r\nHost: blocked.example:443\r\n\r\n")
-	if !strings.HasPrefix(denyResp, "HTTP/1.1 403 ") || !strings.Contains(denyResp, "policy-blocked") || !strings.Contains(denyResp, "Boundary-Reason:") {
-		t.Fatalf("denied response = %q, want 403 with policy-blocked and Boundary-Reason", denyResp)
+	if !strings.HasPrefix(denyResp, "HTTP/1.1 403 ") || !strings.Contains(denyResp, "Proxy-Status:") || !strings.Contains(denyResp, "policy-blocked") {
+		t.Fatalf("denied response = %q, want 403 with Proxy-Status containing policy-blocked", denyResp)
+	}
+	if strings.Contains(denyResp, "Boundary-Reason:") {
+		t.Fatalf("denied response must not emit legacy Boundary-Reason header: %q", denyResp)
 	}
 
 	// Verify AttachListener (used by socketat Pod-loopback in ExplicitProxy mode) shares the exact same tunnel pipeline.
@@ -970,5 +975,285 @@ func TestTunnelSecurityHardeningAndConcurrency(t *testing.T) {
 	mgr.Rearm("pod-race")
 	if err := mgr.Remove("pod-race"); err != nil {
 		t.Fatalf("Remove: %v", err)
+	}
+}
+
+// TestTunnelHTTP2ConnectUDP verifies RFC 9298 + RFC 8441 HTTP/2 extended CONNECT
+// (:protocol: connect-udp) over TLS ALPN h2, including IPv6 %3A target encoding,
+// attested identity headers, and stripping of forged guest headers.
+func TestTunnelHTTP2ConnectUDP(t *testing.T) {
+	ctx := t.Context()
+	tmp := t.TempDir()
+	caPEM, srvCertPEM, srvKeyPEM, _, _, _ := generateTestCerts(t)
+	srvPair, err := tls.X509KeyPair(srvCertPEM, srvKeyPEM)
+	if err != nil {
+		t.Fatalf("load server keypair: %v", err)
+	}
+	caPath := filepath.Join(tmp, "ca.crt")
+	if err := os.WriteFile(caPath, caPEM, 0o600); err != nil {
+		t.Fatalf("write ca: %v", err)
+	}
+
+	var mu sync.Mutex
+	gotHeaders := make(map[string]string)
+
+	baseLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	tlsLn := tls.NewListener(baseLn, &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{srvPair},
+		NextProtos:   []string{"h2"},
+	})
+	defer func() { _ = tlsLn.Close() }()
+
+	// Minimal raw HTTP/2 server advertising SETTINGS_ENABLE_CONNECT_PROTOCOL=1
+	// and echoing DATA frames on the extended CONNECT stream.
+	go func() {
+		for {
+			c, err := tlsLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				preface := make([]byte, len(http2.ClientPreface))
+				if _, err := io.ReadFull(conn, preface); err != nil || string(preface) != http2.ClientPreface {
+					return
+				}
+				fr := http2.NewFramer(conn, conn)
+				fr.ReadMetaHeaders = hpack.NewDecoder(4096, nil)
+				if err := fr.WriteSettings(http2.Setting{ID: http2.SettingEnableConnectProtocol, Val: 1}); err != nil {
+					return
+				}
+				for {
+					f, err := fr.ReadFrame()
+					if err != nil {
+						return
+					}
+					switch f := f.(type) {
+					case *http2.SettingsFrame:
+						if !f.IsAck() {
+							_ = fr.WriteSettingsAck()
+						}
+					case *http2.MetaHeadersFrame:
+						mu.Lock()
+						for _, hf := range f.Fields {
+							gotHeaders[hf.Name] = hf.Value
+						}
+						mu.Unlock()
+						var hbuf bytes.Buffer
+						enc := hpack.NewEncoder(&hbuf)
+						_ = enc.WriteField(hpack.HeaderField{Name: ":status", Value: "200"})
+						_ = enc.WriteField(hpack.HeaderField{Name: "capsule-protocol", Value: "?1"})
+						_ = fr.WriteHeaders(http2.HeadersFrameParam{
+							StreamID:      f.StreamID,
+							BlockFragment: hbuf.Bytes(),
+							EndHeaders:    true,
+						})
+					case *http2.DataFrame:
+						payload := append([]byte(nil), f.Data()...)
+						if len(payload) > 0 {
+							_ = fr.WriteData(f.StreamID, false, payload)
+						}
+						if f.StreamEnded() {
+							_ = fr.WriteData(f.StreamID, true, nil)
+							return
+						}
+					}
+				}
+			}(c)
+		}
+	}()
+
+	mgr, err := NewManager(filepath.Join(tmp, "pods"), nil, WithAuditWriter(io.Discard), WithTimeouts(3*time.Second, 3*time.Second))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer mgr.Close()
+
+	podUID := types.UID("pod-h2-udp")
+	paths, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
+		Identity: auth.WorkloadIdentity{
+			Namespace:   "agents",
+			PodName:     "real-pod",
+			PodUID:      podUID,
+			SandboxName: "real-sb",
+		},
+		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
+			URL: "https://" + baseLn.Addr().String(),
+			TLS: &apis.PEPTLS{
+				ServerName: "upstream.local",
+				CACertificateRefs: []apis.CASource{
+					{Type: apis.CASourceTypeHostPath, HostPath: caPath},
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("EnsureListener: %v", err)
+	}
+
+	c, err := net.DialTimeout("unix", paths.EgressSocketPath, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial egress.sock: %v", err)
+	}
+	defer func() { _ = c.Close() }()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = io.WriteString(c,
+		"GET /.well-known/masque/udp/2001%3Adb8%3A%3A1/53/ HTTP/1.1\r\n"+
+			"Host: egress.local\r\n"+
+			"Connection: Upgrade\r\n"+
+			"Upgrade: connect-udp\r\n"+
+			"Capsule-Protocol: ?1\r\n"+
+			"Agents-Net-Pod-Name: forged-pod\r\n"+
+			"Proxy-Authorization: Bearer forged\r\n\r\n")
+
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
+	if err != nil || resp.StatusCode != http.StatusSwitchingProtocols {
+		t.Fatalf("connect-udp status = %v err=%v, want 101", resp, err)
+	}
+
+	cs := NewCapsuleStream(br, c)
+	if err := cs.WriteDatagram([]byte("udp-over-h2")); err != nil {
+		t.Fatalf("WriteDatagram: %v", err)
+	}
+	echoed, err := cs.ReadDatagram()
+	if err != nil || string(echoed) != "udp-over-h2" {
+		t.Fatalf("ReadDatagram = %q err=%v, want udp-over-h2", string(echoed), err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotHeaders[":method"] != http.MethodConnect || gotHeaders[":protocol"] != "connect-udp" {
+		t.Fatalf("extended CONNECT pseudo-headers = %+v, want :method=CONNECT :protocol=connect-udp", gotHeaders)
+	}
+	if gotHeaders[":path"] != "/.well-known/masque/udp/2001%3Adb8%3A%3A1/53/" {
+		t.Fatalf("encoded IPv6 :path = %q, want %q", gotHeaders[":path"], "/.well-known/masque/udp/2001%3Adb8%3A%3A1/53/")
+	}
+	if gotHeaders["agents-net-pod-name"] != "real-pod" {
+		t.Fatalf("attested pod header = %q, want real-pod (guest forgery must be ignored)", gotHeaders["agents-net-pod-name"])
+	}
+	if gotHeaders["proxy-authorization"] != "" {
+		t.Fatalf("guest Proxy-Authorization leaked to PEP: %q", gotHeaders["proxy-authorization"])
+	}
+}
+
+// TestTunnelSpecProtocolCompliance covers RFC 9110 1xx/2xx handling, HTTP/1.0
+// CONNECT, Host normalization, guest header stripping, and RFC 9209 Proxy-Status.
+func TestTunnelSpecProtocolCompliance(t *testing.T) {
+	ctx := t.Context()
+
+	var mu sync.Mutex
+	var gotUpstreamHeaders http.Header
+
+	// Upstream HTTP/1.1 PEP sending a 102 interim response followed by 204 No Content.
+	upLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen upstream: %v", err)
+	}
+	defer func() { _ = upLn.Close() }()
+	go func() {
+		for {
+			c, err := upLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				br := bufio.NewReader(conn)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				gotUpstreamHeaders = req.Header.Clone()
+				mu.Unlock()
+				_, _ = io.WriteString(conn, "HTTP/1.1 102 Processing\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n")
+				_, _ = io.Copy(conn, br)
+			}(c)
+		}
+	}()
+
+	mgr, err := NewManager(t.TempDir(), nil, WithAuditWriter(io.Discard), WithTimeouts(3*time.Second, 3*time.Second))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer mgr.Close()
+
+	podUID := types.UID("pod-spec-edge")
+	paths, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
+		Identity: auth.WorkloadIdentity{
+			Namespace:   "agents",
+			PodName:     "real-agent",
+			PodUID:      podUID,
+			SandboxName: "real-agent",
+		},
+		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
+			URL: "http://" + upLn.Addr().String(),
+		},
+		MaxConnections: 2,
+	})
+	if err != nil {
+		t.Fatalf("EnsureListener: %v", err)
+	}
+
+	// 1. HTTP/1.0 CONNECT (no Host), trailing dot Host, IPv6 normalized Host, and 1xx+204.
+	validReqs := []string{
+		"CONNECT example.com:443 HTTP/1.0\r\nAgents-Net-Pod-Name: forged\r\nProxy-Authorization: Bearer evil\r\n\r\n",
+		"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com.:443\r\n\r\n",
+		"CONNECT [::1]:443 HTTP/1.1\r\nHost: [0:0:0:0:0:0:0:1]:443\r\n\r\n",
+	}
+	for _, raw := range validReqs {
+		c, err := net.DialTimeout("unix", paths.EgressSocketPath, 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial egress.sock: %v", err)
+		}
+		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+		_, _ = io.WriteString(c, raw)
+		br := bufio.NewReader(c)
+		statusLine, err := br.ReadString('\n')
+		if err != nil || !strings.HasPrefix(statusLine, "HTTP/1.1 200 ") {
+			_ = c.Close()
+			t.Fatalf("request %q got status=%q err=%v, want 200", raw, statusLine, err)
+		}
+		_, _ = br.ReadString('\n')
+		_, _ = io.WriteString(c, "echo-ok\n")
+		got, err := br.ReadString('\n')
+		_ = c.Close()
+		if err != nil || got != "echo-ok\n" {
+			t.Fatalf("request %q echo = %q err=%v, want echo-ok", raw, got, err)
+		}
+	}
+
+	// Verify forged guest headers were stripped and attested identity was sent.
+	mu.Lock()
+	hdrs := gotUpstreamHeaders.Clone()
+	mu.Unlock()
+	if hdrs.Get(auth.HeaderPodName) != "real-agent" {
+		t.Fatalf("upstream %s = %q, want real-agent", auth.HeaderPodName, hdrs.Get(auth.HeaderPodName))
+	}
+	if hdrs.Get("Proxy-Authorization") != "" {
+		t.Fatalf("forged Proxy-Authorization leaked upstream: %q", hdrs.Get("Proxy-Authorization"))
+	}
+
+	// 2. RFC 9209 Proxy-Status error types on protocol/malformed/unconfigured refusals.
+	verResp := sendRawRequest(t, paths.EgressSocketPath, "CONNECT example.com:443 HTTP/2.0\r\nHost: example.com:443\r\n\r\n")
+	if !strings.HasPrefix(verResp, "HTTP/1.1 505 ") || !strings.Contains(verResp, "error=http_protocol_error; reason=unsupported-version") {
+		t.Fatalf("HTTP/2.0 response = %q, want 505 http_protocol_error", verResp)
+	}
+	badHost := sendRawRequest(t, paths.EgressSocketPath, "CONNECT example.com:443 HTTP/1.1\r\nHost: other.com:443\r\n\r\n")
+	if !strings.HasPrefix(badHost, "HTTP/1.1 400 ") || !strings.Contains(badHost, "error=http_request_error; reason=authority-mismatch") {
+		t.Fatalf("mismatch response = %q, want 400 http_request_error", badHost)
+	}
+	unconfPaths, err := mgr.EnsureListener(ctx, "pod-unconf-spec", ListenerConfig{})
+	if err != nil {
+		t.Fatalf("EnsureListener unconfigured: %v", err)
+	}
+	unconfResp := sendRawRequest(t, unconfPaths.EgressSocketPath, "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n")
+	if !strings.HasPrefix(unconfResp, "HTTP/1.1 503 ") || !strings.Contains(unconfResp, "error=proxy_configuration_error; reason=upstream-unconfigured") {
+		t.Fatalf("unconfigured response = %q, want 503 proxy_configuration_error", unconfResp)
 	}
 }

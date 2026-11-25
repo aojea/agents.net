@@ -257,6 +257,9 @@ func (p NetworkParameters) Validate() error {
 		if port.Port < 1 || port.Port > 65535 {
 			return fmt.Errorf("ingressPort %d out of range [1, 65535]", port.Port)
 		}
+		if port.EndPort != 0 && (port.EndPort < port.Port || port.EndPort > 65535) {
+			return fmt.Errorf("ingressPort endPort %d out of range [%d, 65535]", port.EndPort, port.Port)
+		}
 		switch port.Protocol {
 		case "", apis.IngressProtocolTCP, apis.IngressProtocolUDP:
 		default:

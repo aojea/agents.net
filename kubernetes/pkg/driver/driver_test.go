@@ -345,7 +345,7 @@ func TestReportResourceClaimIngressDiscoveryAndRevocation(t *testing.T) {
 		AdapterMode:     apis.AdapterModeExplicitProxy,
 		IngressPorts: []apis.IngressPort{
 			{Port: 8080},
-			{Port: 9090, Protocol: apis.IngressProtocolTCP},
+			{Port: 9000, EndPort: 9005, Protocol: apis.IngressProtocolTCP},
 		},
 	})
 	claim.Status.Allocation.Devices.Results[0].ShareID = &shareID
@@ -434,8 +434,13 @@ func TestReportResourceClaimIngressDiscoveryAndRevocation(t *testing.T) {
 	if !devStatus.Ingress.TLS || devStatus.Ingress.ServerName != "dra-agents-net.kube-system.svc" {
 		t.Fatalf("unexpected TLS metadata: %+v", devStatus.Ingress)
 	}
-	if len(devStatus.Ingress.Ports) != 2 || devStatus.Ingress.Ports[0].Port != 8080 || devStatus.Ingress.Ports[0].Protocol != apis.IngressProtocolTCP {
+	if len(devStatus.Ingress.Ports) != 2 ||
+		devStatus.Ingress.Ports[0].Port != 8080 || devStatus.Ingress.Ports[0].Protocol != apis.IngressProtocolTCP ||
+		devStatus.Ingress.Ports[1].Port != 9000 || devStatus.Ingress.Ports[1].EndPort != 9005 {
 		t.Fatalf("unexpected ingress ports: %+v", devStatus.Ingress.Ports)
+	}
+	if formatted := formatIngressPorts(devStatus.Ingress.Ports); formatted != "8080,9000-9005" {
+		t.Fatalf("formatIngressPorts = %q, want 8080,9000-9005", formatted)
 	}
 
 	// StopPodSandbox must revoke IngressStatus and mark Ready=False.

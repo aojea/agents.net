@@ -1024,21 +1024,21 @@ func testIntegrationHostIngressBridgeCrossNetNS(t *testing.T) {
 		t.Fatalf("tunneled body = %q, want pod-netns-8080:/webhook", string(body))
 	}
 
-	// 2. Undeclared port 9999 returns 403 ingress-port-denied.
+	// 2. Undeclared port 9999 returns 403 with RFC 9209 Proxy-Status.
 	denyResp, _, denyConn := dialBridge(string(podUID) + ":9999")
 	_ = denyConn.Close()
-	if denyResp.StatusCode != http.StatusForbidden || denyResp.Header.Get("Boundary-Reason") != "ingress-port-denied" {
-		t.Fatalf("undeclared port 9999: status=%d reason=%q, want 403 ingress-port-denied", denyResp.StatusCode, denyResp.Header.Get("Boundary-Reason"))
+	if denyResp.StatusCode != http.StatusForbidden || !strings.Contains(denyResp.Header.Get("Proxy-Status"), "error=http_request_denied; reason=port-not-permitted") {
+		t.Fatalf("undeclared port 9999: status=%d Proxy-Status=%q, want 403 port-not-permitted", denyResp.StatusCode, denyResp.Header.Get("Proxy-Status"))
 	}
 
-	// 3. Unknown Pod UID returns 404 unknown-sandbox.
+	// 3. Unknown Pod UID returns 404 with RFC 9209 Proxy-Status.
 	unkResp, _, unkConn := dialBridge("unknown-pod-uid:8080")
 	_ = unkConn.Close()
-	if unkResp.StatusCode != http.StatusNotFound || unkResp.Header.Get("Boundary-Reason") != "unknown-sandbox" {
-		t.Fatalf("unknown pod: status=%d reason=%q, want 404 unknown-sandbox", unkResp.StatusCode, unkResp.Header.Get("Boundary-Reason"))
+	if unkResp.StatusCode != http.StatusNotFound || !strings.Contains(unkResp.Header.Get("Proxy-Status"), "error=destination_not_found; reason=unknown-sandbox") {
+		t.Fatalf("unknown pod: status=%d Proxy-Status=%q, want 404 unknown-sandbox", unkResp.StatusCode, unkResp.Header.Get("Proxy-Status"))
 	}
 
-	// 4. Revoke closes an active ingress tunnel immediately.
+	// 4. Revoke closes an active ingress tunnel immediately and rejects subsequent dials with 404.
 	liveResp, _, liveConn := dialBridge(string(podUID) + ":8080")
 	if liveResp.StatusCode != http.StatusOK {
 		t.Fatalf("live tunnel status = %d, want 200", liveResp.StatusCode)
@@ -1049,6 +1049,11 @@ func testIntegrationHostIngressBridgeCrossNetNS(t *testing.T) {
 	_ = liveConn.Close()
 	if readErr == nil {
 		t.Fatal("expected active ingress tunnel to close immediately after Revoke")
+	}
+	revokedResp, _, revokedConn := dialBridge(string(podUID) + ":8080")
+	_ = revokedConn.Close()
+	if revokedResp.StatusCode != http.StatusNotFound || !strings.Contains(revokedResp.Header.Get("Proxy-Status"), "reason=sandbox-revoked") {
+		t.Fatalf("revoked pod: status=%d Proxy-Status=%q, want 404 sandbox-revoked", revokedResp.StatusCode, revokedResp.Header.Get("Proxy-Status"))
 	}
 }
 

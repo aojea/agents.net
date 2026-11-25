@@ -54,8 +54,9 @@ const (
 	// HeaderPort selects an explicit pinned port (defaults to the first pinned port).
 	HeaderPort = "X-Agents-Net-Port"
 
-	defaultDialTimeout = 10 * time.Second
-	maxConnectHeadSize = 16 * 1024
+	defaultDialTimeout  = 10 * time.Second
+	maxConnectHeadSize  = 16 * 1024
+	maxInterimResponses = 8
 )
 
 // RouteEntry holds the live ingress routing target discovered from one ResourceClaim.
@@ -182,6 +183,9 @@ func (r *Registry) extractRoute(claim *resourceapi.ResourceClaim, claimKey strin
 		if status.APIVersion != apis.DeviceStatusAPIVersion || status.Kind != apis.DeviceStatusKind {
 			continue
 		}
+		if status.PodUID != "" && status.PodUID != string(ref.UID) {
+			return RouteEntry{}, false
+		}
 		if status.Ingress == nil || status.Ingress.Endpoint == "" || status.Ingress.Target == "" || len(status.Ingress.Ports) == 0 {
 			return RouteEntry{}, false
 		}
@@ -303,7 +307,6 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		port = entry.Ingress.Ports[0].Port
 	}
 	if !isPortPinned(entry.Ingress.Ports, port) {
-		w.Header().Set("Proxy-Status", `agents-net-gateway; error=http_request_denied; details="port-not-permitted"`)
 		h.writeError(w, r, entry, port, http.StatusForbidden, "port-not-permitted", fmt.Sprintf("port %d is not in ingressPorts allowlist", port))
 		return
 	}
@@ -339,10 +342,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if errors.As(err, &be) {
 				if be.proxyStatus != "" {
 					rw.Header().Set("Proxy-Status", be.proxyStatus)
+				} else {
+					rw.Header().Set("Proxy-Status", apis.FormatProxyStatus("agents-net-gateway", be.status, "bridge-denied"))
 				}
 				http.Error(rw, be.Error(), be.status)
 				return
 			}
+			rw.Header().Set("Proxy-Status", apis.FormatProxyStatus("agents-net-gateway", http.StatusBadGateway, "ingress-dial-failed"))
 			http.Error(rw, "agents.net ingress bridge error", http.StatusBadGateway)
 		},
 	}
@@ -442,7 +448,7 @@ func parsePort(raw string) (int32, error) {
 
 func isPortPinned(ports []apis.IngressPort, port int32) bool {
 	for _, p := range ports {
-		if p.Port == port && (p.Protocol == "" || p.Protocol == apis.IngressProtocolTCP) {
+		if p.Contains(port, apis.IngressProtocolTCP) {
 			return true
 		}
 	}
@@ -502,14 +508,14 @@ func (h *Handler) dialConnectBridge(ctx context.Context, ing apis.IngressStatus,
 	}
 
 	br := bufio.NewReader(io.LimitReader(conn, maxConnectHeadSize))
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	resp, err := readFinalResponse(br, &http.Request{Method: http.MethodConnect})
 	if err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("read CONNECT response from ingress bridge: %w", err)
 	}
 	_ = conn.SetDeadline(time.Time{})
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		ps := resp.Header.Get("Proxy-Status")
 		_ = conn.Close()
 		return nil, &bridgeDeniedError{
@@ -556,7 +562,24 @@ func (r *statusRecorder) WriteHeader(code int) {
 	r.ResponseWriter.WriteHeader(code)
 }
 
+func readFinalResponse(br *bufio.Reader, req *http.Request) (*http.Response, error) {
+	for interim := range maxInterimResponses + 1 {
+		resp, err := http.ReadResponse(br, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 100 || resp.StatusCode >= 200 {
+			return resp, nil
+		}
+		if interim == maxInterimResponses {
+			return nil, fmt.Errorf("ingress bridge sent more than %d interim responses", maxInterimResponses)
+		}
+	}
+	return nil, errors.New("unexpected interim response loop termination")
+}
+
 func (h *Handler) writeError(w http.ResponseWriter, r *http.Request, entry RouteEntry, port int32, status int, reason, msg string) {
+	w.Header().Set("Proxy-Status", apis.FormatProxyStatus("agents-net-gateway", status, reason))
 	http.Error(w, msg, status)
 	h.audit(AuditRecord{
 		Direction: "ingress",

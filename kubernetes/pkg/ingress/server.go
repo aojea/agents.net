@@ -46,10 +46,11 @@ import (
 )
 
 const (
-	defaultDialTimeout = 5 * time.Second
-	defaultHeadTimeout = 5 * time.Second
-	maxHeadBytes       = 8 * 1024
-	maxIngressConns    = 4096
+	defaultDialTimeout  = 5 * time.Second
+	defaultHeadTimeout  = 5 * time.Second
+	maxHeadBytes        = 8 * 1024
+	maxIngressConns     = 4096
+	maxInterimResponses = 8
 )
 
 // DialNetNSFunc dials a literal IP:port inside a Linux network namespace.
@@ -203,7 +204,7 @@ func (s *Server) acceptLoop(ln net.Listener) {
 		if s.activeConns.Add(1) > maxIngressConns {
 			s.activeConns.Add(-1)
 			metrics.IngressConnectionsTotal.WithLabelValues("deny", "max_connections").Inc()
-			s.writeError(conn, http.StatusTooManyRequests, "max-connections-exceeded")
+			s.writeError(conn, http.StatusServiceUnavailable, "busy")
 			_ = conn.Close()
 			continue
 		}
@@ -291,7 +292,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	}
 	if !isTCPPortAllowed(cfg.Parameters.IngressPorts, port) {
 		metrics.IngressConnectionsTotal.WithLabelValues("deny", "port_denied").Inc()
-		s.writeError(conn, http.StatusForbidden, "ingress-port-denied")
+		s.writeError(conn, http.StatusForbidden, "port-not-permitted")
 		return
 	}
 
@@ -299,7 +300,7 @@ func (s *Server) serveConn(conn net.Conn) {
 	defer dialCancel()
 	if !s.registerConn(podUID, conn, dialCancel) {
 		metrics.IngressConnectionsTotal.WithLabelValues("deny", "revoked").Inc()
-		s.writeError(conn, http.StatusServiceUnavailable, "sandbox-revoked")
+		s.writeError(conn, http.StatusNotFound, "sandbox-revoked")
 		return
 	}
 	defer s.untrackConn(podUID, conn)
@@ -323,7 +324,7 @@ func (s *Server) serveConn(conn net.Conn) {
 		_ = backend.Close()
 	}) {
 		metrics.IngressConnectionsTotal.WithLabelValues("deny", "revoked").Inc()
-		s.writeError(conn, http.StatusServiceUnavailable, "sandbox-revoked")
+		s.writeError(conn, http.StatusNotFound, "sandbox-revoked")
 		return
 	}
 
@@ -371,7 +372,17 @@ func (s *Server) dialPod(ctx context.Context, cfg store.PodConfig, port int32) (
 	if cfg.NetNS == "" {
 		return nil, errPodNotReady
 	}
-	return s.dialNetNS(cfg.NetNS, "tcp", net.JoinHostPort("127.0.0.1", strconv.FormatInt(int64(port), 10)), s.dialTimeout)
+	portStr := strconv.FormatInt(int64(port), 10)
+	conn, err := s.dialNetNS(cfg.NetNS, "tcp", net.JoinHostPort("127.0.0.1", portStr), s.dialTimeout)
+	if err == nil || ctx.Err() != nil {
+		return conn, err
+	}
+	// Fall back to IPv6 loopback for IPv6-only listeners inside the Pod netns.
+	conn6, err6 := s.dialNetNS(cfg.NetNS, "tcp", net.JoinHostPort("::1", portStr), s.dialTimeout)
+	if err6 == nil {
+		return conn6, nil
+	}
+	return nil, err
 }
 
 func (s *Server) dialIngressSocket(ctx context.Context, sockPath string, port int32) (net.Conn, error) {
@@ -396,7 +407,7 @@ func (s *Server) dialIngressSocket(ctx context.Context, sockPath string, port in
 
 	limited := &boundedIngressReader{r: conn, remaining: maxHeadBytes}
 	br := bufio.NewReader(limited)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	resp, err := readFinalResponse(br, &http.Request{Method: http.MethodConnect})
 	if !stopCancel() {
 		_ = conn.Close()
 		if ctx.Err() != nil {
@@ -411,7 +422,7 @@ func (s *Server) dialIngressSocket(ctx context.Context, sockPath string, port in
 	_ = conn.SetDeadline(time.Time{})
 	limited.remaining = -1
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		_ = conn.Close()
 		return nil, fmt.Errorf("ingress.sock rejected CONNECT with HTTP %d", resp.StatusCode)
 	}
@@ -419,6 +430,22 @@ func (s *Server) dialIngressSocket(ctx context.Context, sockPath string, port in
 		return &bufferedConn{Conn: conn, r: br}, nil
 	}
 	return conn, nil
+}
+
+func readFinalResponse(br *bufio.Reader, req *http.Request) (*http.Response, error) {
+	for interim := range maxInterimResponses + 1 {
+		resp, err := http.ReadResponse(br, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 100 || resp.StatusCode >= 200 {
+			return resp, nil
+		}
+		if interim == maxInterimResponses {
+			return nil, fmt.Errorf("ingress.sock sent more than %d interim responses", maxInterimResponses)
+		}
+	}
+	return nil, errors.New("unexpected interim response loop termination")
 }
 
 type boundedIngressReader struct {
@@ -463,10 +490,10 @@ func (s *Server) writeError(conn net.Conn, status int, reason string) {
 	if text == "" {
 		text = "Error"
 	}
-	clean := strings.ReplaceAll(strings.ReplaceAll(reason, "\r", ""), "\n", "")
+	proxyStatus := apis.FormatProxyStatus("dra-agents-net-ingress", status, reason)
 	_, _ = fmt.Fprintf(conn,
-		"HTTP/1.1 %d %s\r\nBoundary-Reason: %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-		status, text, clean,
+		"HTTP/1.1 %d %s\r\nProxy-Status: %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+		status, text, proxyStatus,
 	)
 }
 
@@ -480,8 +507,11 @@ func readConnectHead(br *bufio.Reader) (types.UID, int32, int, string) {
 		return "", 0, http.StatusBadRequest, "malformed-request-line"
 	}
 	method, target, version := parts[0], parts[1], parts[2]
-	if version != "HTTP/1.1" {
-		return "", 0, http.StatusHTTPVersionNotSupported, "unsupported-http-version"
+	if version != "HTTP/1.1" && version != "HTTP/1.0" {
+		if strings.HasPrefix(version, "HTTP/") {
+			return "", 0, http.StatusHTTPVersionNotSupported, "unsupported-version"
+		}
+		return "", 0, http.StatusBadRequest, "malformed-request-line"
 	}
 	if method != http.MethodConnect {
 		return "", 0, http.StatusMethodNotAllowed, "method-not-allowed"
@@ -507,7 +537,13 @@ func readConnectHead(br *bufio.Reader) (types.UID, int32, int, string) {
 			hostHeader = strings.TrimSpace(v)
 		}
 	}
-	if hostCount != 1 || !strings.EqualFold(hostHeader, target) {
+	if hostCount > 1 {
+		return "", 0, http.StatusBadRequest, "duplicate-host"
+	}
+	if version == "HTTP/1.1" && hostCount == 0 {
+		return "", 0, http.StatusBadRequest, "missing-host"
+	}
+	if hostCount == 1 && !strings.EqualFold(hostHeader, target) {
 		return "", 0, http.StatusBadRequest, "authority-mismatch"
 	}
 
@@ -524,11 +560,7 @@ func readConnectHead(br *bufio.Reader) (types.UID, int32, int, string) {
 
 func isTCPPortAllowed(ports []apis.IngressPort, port int32) bool {
 	for _, p := range ports {
-		proto := p.Protocol
-		if proto == "" {
-			proto = apis.IngressProtocolTCP
-		}
-		if proto == apis.IngressProtocolTCP && p.Port == port {
+		if p.Contains(port, apis.IngressProtocolTCP) {
 			return true
 		}
 	}

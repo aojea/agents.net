@@ -59,6 +59,7 @@ func TestIngressAllowlistSocketAtAndRevoke(t *testing.T) {
 		Parameters: params.NetworkParameters{
 			IngressPorts: []apis.IngressPort{
 				{Port: 8080, Protocol: apis.IngressProtocolTCP},
+				{Port: 9000, EndPort: 9005, Protocol: apis.IngressProtocolTCP},
 			},
 		},
 	}); err != nil {
@@ -84,51 +85,69 @@ func TestIngressAllowlistSocketAtAndRevoke(t *testing.T) {
 	}
 	defer func() { _ = srv.Close() }()
 
-	// 1. Undeclared port must fail closed with 403 Boundary-Reason: ingress-port-denied.
-	if resp := rawConnect(t, addr.String(), fmt.Sprintf("CONNECT %s:9999 HTTP/1.1\r\nHost: %s:9999\r\n\r\n", podUID, podUID)); !strings.HasPrefix(resp, "HTTP/1.1 403 ") || !strings.Contains(resp, "Boundary-Reason: ingress-port-denied") {
-		t.Fatalf("undeclared port response = %q, want 403 ingress-port-denied", resp)
+	// 1. Undeclared port must fail closed with 403 and RFC 9209 Proxy-Status.
+	if resp := rawConnect(t, addr.String(), fmt.Sprintf("CONNECT %s:9999 HTTP/1.1\r\nHost: %s:9999\r\n\r\n", podUID, podUID)); !strings.HasPrefix(resp, "HTTP/1.1 403 ") ||
+		!strings.Contains(resp, "Proxy-Status: dra-agents-net-ingress; error=http_request_denied; reason=port-not-permitted") {
+		t.Fatalf("undeclared port response = %q, want 403 with RFC 9209 Proxy-Status", resp)
 	}
 
-	// 2. Unknown Pod UID must fail closed with 404 Boundary-Reason: unknown-sandbox.
-	if resp := rawConnect(t, addr.String(), "CONNECT unknown-uid:8080 HTTP/1.1\r\nHost: unknown-uid:8080\r\n\r\n"); !strings.HasPrefix(resp, "HTTP/1.1 404 ") || !strings.Contains(resp, "Boundary-Reason: unknown-sandbox") {
+	// 2. Unknown Pod UID must fail closed with 404 and RFC 9209 Proxy-Status.
+	if resp := rawConnect(t, addr.String(), "CONNECT unknown-uid:8080 HTTP/1.1\r\nHost: unknown-uid:8080\r\n\r\n"); !strings.HasPrefix(resp, "HTTP/1.1 404 ") ||
+		!strings.Contains(resp, "Proxy-Status: dra-agents-net-ingress; error=destination_not_found; reason=unknown-sandbox") {
 		t.Fatalf("unknown pod response = %q, want 404 unknown-sandbox", resp)
 	}
 
-	// 3. Non-CONNECT method and Host mismatch are rejected cleanly.
-	if resp := rawConnect(t, addr.String(), "GET / HTTP/1.1\r\nHost: x:80\r\n\r\n"); !strings.HasPrefix(resp, "HTTP/1.1 405 ") {
-		t.Fatalf("non-CONNECT response = %q, want 405", resp)
+	// 3. Non-CONNECT method and Host mismatch are rejected cleanly with Proxy-Status.
+	if resp := rawConnect(t, addr.String(), "GET / HTTP/1.1\r\nHost: x:80\r\n\r\n"); !strings.HasPrefix(resp, "HTTP/1.1 405 ") || !strings.Contains(resp, "Proxy-Status:") {
+		t.Fatalf("non-CONNECT response = %q, want 405 with Proxy-Status", resp)
 	}
-	if resp := rawConnect(t, addr.String(), fmt.Sprintf("CONNECT %s:8080 HTTP/1.1\r\nHost: wrong:8080\r\n\r\n", podUID)); !strings.HasPrefix(resp, "HTTP/1.1 400 ") {
-		t.Fatalf("host mismatch response = %q, want 400", resp)
+	if resp := rawConnect(t, addr.String(), fmt.Sprintf("CONNECT %s:8080 HTTP/1.1\r\nHost: wrong:8080\r\n\r\n", podUID)); !strings.HasPrefix(resp, "HTTP/1.1 400 ") || !strings.Contains(resp, "reason=authority-mismatch") {
+		t.Fatalf("host mismatch response = %q, want 400 authority-mismatch", resp)
 	}
 
-	// 4. Allowed port tunnels HTTP traffic cleanly into the Pod netns via DialNetNS.
-	conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial ingress: %v", err)
-	}
-	defer func() { _ = conn.Close() }()
-	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
-	_, _ = fmt.Fprintf(conn, "CONNECT %s:8080 HTTP/1.1\r\nHost: %s:8080\r\n\r\n", podUID, podUID)
-	br := bufio.NewReader(conn)
-	status, err := br.ReadString('\n')
-	if err != nil || !strings.HasPrefix(status, "HTTP/1.1 200 ") {
-		t.Fatalf("CONNECT status = %q err=%v, want 200", status, err)
-	}
-	_, _ = br.ReadString('\n') // blank line
+	// 4. Allowed port and inclusive range port (via HTTP/1.0 without Host) tunnel cleanly.
+	for _, tc := range []struct {
+		req      string
+		wantAddr string
+	}{
+		{
+			req:      fmt.Sprintf("CONNECT %s:8080 HTTP/1.1\r\nHost: %s:8080\r\n\r\n", podUID, podUID),
+			wantAddr: "127.0.0.1:8080",
+		},
+		{
+			req:      fmt.Sprintf("CONNECT %s:9003 HTTP/1.0\r\n\r\n", podUID),
+			wantAddr: "127.0.0.1:9003",
+		},
+	} {
+		conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
+		if err != nil {
+			t.Fatalf("dial ingress: %v", err)
+		}
+		_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+		_, _ = io.WriteString(conn, tc.req)
+		br := bufio.NewReader(conn)
+		status, err := br.ReadString('\n')
+		if err != nil || !strings.HasPrefix(status, "HTTP/1.1 200 ") {
+			_ = conn.Close()
+			t.Fatalf("CONNECT status = %q err=%v, want 200", status, err)
+		}
+		_, _ = br.ReadString('\n') // blank line
 
-	_, _ = io.WriteString(conn, "GET /hello HTTP/1.1\r\nHost: sandbox\r\nConnection: close\r\n\r\n")
-	httpResp, err := http.ReadResponse(br, nil)
-	if err != nil {
-		t.Fatalf("ReadResponse: %v", err)
-	}
-	body, _ := io.ReadAll(httpResp.Body)
-	_ = httpResp.Body.Close()
-	if string(body) != "pod-ok:/hello" {
-		t.Fatalf("body = %q, want pod-ok:/hello", string(body))
-	}
-	if dialedNetNS != "/var/run/netns/fake-pod" || dialedAddr != "127.0.0.1:8080" {
-		t.Fatalf("dialed (%q, %q), want (/var/run/netns/fake-pod, 127.0.0.1:8080)", dialedNetNS, dialedAddr)
+		_, _ = io.WriteString(conn, "GET /hello HTTP/1.1\r\nHost: sandbox\r\nConnection: close\r\n\r\n")
+		httpResp, err := http.ReadResponse(br, nil)
+		if err != nil {
+			_ = conn.Close()
+			t.Fatalf("ReadResponse: %v", err)
+		}
+		body, _ := io.ReadAll(httpResp.Body)
+		_ = httpResp.Body.Close()
+		_ = conn.Close()
+		if string(body) != "pod-ok:/hello" {
+			t.Fatalf("body = %q, want pod-ok:/hello", string(body))
+		}
+		if dialedNetNS != "/var/run/netns/fake-pod" || dialedAddr != tc.wantAddr {
+			t.Fatalf("dialed (%q, %q), want (/var/run/netns/fake-pod, %s)", dialedNetNS, dialedAddr, tc.wantAddr)
+		}
 	}
 }
 
@@ -162,7 +181,8 @@ func TestIngressSocketUDSPathAndRevoke(t *testing.T) {
 					_, _ = io.WriteString(conn, "HTTP/1.1 400 Bad Request\r\n\r\n")
 					return
 				}
-				_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+				// Send a 1xx interim response followed by a non-200 2xx to verify RFC 9110 handling.
+				_, _ = io.WriteString(conn, "HTTP/1.1 102 Processing\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n")
 				_, _ = io.Copy(conn, br)
 			}(c)
 		}
@@ -219,8 +239,9 @@ func TestIngressSocketUDSPathAndRevoke(t *testing.T) {
 	if _, err := br.Read(buf); err == nil {
 		t.Fatalf("expected active ingress connection to close after Revoke")
 	}
-	if resp := rawConnect(t, addr.String(), fmt.Sprintf("CONNECT %s:8080 HTTP/1.1\r\nHost: %s:8080\r\n\r\n", podUID, podUID)); !strings.HasPrefix(resp, "HTTP/1.1 503 ") || !strings.Contains(resp, "sandbox-revoked") {
-		t.Fatalf("post-Revoke new connection response = %q, want 503 sandbox-revoked", resp)
+	if resp := rawConnect(t, addr.String(), fmt.Sprintf("CONNECT %s:8080 HTTP/1.1\r\nHost: %s:8080\r\n\r\n", podUID, podUID)); !strings.HasPrefix(resp, "HTTP/1.1 404 ") ||
+		!strings.Contains(resp, "Proxy-Status: dra-agents-net-ingress; error=destination_not_found; reason=sandbox-revoked") {
+		t.Fatalf("post-Revoke new connection response = %q, want 404 with Proxy-Status sandbox-revoked", resp)
 	}
 	srv.Allow(podUID)
 
@@ -240,8 +261,73 @@ func TestIngressSocketUDSPathAndRevoke(t *testing.T) {
 			IngressPorts: []apis.IngressPort{{Port: 8080}},
 		},
 	})
-	if resp := rawConnect(t, addr.String(), fmt.Sprintf("CONNECT %s:8080 HTTP/1.1\r\nHost: %s:8080\r\n\r\n", symlinkPod, symlinkPod)); !strings.HasPrefix(resp, "HTTP/1.1 502 ") {
-		t.Fatalf("symlink ingress.sock response = %q, want 502", resp)
+	if resp := rawConnect(t, addr.String(), fmt.Sprintf("CONNECT %s:8080 HTTP/1.1\r\nHost: %s:8080\r\n\r\n", symlinkPod, symlinkPod)); !strings.HasPrefix(resp, "HTTP/1.1 502 ") || !strings.Contains(resp, "Proxy-Status:") {
+		t.Fatalf("symlink ingress.sock response = %q, want 502 with Proxy-Status", resp)
+	}
+}
+
+func TestIngressIPv6LoopbackFallback(t *testing.T) {
+	backendSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, "v6-fallback-ok")
+	}))
+	defer backendSrv.Close()
+
+	st, _ := store.New(nil)
+	podUID := types.UID("pod-v6-loopback")
+	_ = st.Upsert(store.PodConfig{
+		PodUID: podUID,
+		NetNS:  "/var/run/netns/fake-v6",
+		Parameters: params.NetworkParameters{
+			IngressPorts: []apis.IngressPort{{Port: 8080}},
+		},
+	})
+
+	var dialed []string
+	srv, err := NewServer(Config{
+		ListenAddr: "127.0.0.1:0",
+		Store:      st,
+		DialNetNS: func(_, network, address string, timeout time.Duration) (net.Conn, error) {
+			dialed = append(dialed, address)
+			if strings.HasPrefix(address, "127.0.0.1:") {
+				return nil, net.ErrClosed
+			}
+			return net.DialTimeout(network, backendSrv.Listener.Addr().String(), timeout)
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	addr, err := srv.Start()
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial ingress: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = fmt.Fprintf(conn, "CONNECT %s:8080 HTTP/1.1\r\nHost: %s:8080\r\n\r\n", podUID, podUID)
+	br := bufio.NewReader(conn)
+	status, err := br.ReadString('\n')
+	if err != nil || !strings.HasPrefix(status, "HTTP/1.1 200 ") {
+		t.Fatalf("CONNECT status = %q err=%v, want 200", status, err)
+	}
+	_, _ = br.ReadString('\n')
+	_, _ = io.WriteString(conn, "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+	httpResp, err := http.ReadResponse(br, nil)
+	if err != nil {
+		t.Fatalf("ReadResponse: %v", err)
+	}
+	body, _ := io.ReadAll(httpResp.Body)
+	_ = httpResp.Body.Close()
+	if string(body) != "v6-fallback-ok" {
+		t.Fatalf("body = %q, want v6-fallback-ok", string(body))
+	}
+	if len(dialed) != 2 || dialed[0] != "127.0.0.1:8080" || dialed[1] != "[::1]:8080" {
+		t.Fatalf("dialed addresses = %v, want [127.0.0.1:8080 [::1]:8080]", dialed)
 	}
 }
 

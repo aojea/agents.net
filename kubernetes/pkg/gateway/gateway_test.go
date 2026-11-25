@@ -103,7 +103,10 @@ func TestGatewayDiscoversFromResourceClaimAndProxiesThroughIngressBridge(t *test
 		PodNamespace: "demo",
 		NetNS:        "/proc/self/ns/net",
 		Parameters: params.NetworkParameters{
-			IngressPorts: []apis.IngressPort{{Port: 8080, Protocol: apis.IngressProtocolTCP}},
+			IngressPorts: []apis.IngressPort{
+				{Port: 8080, Protocol: apis.IngressProtocolTCP},
+				{Port: 9000, EndPort: 9005, Protocol: apis.IngressProtocolTCP},
+			},
 		},
 	}); err != nil {
 		t.Fatalf("store.Upsert: %v", err)
@@ -129,6 +132,7 @@ func TestGatewayDiscoversFromResourceClaimAndProxiesThroughIngressBridge(t *test
 	reg := NewRegistry(apis.DriverName)
 	claim := makeStatusClaim("demo", "web-agent-agents-net", "web-agent", podUID, bridgeAddr.String(), metav1.ConditionTrue, []apis.IngressPort{
 		{Port: 8080, Protocol: apis.IngressProtocolTCP},
+		{Port: 9000, EndPort: 9005, Protocol: apis.IngressProtocolTCP},
 	})
 	reg.SyncClaim(claim)
 
@@ -164,17 +168,28 @@ func TestGatewayDiscoversFromResourceClaimAndProxiesThroughIngressBridge(t *test
 		t.Fatalf("header route = %d %q, want 200 pod-reply:/from-headers", resp.StatusCode, string(body))
 	}
 
-	// 6. Unpinned port returns 403 port-not-permitted.
+	// 5b. Port within an inclusive ingressPort range succeeds.
+	resp, err = http.Get(gwSrv.URL + "/agents/demo/web-agent:9003/range-ok")
+	if err != nil {
+		t.Fatalf("GET range port: %v", err)
+	}
+	body, _ = io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || string(body) != "pod-reply:/range-ok" {
+		t.Fatalf("range port = %d %q, want 200 pod-reply:/range-ok", resp.StatusCode, string(body))
+	}
+
+	// 6. Unpinned port returns 403 with RFC 9209 Proxy-Status.
 	resp, err = http.Get(gwSrv.URL + "/agents/demo/web-agent:9999/secret")
 	if err != nil {
 		t.Fatalf("GET unpinned port: %v", err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("unpinned port status = %d, want 403", resp.StatusCode)
+	if resp.StatusCode != http.StatusForbidden || !strings.Contains(resp.Header.Get("Proxy-Status"), "error=http_request_denied; reason=port-not-permitted") {
+		t.Fatalf("unpinned port status = %d Proxy-Status=%q, want 403 port-not-permitted", resp.StatusCode, resp.Header.Get("Proxy-Status"))
 	}
 
-	// 7. Revoking Ready=False on the ResourceClaim immediately evicts the route (404).
+	// 7. Revoking Ready=False on the ResourceClaim immediately evicts the route (404 + Proxy-Status).
 	revoked := makeStatusClaim("demo", "web-agent-agents-net", "web-agent", podUID, "", metav1.ConditionFalse, nil)
 	reg.SyncClaim(revoked)
 
@@ -183,7 +198,7 @@ func TestGatewayDiscoversFromResourceClaimAndProxiesThroughIngressBridge(t *test
 		t.Fatalf("GET after revoke: %v", err)
 	}
 	_ = resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("after revoke status = %d, want 404", resp.StatusCode)
+	if resp.StatusCode != http.StatusNotFound || !strings.Contains(resp.Header.Get("Proxy-Status"), "error=destination_not_found; reason=unknown-sandbox") {
+		t.Fatalf("after revoke status = %d Proxy-Status=%q, want 404 unknown-sandbox", resp.StatusCode, resp.Header.Get("Proxy-Status"))
 	}
 }

@@ -23,6 +23,7 @@ package apis
 
 import (
 	"slices"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -304,10 +305,89 @@ func (p *ExplicitProxyConfig) DeepCopy() *ExplicitProxyConfig {
 	return &out
 }
 
-// IngressPort declares one allowed container port exposed through the host ingress bridge.
+// IngressPort declares one allowed container port or inclusive port range
+// (when EndPort is set) exposed through the host ingress bridge.
 type IngressPort struct {
 	Port     int32           `json:"port"`
+	EndPort  int32           `json:"endPort,omitempty"`
 	Protocol IngressProtocol `json:"protocol,omitempty"`
+}
+
+// Contains reports whether port and proto fall within p. An empty protocol on
+// either side defaults to TCP; EndPort == 0 matches only p.Port.
+func (p IngressPort) Contains(port int32, proto IngressProtocol) bool {
+	pProto := p.Protocol
+	if pProto == "" {
+		pProto = IngressProtocolTCP
+	}
+	if proto == "" {
+		proto = IngressProtocolTCP
+	}
+	if pProto != proto {
+		return false
+	}
+	end := p.EndPort
+	if end == 0 {
+		end = p.Port
+	}
+	return port >= p.Port && port <= end
+}
+
+// FormatProxyStatus builds an RFC 9209 Proxy-Status field value using the
+// standardized agents.net structure ("<member>; error=<type>; reason=<token>").
+func FormatProxyStatus(member string, status int, reason string) string {
+	cleanMember := sanitizeProxyStatusToken(member)
+	if cleanMember == "" {
+		cleanMember = "dra-agents-net"
+	}
+	cleanReason := sanitizeProxyStatusToken(reason)
+	if cleanReason == "" {
+		cleanReason = "error"
+	}
+	return cleanMember + "; error=" + proxyErrorType(status, cleanReason) + "; reason=" + cleanReason
+}
+
+func proxyErrorType(status int, reason string) string {
+	switch reason {
+	case "port-not-permitted", "ingress-port-denied", "not-on-allowlist",
+		"port-not-allowed", "transport-not-allowed", "udp-disabled",
+		"identity-unknown", "listener-revoked", "upstream-denied":
+		return "http_request_denied"
+	case "unknown-sandbox", "sandbox-revoked":
+		return "destination_not_found"
+	case "busy", "max-connections-exceeded":
+		return "connection_limit_reached"
+	case "upstream-unconfigured", "policy-unavailable":
+		return "proxy_configuration_error"
+	case "unsupported-version", "unsupported-http-version":
+		return "http_protocol_error"
+	case "ingress-dial-failed", "upstream-connect-failed", "sandbox-not-ready", "dial-failed", "upstream-auth-failed":
+		return "destination_unavailable"
+	}
+	switch status {
+	case 403, 407:
+		return "http_request_denied"
+	case 404:
+		return "destination_not_found"
+	case 502, 503, 504:
+		return "destination_unavailable"
+	case 505:
+		return "http_protocol_error"
+	default:
+		return "http_request_error"
+	}
+}
+
+func sanitizeProxyStatusToken(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := range len(s) {
+		c := s[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
 }
 
 // DeviceStatus is the structured DRA status payload published by dra-agents-net in
