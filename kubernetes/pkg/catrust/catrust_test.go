@@ -63,13 +63,12 @@ func TestMaterializeAllSourcesAppendAndReplace(t *testing.T) {
 	ctx := t.Context()
 	sysCA := makeSelfSignedCAPEM(t, "system-root-ca")
 	cmCA := makeSelfSignedCAPEM(t, "configmap-ca")
-	secCA := makeSelfSignedCAPEM(t, "cert-manager-secret-ca")
 	ctbCA := makeSelfSignedCAPEM(t, "ctb-ca")
 	hostCA := makeSelfSignedCAPEM(t, "host-ca")
 
-	// Simulate a cert-manager kubernetes.io/tls Secret where ca.crt has a stray PRIVATE KEY
-	// block alongside the CA cert: Materialize MUST extract only the CERTIFICATE block.
-	secretDataWithKey := append([]byte("-----BEGIN PRIVATE KEY-----\nZmFrZS1rZXk=\n-----END PRIVATE KEY-----\n"), secCA...)
+	// Include a stray PRIVATE KEY block alongside a ConfigMap CA cert to verify
+	// Materialize extracts only valid CERTIFICATE PEM blocks.
+	cmDataWithKey := append([]byte("-----BEGIN PRIVATE KEY-----\nZmFrZS1rZXk=\n-----END PRIVATE KEY-----\n"), cmCA...)
 
 	tmp := t.TempDir()
 	sysPath := filepath.Join(tmp, "sys-roots.pem")
@@ -80,15 +79,7 @@ func TestMaterializeAllSourcesAppendAndReplace(t *testing.T) {
 	fakeKube := k8sfake.NewClientset(
 		&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Name: "corp-ca", Namespace: "agents"},
-			Data:       map[string]string{"ca.crt": string(cmCA)},
-		},
-		&corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "certmgr-ca", Namespace: "agents"},
-			Type:       corev1.SecretTypeTLS,
-			Data: map[string][]byte{
-				"ca.crt":  secretDataWithKey,
-				"tls.key": []byte("-----BEGIN PRIVATE KEY-----\nU0VDUkVU\n-----END PRIVATE KEY-----\n"),
-			},
+			Data:       map[string]string{"ca.crt": string(cmDataWithKey)},
 		},
 		&certificatesv1beta1.ClusterTrustBundle{
 			ObjectMeta: metav1.ObjectMeta{Name: "egress-ctb", Labels: map[string]string{"env": "prod"}},
@@ -107,10 +98,6 @@ func TestMaterializeAllSourcesAppendAndReplace(t *testing.T) {
 			{
 				Type:         apis.CASourceTypeConfigMap,
 				ConfigMapRef: &apis.ConfigMapKeyRef{Name: "corp-ca"},
-			},
-			{
-				Type:      apis.CASourceTypeSecret,
-				SecretRef: &apis.SecretKeyRef{Name: "certmgr-ca"},
 			},
 			{
 				Type: apis.CASourceTypeClusterTrustBundle,
@@ -141,18 +128,17 @@ func TestMaterializeAllSourcesAppendAndReplace(t *testing.T) {
 		t.Fatalf("read extra: %v", err)
 	}
 
-	// Never leak PRIVATE KEY blocks from Secret sources into mounted CA bundles.
 	if strings.Contains(string(merged), "PRIVATE KEY") || strings.Contains(string(extra), "PRIVATE KEY") {
 		t.Fatalf("private key leaked into materialized CA bundle")
 	}
 
-	// Merged bundle has system root + 4 custom CAs = 5 certs.
-	if got := strings.Count(string(merged), "BEGIN CERTIFICATE"); got != 5 {
-		t.Fatalf("merged cert count = %d, want 5", got)
+	// Merged bundle has system root + 3 custom CAs = 4 certs.
+	if got := strings.Count(string(merged), "BEGIN CERTIFICATE"); got != 4 {
+		t.Fatalf("merged cert count = %d, want 4", got)
 	}
-	// Extra bundle (for NODE_EXTRA_CA_CERTS) has only the 4 custom CAs.
-	if got := strings.Count(string(extra), "BEGIN CERTIFICATE"); got != 4 {
-		t.Fatalf("extra cert count = %d, want 4", got)
+	// Extra bundle (for NODE_EXTRA_CA_CERTS) has only the 3 custom CAs.
+	if got := strings.Count(string(extra), "BEGIN CERTIFICATE"); got != 3 {
+		t.Fatalf("extra cert count = %d, want 3", got)
 	}
 
 	// Replace mode must NOT include system root CA.
@@ -162,8 +148,8 @@ func TestMaterializeAllSourcesAppendAndReplace(t *testing.T) {
 		t.Fatalf("Materialize Replace: %v", err)
 	}
 	repBytes, _ := os.ReadFile(bundleRep.MergedHostPath)
-	if got := strings.Count(string(repBytes), "BEGIN CERTIFICATE"); got != 4 {
-		t.Fatalf("replace cert count = %d, want 4", got)
+	if got := strings.Count(string(repBytes), "BEGIN CERTIFICATE"); got != 3 {
+		t.Fatalf("replace cert count = %d, want 3", got)
 	}
 
 	// Verify env var mapping covers agents.net + all major runtimes.

@@ -450,7 +450,7 @@ func (e *upstreamDeniedError) Error() string {
 }
 
 type parsedUpstream struct {
-	scheme  string // "https", "http", or "unix"
+	scheme  string // "https" or "unix"
 	address string // host:port or socket path
 	host    string // Host header value
 }
@@ -461,21 +461,17 @@ func parseUpstreamAddress(raw string) (parsedUpstream, error) {
 		return parsedUpstream{}, fmt.Errorf("parse upstream address %q: %w", raw, err)
 	}
 	switch u.Scheme {
-	case "https", "http":
+	case "https":
 		hostname := u.Hostname()
 		if hostname == "" {
 			return parsedUpstream{}, fmt.Errorf("upstream address %q missing host", raw)
 		}
 		port := u.Port()
 		if port == "" {
-			if u.Scheme == "https" {
-				port = "443"
-			} else {
-				port = "80"
-			}
+			port = "443"
 		}
 		addr := net.JoinHostPort(hostname, port)
-		return parsedUpstream{scheme: u.Scheme, address: addr, host: u.Host}, nil
+		return parsedUpstream{scheme: "https", address: addr, host: u.Host}, nil
 	case "unix":
 		sockPath := u.Path
 		if sockPath == "" {
@@ -486,7 +482,7 @@ func parseUpstreamAddress(raw string) (parsedUpstream, error) {
 		}
 		return parsedUpstream{scheme: "unix", address: sockPath, host: "localhost"}, nil
 	default:
-		return parsedUpstream{}, fmt.Errorf("unsupported upstream scheme %q (want https, http, or unix)", u.Scheme)
+		return parsedUpstream{}, fmt.Errorf("unsupported upstream scheme %q (want https or unix; plaintext http is forbidden)", u.Scheme)
 	}
 }
 
@@ -609,23 +605,12 @@ func (u *upstreamDialer) getH2Transport() (*http.Transport, error) {
 	return u.h2Tr, nil
 }
 
-func (u *upstreamDialer) buildAuthHeaders(ctx context.Context, id auth.WorkloadIdentity) (http.Header, error) {
-	hdrs := id.AttestedHeaders()
-	if u.clientCfg != nil && u.clientCfg.ProxyAuthorization != nil {
-		val, err := u.clientCfg.ProxyAuthorization(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("obtain Proxy-Authorization: %w", err)
-		}
-		hdrs.Set("Proxy-Authorization", val)
-	}
-	return hdrs, nil
+func (u *upstreamDialer) buildAuthHeaders(id auth.WorkloadIdentity) http.Header {
+	return id.AttestedHeaders()
 }
 
 func (u *upstreamDialer) dialTCP(ctx context.Context, host, port string, id auth.WorkloadIdentity) (*upstreamTunnel, error) {
-	hdrs, err := u.buildAuthHeaders(ctx, id)
-	if err != nil {
-		return nil, &upstreamDeniedError{status: 502, reason: "upstream-auth-failed"}
-	}
+	hdrs := u.buildAuthHeaders(id)
 	authority := net.JoinHostPort(host, port)
 
 	// Over https://, prefer multiplexed HTTP/2 via TLS ALPN and transparently fall back
@@ -808,16 +793,12 @@ func readFinalH1Response(br *bufio.Reader, req *http.Request) (*http.Response, e
 	return nil, errors.New("unexpected interim response loop termination")
 }
 
-// dialUDP forwards an RFC 9298 connect-udp tunnel over the authenticated upstream
-// transport. Over https://, it prefers HTTP/2 extended CONNECT (:protocol: connect-udp,
-// RFC 8441) multiplexed on the shared HTTP/2 session and falls back to HTTP/1.1
-// Upgrade: connect-udp when the PEP negotiates http/1.1 or does not advertise
-// SETTINGS_ENABLE_CONNECT_PROTOCOL.
+// dialUDP forwards an RFC 9298 connect-udp tunnel over the mTLS upstream transport.
+// Over https://, it opens an HTTP/2 extended CONNECT (:protocol: connect-udp, RFC 8441)
+// stream and falls back to HTTP/1.1 Upgrade: connect-udp when the PEP negotiates
+// http/1.1 or does not advertise SETTINGS_ENABLE_CONNECT_PROTOCOL.
 func (u *upstreamDialer) dialUDP(ctx context.Context, host, port string, id auth.WorkloadIdentity) (*upstreamTunnel, error) {
-	hdrs, err := u.buildAuthHeaders(ctx, id)
-	if err != nil {
-		return nil, &upstreamDeniedError{status: 502, reason: "upstream-auth-failed"}
-	}
+	hdrs := u.buildAuthHeaders(id)
 	if u.target.scheme == "https" && !u.useH1.Load() && !u.useH1UDP.Load() {
 		tun, err := u.dialH2ConnectUDP(ctx, host, port, hdrs)
 		if err == nil {

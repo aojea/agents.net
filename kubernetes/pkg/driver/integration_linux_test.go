@@ -501,7 +501,7 @@ func newIntegrationPKI(t *testing.T) *integrationPKI {
 	}
 }
 
-func (p *integrationPKI) issue(t *testing.T, cn string, isServer bool) tls.Certificate {
+func (p *integrationPKI) issuePEM(t *testing.T, cn string, isServer bool) ([]byte, []byte, tls.Certificate) {
 	t.Helper()
 	key, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	eku := x509.ExtKeyUsageClientAuth
@@ -530,6 +530,12 @@ func (p *integrationPKI) issue(t *testing.T, cn string, isServer bool) tls.Certi
 	if err != nil {
 		t.Fatalf("X509KeyPair: %v", err)
 	}
+	return cPEM, kPEM, pair
+}
+
+func (p *integrationPKI) issue(t *testing.T, cn string, isServer bool) tls.Certificate {
+	t.Helper()
+	_, _, pair := p.issuePEM(t, cn, isServer)
 	return pair
 }
 
@@ -578,12 +584,20 @@ func testIntegrationExplicitProxyCrossNetNS(t *testing.T) {
 		}
 	}()
 
-	// Host-netns TLS upstream supporting HTTP/2 CONNECT + HTTP/1.1 connect-udp + policy deny.
+	// Host-netns mTLS upstream supporting HTTP/2 CONNECT + HTTP/1.1 connect-udp + policy deny.
 	pki := newIntegrationPKI(t)
 	srvPair := pki.issue(t, "127.0.0.1", true)
-	caPath := filepath.Join(t.TempDir(), "ca.crt")
+	cliCertPEM, cliKeyPEM, _ := pki.issuePEM(t, "dra-integration-client", false)
+	certDir := t.TempDir()
+	caPath := filepath.Join(certDir, "ca.crt")
 	if err := os.WriteFile(caPath, pki.caPEM, 0o600); err != nil {
 		t.Fatalf("write CA file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, "tls.crt"), cliCertPEM, 0o600); err != nil {
+		t.Fatalf("write client cert: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, "tls.key"), cliKeyPEM, 0o600); err != nil {
+		t.Fatalf("write client key: %v", err)
 	}
 
 	var (
@@ -591,7 +605,7 @@ func testIntegrationExplicitProxyCrossNetNS(t *testing.T) {
 		recMu    sync.Mutex
 		h2Count  int
 		udpCount int
-		gotParam string
+		gotAttrs string
 	)
 	rawUpLn, err := net.Listen("tcp4", "127.0.0.1:0")
 	if err != nil {
@@ -601,6 +615,8 @@ func testIntegrationExplicitProxyCrossNetNS(t *testing.T) {
 		Listener: tls.NewListener(rawUpLn, &tls.Config{
 			MinVersion:   tls.VersionTLS12,
 			Certificates: []tls.Certificate{srvPair},
+			ClientCAs:    pki.caPool,
+			ClientAuth:   tls.RequireAndVerifyClientCert,
 			NextProtos:   []string{"h2", "http/1.1"},
 		}),
 		count: &tlsConns,
@@ -612,8 +628,8 @@ func testIntegrationExplicitProxyCrossNetNS(t *testing.T) {
 		Protocols: protos,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			recMu.Lock()
-			if p := r.Header.Get(auth.HeaderCustomPrefix + "tenant"); p != "" {
-				gotParam = p
+			if a := r.Header.Get(auth.HeaderAttributes); a != "" {
+				gotAttrs = a
 			}
 			recMu.Unlock()
 
@@ -752,6 +768,10 @@ func testIntegrationExplicitProxyCrossNetNS(t *testing.T) {
 					{Type: apis.CASourceTypeHostPath, HostPath: caPath},
 				},
 			},
+			Auth: &apis.PEPAuth{
+				Type: apis.PEPAuthTypeMTLS,
+				MTLS: &apis.MTLSAuth{CertDir: certDir},
+			},
 		},
 		Custom: map[string]string{"tenant": "team-netns"},
 	})
@@ -879,8 +899,8 @@ func testIntegrationExplicitProxyCrossNetNS(t *testing.T) {
 	}
 
 	recMu.Lock()
-	if h2Count != 2 || udpCount != 1 || gotParam != "team-netns" {
-		t.Fatalf("upstream observations: h2=%d udp=%d param=%q, want 2/1/team-netns", h2Count, udpCount, gotParam)
+	if h2Count != 2 || udpCount != 1 || !strings.Contains(gotAttrs, `tenant="team-netns"`) {
+		t.Fatalf("upstream observations: h2=%d udp=%d attrs=%q, want 2/1 with tenant=\"team-netns\"", h2Count, udpCount, gotAttrs)
 	}
 	recMu.Unlock()
 

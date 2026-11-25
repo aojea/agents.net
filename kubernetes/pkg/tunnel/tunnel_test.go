@@ -123,6 +123,22 @@ func generateTestCerts(t *testing.T) (caPEM, srvCertPEM, srvKeyPEM, cliCertPEM, 
 	return
 }
 
+func writeTestMTLSCertDir(t *testing.T, caPEM, cliCertPEM, cliKeyPEM []byte) (certDir, caPath string) {
+	t.Helper()
+	certDir = t.TempDir()
+	caPath = filepath.Join(certDir, "ca.crt")
+	if err := os.WriteFile(caPath, caPEM, 0o600); err != nil {
+		t.Fatalf("write ca.crt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, "tls.crt"), cliCertPEM, 0o600); err != nil {
+		t.Fatalf("write tls.crt: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, "tls.key"), cliKeyPEM, 0o600); err != nil {
+		t.Fatalf("write tls.key: %v", err)
+	}
+	return certDir, caPath
+}
+
 func TestTunnelHTTP2MTLSForwardingDenyAndRevoke(t *testing.T) {
 	ctx := t.Context()
 	caPEM, srvCertPEM, srvKeyPEM, cliCertPEM, cliKeyPEM, caPool := generateTestCerts(t)
@@ -219,9 +235,9 @@ func TestTunnelHTTP2MTLSForwardingDenyAndRevoke(t *testing.T) {
 			Namespace:      "agents",
 			PodName:        "sb-1",
 			PodUID:         podUID,
+			SandboxID:      "sb-gen-1",
 			ServiceAccount: "agent-sa",
 			NodeName:       "node-1",
-			SandboxName:    "sb-1",
 			Custom:         map[string]string{"tenant": "team-a"},
 		},
 		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
@@ -307,7 +323,10 @@ func TestTunnelHTTP2MTLSForwardingDenyAndRevoke(t *testing.T) {
 	if peerCN != "sandbox-node-1" {
 		t.Fatalf("upstream peer CN = %q, want sandbox-node-1", peerCN)
 	}
-	if hdrs.Get(auth.HeaderSandboxNamespace) != "agents" || hdrs.Get(auth.HeaderCustomPrefix+"tenant") != "team-a" {
+	if hdrs.Get(auth.HeaderPrincipal) != "k8s://agents/agent-sa/sb-1" ||
+		hdrs.Get(auth.HeaderGeneration) != "sb-gen-1" ||
+		!strings.Contains(hdrs.Get(auth.HeaderAttributes), `ns="agents"`) ||
+		!strings.Contains(hdrs.Get(auth.HeaderAttributes), `tenant="team-a"`) {
 		t.Fatalf("missing attested identity headers: %+v", hdrs)
 	}
 
@@ -339,19 +358,21 @@ func TestTunnelHTTP2MTLSForwardingDenyAndRevoke(t *testing.T) {
 	}
 }
 
-func TestTunnelHTTP1ConnectUDPAndServiceAccountToken(t *testing.T) {
+func TestTunnelHTTP1ConnectUDPAndMTLS(t *testing.T) {
 	ctx := t.Context()
-	caPEM, srvCertPEM, srvKeyPEM, _, _, _ := generateTestCerts(t)
+	caPEM, srvCertPEM, srvKeyPEM, cliCertPEM, cliKeyPEM, caPool := generateTestCerts(t)
 	srvPair, _ := tls.X509KeyPair(srvCertPEM, srvKeyPEM)
 
 	var mu sync.Mutex
-	var gotProxyAuth string
-	var gotClaimName string
+	var gotPrincipal string
+	var gotPeerCN string
 
-	// Minimal RFC 9298 connect-udp + HTTP/1.1 CONNECT echo upstream server.
+	// Minimal RFC 9298 connect-udp + HTTP/1.1 mTLS echo upstream server.
 	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{srvPair},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
 		NextProtos:   []string{"http/1.1"},
 	})
 	if err != nil {
@@ -366,14 +387,23 @@ func TestTunnelHTTP1ConnectUDPAndServiceAccountToken(t *testing.T) {
 			}
 			go func(c net.Conn) {
 				defer func() { _ = c.Close() }()
+				if tc, ok := c.(*tls.Conn); ok {
+					if err := tc.Handshake(); err != nil {
+						return
+					}
+					if certs := tc.ConnectionState().PeerCertificates; len(certs) > 0 {
+						mu.Lock()
+						gotPeerCN = certs[0].Subject.CommonName
+						mu.Unlock()
+					}
+				}
 				br := bufio.NewReader(c)
 				req, err := http.ReadRequest(br)
 				if err != nil {
 					return
 				}
 				mu.Lock()
-				gotProxyAuth = req.Header.Get("Proxy-Authorization")
-				gotClaimName = req.Header.Get(auth.HeaderClaimName)
+				gotPrincipal = req.Header.Get(auth.HeaderPrincipal)
 				mu.Unlock()
 
 				if req.Method == http.MethodGet && strings.EqualFold(req.Header.Get("Upgrade"), "connect-udp") {
@@ -393,13 +423,9 @@ func TestTunnelHTTP1ConnectUDPAndServiceAccountToken(t *testing.T) {
 		}
 	}()
 
-	tmpDir := t.TempDir()
-	caPath := filepath.Join(tmpDir, "ca.crt")
-	_ = os.WriteFile(caPath, caPEM, 0o600)
-	tokPath := filepath.Join(tmpDir, "node-token")
-	_ = os.WriteFile(tokPath, []byte("jwt-upstream-token"), 0o600)
+	certDir, caPath := writeTestMTLSCertDir(t, caPEM, cliCertPEM, cliKeyPEM)
 
-	resolver := auth.NewResolver(auth.ResolverConfig{DefaultNodeTokenPath: tokPath})
+	resolver := auth.NewResolver(auth.ResolverConfig{})
 	defer func() { _ = resolver.Close() }()
 	mgr, err := NewManager(t.TempDir(), resolver, WithAuditWriter(io.Discard))
 	if err != nil {
@@ -407,7 +433,7 @@ func TestTunnelHTTP1ConnectUDPAndServiceAccountToken(t *testing.T) {
 	}
 	defer mgr.Close()
 
-	podUID := types.UID("pod-udp-jwt")
+	podUID := types.UID("pod-udp-mtls")
 	paths, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
 		Identity: auth.WorkloadIdentity{
 			Namespace: "agents",
@@ -424,11 +450,8 @@ func TestTunnelHTTP1ConnectUDPAndServiceAccountToken(t *testing.T) {
 				},
 			},
 			Auth: &apis.PEPAuth{
-				Type: apis.PEPAuthTypeServiceAccountToken,
-				ServiceAccountToken: &apis.ServiceAccountTokenAuth{
-					Audience: "https://upstream.local",
-					Mode:     apis.ServiceAccountTokenModeNode,
-				},
+				Type: apis.PEPAuthTypeMTLS,
+				MTLS: &apis.MTLSAuth{CertDir: certDir},
 			},
 		},
 	})
@@ -436,14 +459,13 @@ func TestTunnelHTTP1ConnectUDPAndServiceAccountToken(t *testing.T) {
 		t.Fatalf("EnsureListener: %v", err)
 	}
 
-	// Simulate warm pool SandboxClaim adoption updating attested metadata.
+	// Update attested ServiceAccount metadata.
 	mgr.UpdateIdentity(podUID, auth.WorkloadIdentity{
-		Namespace: "agents",
-		PodName:   "warm-1",
-		PodUID:    podUID,
-		NodeName:  "node-1",
-		ClaimUID:  "claim-uid-42",
-		ClaimName: "claim-alpha",
+		Namespace:      "agents",
+		PodName:        "warm-1",
+		PodUID:         podUID,
+		ServiceAccount: "runner-sa",
+		NodeName:       "node-1",
 	}, true)
 
 	// Open RFC 9298 connect-udp tunnel and echo a datagram capsule end-to-end.
@@ -476,14 +498,14 @@ func TestTunnelHTTP1ConnectUDPAndServiceAccountToken(t *testing.T) {
 	}
 
 	mu.Lock()
-	pa := gotProxyAuth
-	cn := gotClaimName
+	peer := gotPeerCN
+	princ := gotPrincipal
 	mu.Unlock()
-	if pa != "Bearer jwt-upstream-token" {
-		t.Fatalf("upstream Proxy-Authorization = %q, want Bearer jwt-upstream-token", pa)
+	if peer != "sandbox-node-1" {
+		t.Fatalf("upstream peer CN = %q, want sandbox-node-1", peer)
 	}
-	if cn != "claim-alpha" {
-		t.Fatalf("upstream claim header = %q, want claim-alpha", cn)
+	if princ != "k8s://agents/runner-sa/warm-1" {
+		t.Fatalf("upstream %s = %q, want k8s://agents/runner-sa/warm-1", auth.HeaderPrincipal, princ)
 	}
 }
 
@@ -521,12 +543,13 @@ func TestTunnelExplicitHTTPProxyViaConnect(t *testing.T) {
 	}))
 	defer destSrv.Close()
 
-	// Minimal HTTP/1.1 CONNECT upstream proxy that records attested headers and dials dest.
+	// Local Unix-socket HTTP/1.1 CONNECT upstream PEP that records attested headers and dials dest.
 	var mu sync.Mutex
-	var gotSandboxHeader string
-	upLn, err := net.Listen("tcp", "127.0.0.1:0")
+	var gotPrincipal string
+	upSock := filepath.Join(t.TempDir(), "pep.sock")
+	upLn, err := net.Listen("unix", upSock)
 	if err != nil {
-		t.Fatalf("listen upstream: %v", err)
+		t.Fatalf("listen upstream unix: %v", err)
 	}
 	defer func() { _ = upLn.Close() }()
 	go func() {
@@ -543,7 +566,7 @@ func TestTunnelExplicitHTTPProxyViaConnect(t *testing.T) {
 					return
 				}
 				mu.Lock()
-				gotSandboxHeader = req.Header.Get(auth.HeaderSandboxName)
+				gotPrincipal = req.Header.Get(auth.HeaderPrincipal)
 				mu.Unlock()
 
 				dst, err := net.DialTimeout("tcp", req.Host, 2*time.Second)
@@ -568,13 +591,12 @@ func TestTunnelExplicitHTTPProxyViaConnect(t *testing.T) {
 	podUID := types.UID("pod-http-proxy")
 	if _, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
 		Identity: auth.WorkloadIdentity{
-			Namespace:   "agents",
-			SandboxName: "http-sb",
-			PodName:     "http-sb",
-			PodUID:      podUID,
+			Namespace: "agents",
+			PodName:   "http-sb",
+			PodUID:    podUID,
 		},
 		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
-			URL: "http://" + upLn.Addr().String(),
+			URL: "unix://" + upSock,
 		},
 	}); err != nil {
 		t.Fatalf("EnsureListener: %v", err)
@@ -609,23 +631,23 @@ func TestTunnelExplicitHTTPProxyViaConnect(t *testing.T) {
 		t.Fatalf("unexpected response: status=%d body=%q", resp.StatusCode, string(body))
 	}
 	mu.Lock()
-	sbHdr := gotSandboxHeader
+	princ := gotPrincipal
 	mu.Unlock()
-	if sbHdr != "http-sb" {
-		t.Fatalf("upstream %s = %q, want http-sb", auth.HeaderSandboxName, sbHdr)
+	if princ != "k8s://agents/http-sb" {
+		t.Fatalf("upstream %s = %q, want k8s://agents/http-sb", auth.HeaderPrincipal, princ)
 	}
 }
 
 func TestTunnelHTTP2Multiplexing(t *testing.T) {
 	ctx := t.Context()
-	caPEM, srvCertPEM, srvKeyPEM, _, _, _ := generateTestCerts(t)
+	caPEM, srvCertPEM, srvKeyPEM, cliCertPEM, cliKeyPEM, caPool := generateTestCerts(t)
 	serverPair, err := tls.X509KeyPair(srvCertPEM, srvKeyPEM)
 	if err != nil {
 		t.Fatalf("load server keypair: %v", err)
 	}
 
 	// Two distinct backend servers to verify HTTP/2 multiplexes distinct destinations
-	// over a single upstream TLS connection.
+	// over a single upstream mTLS connection.
 	dest1 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "dest-one")
 	}))
@@ -643,6 +665,8 @@ func TestTunnelHTTP2Multiplexing(t *testing.T) {
 	tlsLn := tls.NewListener(baseLn, &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{serverPair},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
 		NextProtos:   []string{"h2"},
 	})
 	countingLn := &countingListener{Listener: tlsLn, count: &connCount}
@@ -689,8 +713,7 @@ func TestTunnelHTTP2Multiplexing(t *testing.T) {
 	go func() { _ = h2Srv.Serve(countingLn) }()
 	defer func() { _ = h2Srv.Close() }()
 
-	caPath := filepath.Join(t.TempDir(), "ca.crt")
-	_ = os.WriteFile(caPath, caPEM, 0o600)
+	certDir, caPath := writeTestMTLSCertDir(t, caPEM, cliCertPEM, cliKeyPEM)
 
 	mgr, err := NewManager(t.TempDir(), nil, WithAuditWriter(io.Discard))
 	if err != nil {
@@ -700,7 +723,7 @@ func TestTunnelHTTP2Multiplexing(t *testing.T) {
 
 	podUID := types.UID("pod-h2-mux")
 	if _, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
-		Identity: auth.WorkloadIdentity{Namespace: "agents", SandboxName: "h2-sb", PodUID: podUID},
+		Identity: auth.WorkloadIdentity{Namespace: "agents", PodName: "h2-sb", PodUID: podUID},
 		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
 			URL: "https://" + baseLn.Addr().String(),
 			TLS: &apis.PEPTLS{
@@ -708,6 +731,10 @@ func TestTunnelHTTP2Multiplexing(t *testing.T) {
 				CACertificateRefs: []apis.CASource{
 					{Type: apis.CASourceTypeHostPath, HostPath: caPath},
 				},
+			},
+			Auth: &apis.PEPAuth{
+				Type: apis.PEPAuthTypeMTLS,
+				MTLS: &apis.MTLSAuth{CertDir: certDir},
 			},
 		},
 	}); err != nil {
@@ -757,23 +784,20 @@ func TestTunnelHTTP2Multiplexing(t *testing.T) {
 func TestTunnelHTTPSAutomaticALPNFallbackToHTTP1(t *testing.T) {
 	ctx := t.Context()
 	tmp := t.TempDir()
-	caPEM, srvCertPEM, srvKeyPEM, _, _, _ := generateTestCerts(t)
+	caPEM, srvCertPEM, srvKeyPEM, cliCertPEM, cliKeyPEM, caPool := generateTestCerts(t)
 	serverPair, err := tls.X509KeyPair(srvCertPEM, srvKeyPEM)
 	if err != nil {
 		t.Fatalf("load server keypair: %v", err)
 	}
 
-	caPath := filepath.Join(tmp, "ca.crt")
-	if err := os.WriteFile(caPath, caPEM, 0o600); err != nil {
-		t.Fatalf("write ca: %v", err)
-	}
+	certDir, caPath := writeTestMTLSCertDir(t, caPEM, cliCertPEM, cliKeyPEM)
 
 	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, "h1-fallback:"+r.URL.Path)
 	}))
 	defer dest.Close()
 
-	// HTTP/1.1-only TLS PEP (NextProtos excludes "h2").
+	// HTTP/1.1-only mTLS PEP (NextProtos excludes "h2").
 	var h1Conns atomic.Int32
 	baseLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -782,6 +806,8 @@ func TestTunnelHTTPSAutomaticALPNFallbackToHTTP1(t *testing.T) {
 	tlsLn := tls.NewListener(baseLn, &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{serverPair},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
 		NextProtos:   []string{"http/1.1"},
 	})
 	defer func() { _ = tlsLn.Close() }()
@@ -821,7 +847,7 @@ func TestTunnelHTTPSAutomaticALPNFallbackToHTTP1(t *testing.T) {
 
 	podUID := types.UID("pod-alpn-h1")
 	if _, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
-		Identity: auth.WorkloadIdentity{Namespace: "agents", SandboxName: "alpn-sb", PodUID: podUID},
+		Identity: auth.WorkloadIdentity{Namespace: "agents", PodName: "alpn-sb", PodUID: podUID},
 		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
 			URL: "https://" + baseLn.Addr().String(),
 			TLS: &apis.PEPTLS{
@@ -829,6 +855,10 @@ func TestTunnelHTTPSAutomaticALPNFallbackToHTTP1(t *testing.T) {
 				CACertificateRefs: []apis.CASource{
 					{Type: apis.CASourceTypeHostPath, HostPath: caPath},
 				},
+			},
+			Auth: &apis.PEPAuth{
+				Type: apis.PEPAuthTypeMTLS,
+				MTLS: &apis.MTLSAuth{CertDir: certDir},
 			},
 		},
 	}); err != nil {
@@ -944,10 +974,13 @@ func TestTunnelSecurityHardeningAndConcurrency(t *testing.T) {
 		}
 	}
 
-	// 4. IPv6 literal upstream URL without port parses cleanly.
+	// 4. IPv6 literal upstream URL without port parses cleanly; plaintext http:// is rejected.
 	parsed, err := parseUpstreamAddress("https://[::1]")
 	if err != nil || parsed.address != "[::1]:443" {
 		t.Fatalf("parseUpstreamAddress(https://[::1]) = (%+v, %v), want [::1]:443", parsed, err)
+	}
+	if _, err := parseUpstreamAddress("http://169.254.169.254:80"); err == nil {
+		t.Fatal("expected parseUpstreamAddress to reject plaintext http://")
 	}
 
 	// 5. CapsuleStream returns ErrUnexpectedEOF on truncated frame.
@@ -984,15 +1017,12 @@ func TestTunnelSecurityHardeningAndConcurrency(t *testing.T) {
 func TestTunnelHTTP2ConnectUDP(t *testing.T) {
 	ctx := t.Context()
 	tmp := t.TempDir()
-	caPEM, srvCertPEM, srvKeyPEM, _, _, _ := generateTestCerts(t)
+	caPEM, srvCertPEM, srvKeyPEM, cliCertPEM, cliKeyPEM, caPool := generateTestCerts(t)
 	srvPair, err := tls.X509KeyPair(srvCertPEM, srvKeyPEM)
 	if err != nil {
 		t.Fatalf("load server keypair: %v", err)
 	}
-	caPath := filepath.Join(tmp, "ca.crt")
-	if err := os.WriteFile(caPath, caPEM, 0o600); err != nil {
-		t.Fatalf("write ca: %v", err)
-	}
+	certDir, caPath := writeTestMTLSCertDir(t, caPEM, cliCertPEM, cliKeyPEM)
 
 	var mu sync.Mutex
 	gotHeaders := make(map[string]string)
@@ -1004,6 +1034,8 @@ func TestTunnelHTTP2ConnectUDP(t *testing.T) {
 	tlsLn := tls.NewListener(baseLn, &tls.Config{
 		MinVersion:   tls.VersionTLS12,
 		Certificates: []tls.Certificate{srvPair},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
 		NextProtos:   []string{"h2"},
 	})
 	defer func() { _ = tlsLn.Close() }()
@@ -1076,10 +1108,10 @@ func TestTunnelHTTP2ConnectUDP(t *testing.T) {
 	podUID := types.UID("pod-h2-udp")
 	paths, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
 		Identity: auth.WorkloadIdentity{
-			Namespace:   "agents",
-			PodName:     "real-pod",
-			PodUID:      podUID,
-			SandboxName: "real-sb",
+			Namespace: "agents",
+			PodName:   "real-pod",
+			PodUID:    podUID,
+			SandboxID: "gen-udp-1",
 		},
 		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
 			URL: "https://" + baseLn.Addr().String(),
@@ -1088,6 +1120,10 @@ func TestTunnelHTTP2ConnectUDP(t *testing.T) {
 				CACertificateRefs: []apis.CASource{
 					{Type: apis.CASourceTypeHostPath, HostPath: caPath},
 				},
+			},
+			Auth: &apis.PEPAuth{
+				Type: apis.PEPAuthTypeMTLS,
+				MTLS: &apis.MTLSAuth{CertDir: certDir},
 			},
 		},
 	})
@@ -1107,7 +1143,7 @@ func TestTunnelHTTP2ConnectUDP(t *testing.T) {
 			"Connection: Upgrade\r\n"+
 			"Upgrade: connect-udp\r\n"+
 			"Capsule-Protocol: ?1\r\n"+
-			"Agents-Net-Pod-Name: forged-pod\r\n"+
+			"Agents-Net-Principal: forged-pod\r\n"+
 			"Proxy-Authorization: Bearer forged\r\n\r\n")
 
 	br := bufio.NewReader(c)
@@ -1133,8 +1169,11 @@ func TestTunnelHTTP2ConnectUDP(t *testing.T) {
 	if gotHeaders[":path"] != "/.well-known/masque/udp/2001%3Adb8%3A%3A1/53/" {
 		t.Fatalf("encoded IPv6 :path = %q, want %q", gotHeaders[":path"], "/.well-known/masque/udp/2001%3Adb8%3A%3A1/53/")
 	}
-	if gotHeaders["agents-net-pod-name"] != "real-pod" {
-		t.Fatalf("attested pod header = %q, want real-pod (guest forgery must be ignored)", gotHeaders["agents-net-pod-name"])
+	if gotHeaders["agents-net-principal"] != "k8s://agents/real-pod" {
+		t.Fatalf("attested principal header = %q, want k8s://agents/real-pod (guest forgery must be ignored)", gotHeaders["agents-net-principal"])
+	}
+	if gotHeaders["agents-net-generation"] != "gen-udp-1" {
+		t.Fatalf("attested generation header = %q, want gen-udp-1", gotHeaders["agents-net-generation"])
 	}
 	if gotHeaders["proxy-authorization"] != "" {
 		t.Fatalf("guest Proxy-Authorization leaked to PEP: %q", gotHeaders["proxy-authorization"])
@@ -1149,10 +1188,11 @@ func TestTunnelSpecProtocolCompliance(t *testing.T) {
 	var mu sync.Mutex
 	var gotUpstreamHeaders http.Header
 
-	// Upstream HTTP/1.1 PEP sending a 102 interim response followed by 204 No Content.
-	upLn, err := net.Listen("tcp", "127.0.0.1:0")
+	// Upstream local Unix HTTP/1.1 PEP sending a 102 interim response followed by 204 No Content.
+	upSock := filepath.Join(t.TempDir(), "pep-spec.sock")
+	upLn, err := net.Listen("unix", upSock)
 	if err != nil {
-		t.Fatalf("listen upstream: %v", err)
+		t.Fatalf("listen upstream unix: %v", err)
 	}
 	defer func() { _ = upLn.Close() }()
 	go func() {
@@ -1186,13 +1226,12 @@ func TestTunnelSpecProtocolCompliance(t *testing.T) {
 	podUID := types.UID("pod-spec-edge")
 	paths, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
 		Identity: auth.WorkloadIdentity{
-			Namespace:   "agents",
-			PodName:     "real-agent",
-			PodUID:      podUID,
-			SandboxName: "real-agent",
+			Namespace: "agents",
+			PodName:   "real-agent",
+			PodUID:    podUID,
 		},
 		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
-			URL: "http://" + upLn.Addr().String(),
+			URL: "unix://" + upSock,
 		},
 		MaxConnections: 2,
 	})
@@ -1202,7 +1241,7 @@ func TestTunnelSpecProtocolCompliance(t *testing.T) {
 
 	// 1. HTTP/1.0 CONNECT (no Host), trailing dot Host, IPv6 normalized Host, and 1xx+204.
 	validReqs := []string{
-		"CONNECT example.com:443 HTTP/1.0\r\nAgents-Net-Pod-Name: forged\r\nProxy-Authorization: Bearer evil\r\n\r\n",
+		"CONNECT example.com:443 HTTP/1.0\r\nAgents-Net-Principal: forged\r\nProxy-Authorization: Bearer evil\r\n\r\n",
 		"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com.:443\r\n\r\n",
 		"CONNECT [::1]:443 HTTP/1.1\r\nHost: [0:0:0:0:0:0:0:1]:443\r\n\r\n",
 	}
@@ -1232,8 +1271,8 @@ func TestTunnelSpecProtocolCompliance(t *testing.T) {
 	mu.Lock()
 	hdrs := gotUpstreamHeaders.Clone()
 	mu.Unlock()
-	if hdrs.Get(auth.HeaderPodName) != "real-agent" {
-		t.Fatalf("upstream %s = %q, want real-agent", auth.HeaderPodName, hdrs.Get(auth.HeaderPodName))
+	if hdrs.Get(auth.HeaderPrincipal) != "k8s://agents/real-agent" {
+		t.Fatalf("upstream %s = %q, want k8s://agents/real-agent", auth.HeaderPrincipal, hdrs.Get(auth.HeaderPrincipal))
 	}
 	if hdrs.Get("Proxy-Authorization") != "" {
 		t.Fatalf("forged Proxy-Authorization leaked upstream: %q", hdrs.Get("Proxy-Authorization"))

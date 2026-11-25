@@ -22,58 +22,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
 )
-
-const secretCertReloadTTL = 30 * time.Second
-
-// secretPairLoader caches a TLS keypair from a Kubernetes Secret and refreshes it
-// periodically so cert-manager Secret rotations take effect without restarting Pods.
-type secretPairLoader struct {
-	kubeClient kubernetes.Interface
-	namespace  string
-	name       string
-
-	mu        sync.Mutex
-	cert      *tls.Certificate
-	fetchedAt time.Time
-}
-
-func (l *secretPairLoader) GetClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
-	l.mu.Lock()
-	if l.cert != nil && time.Since(l.fetchedAt) < secretCertReloadTTL {
-		c := l.cert
-		l.mu.Unlock()
-		return c, nil
-	}
-	l.mu.Unlock()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	secret, err := l.kubeClient.CoreV1().Secrets(l.namespace).Get(ctx, l.name, metav1.GetOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("get mTLS Secret %s/%s: %w", l.namespace, l.name, err)
-	}
-	certPEM := secret.Data["tls.crt"]
-	keyPEM := secret.Data["tls.key"]
-	if len(certPEM) == 0 || len(keyPEM) == 0 {
-		return nil, fmt.Errorf("mTLS Secret %s/%s must contain tls.crt and tls.key", l.namespace, secret.Name)
-	}
-	pair, err := tls.X509KeyPair(certPEM, keyPEM)
-	if err != nil {
-		return nil, fmt.Errorf("parse mTLS Secret %s/%s keypair: %w", l.namespace, secret.Name, err)
-	}
-
-	l.mu.Lock()
-	l.cert = &pair
-	l.fetchedAt = time.Now()
-	c := l.cert
-	l.mu.Unlock()
-	return c, nil
-}
 
 // rotatingPairLoader caches a TLS keypair loaded from certPath and keyPath,
 // reloading automatically when either file's modification time, size, or inode changes.
@@ -118,8 +67,8 @@ func (l *rotatingPairLoader) GetClientCertificate(_ *tls.CertificateRequestInfo)
 
 func (r *Resolver) resolveMTLS(ctx context.Context, req ResolveRequest) (*ClientConfig, error) {
 	mtlsSpec := req.PolicyEnforcementPoint.Auth.MTLS
-	if mtlsSpec == nil {
-		return nil, errors.New("mtls auth config is required when auth.type is MTLS")
+	if mtlsSpec == nil || mtlsSpec.CertDir == "" {
+		return nil, errors.New("mtls.certDir is required when auth.type is MTLS")
 	}
 
 	tlsCfg, err := r.buildServerTLSConfig(ctx, req.PolicyEnforcementPoint.TLS, req.PodNamespace)
@@ -127,41 +76,17 @@ func (r *Resolver) resolveMTLS(ctx context.Context, req ResolveRequest) (*Client
 		return nil, err
 	}
 
-	if mtlsSpec.CertDir != "" {
-		loader := &rotatingPairLoader{
-			certPath: filepath.Join(mtlsSpec.CertDir, "tls.crt"),
-			keyPath:  filepath.Join(mtlsSpec.CertDir, "tls.key"),
-		}
-		// Validate initial load eagerly so broken configurations fail fast.
-		if _, err := loader.GetClientCertificate(nil); err != nil {
-			return nil, err
-		}
-		tlsCfg.GetClientCertificate = loader.GetClientCertificate
-		return &ClientConfig{
-			AuthMode:  AuthModeMTLS,
-			TLSConfig: tlsCfg,
-		}, nil
+	loader := &rotatingPairLoader{
+		certPath: filepath.Join(mtlsSpec.CertDir, "tls.crt"),
+		keyPath:  filepath.Join(mtlsSpec.CertDir, "tls.key"),
 	}
-
-	if mtlsSpec.SecretRef != nil && mtlsSpec.SecretRef.Name != "" {
-		if r.kubeClient == nil {
-			return nil, errors.New("kubernetes client is required to read mtls.secretRef")
-		}
-		loader := &secretPairLoader{
-			kubeClient: r.kubeClient,
-			namespace:  req.PodNamespace,
-			name:       mtlsSpec.SecretRef.Name,
-		}
-		// Validate eagerly so broken Secret references fail fast during PrepareResourceClaims.
-		if _, err := loader.GetClientCertificate(nil); err != nil {
-			return nil, err
-		}
-		tlsCfg.GetClientCertificate = loader.GetClientCertificate
-		return &ClientConfig{
-			AuthMode:  AuthModeMTLS,
-			TLSConfig: tlsCfg,
-		}, nil
+	// Validate initial load eagerly so broken configurations fail fast.
+	if _, err := loader.GetClientCertificate(nil); err != nil {
+		return nil, err
 	}
-
-	return nil, errors.New("mtls auth requires either certDir or secretRef")
+	tlsCfg.GetClientCertificate = loader.GetClientCertificate
+	return &ClientConfig{
+		AuthMode:  AuthModeMTLS,
+		TLSConfig: tlsCfg,
+	}, nil
 }

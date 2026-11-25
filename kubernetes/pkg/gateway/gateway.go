@@ -234,19 +234,29 @@ type AuditRecord struct {
 	Reason    string `json:"reason,omitempty"`
 }
 
+type bridgeDialTargetKey struct{}
+
+type bridgeDialTarget struct {
+	ingress apis.IngressStatus
+	port    int32
+}
+
 // Config configures an agents.net ingress gateway Handler.
 type Config struct {
-	Registry    *Registry
-	TLSConfig   *tls.Config
-	DialTimeout time.Duration
-	AuditWriter io.Writer
+	Registry            *Registry
+	TLSConfig           *tls.Config
+	AllowInsecureBridge bool
+	DialTimeout         time.Duration
+	AuditWriter         io.Writer
 }
 
 // Handler routes external HTTP requests to isolated Pods discovered through Registry.
 type Handler struct {
-	registry    *Registry
-	tlsConfig   *tls.Config
-	dialTimeout time.Duration
+	registry            *Registry
+	tlsConfig           *tls.Config
+	allowInsecureBridge bool
+	dialTimeout         time.Duration
+	transport           *http.Transport
 
 	auditMu  sync.Mutex
 	auditOut io.Writer
@@ -257,6 +267,9 @@ func NewHandler(cfg Config) (*Handler, error) {
 	if cfg.Registry == nil {
 		return nil, errors.New("registry is required")
 	}
+	if cfg.TLSConfig == nil && !cfg.AllowInsecureBridge {
+		return nil, errors.New("mTLS TLSConfig is required for node ingress bridge connections")
+	}
 	dialTimeout := cfg.DialTimeout
 	if dialTimeout <= 0 {
 		dialTimeout = defaultDialTimeout
@@ -265,12 +278,34 @@ func NewHandler(cfg Config) (*Handler, error) {
 	if auditOut == nil {
 		auditOut = os.Stdout
 	}
-	return &Handler{
-		registry:    cfg.Registry,
-		tlsConfig:   cfg.TLSConfig,
-		dialTimeout: dialTimeout,
-		auditOut:    auditOut,
-	}, nil
+	h := &Handler{
+		registry:            cfg.Registry,
+		tlsConfig:           cfg.TLSConfig,
+		allowInsecureBridge: cfg.AllowInsecureBridge,
+		dialTimeout:         dialTimeout,
+		auditOut:            auditOut,
+	}
+	h.transport = &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			dt, ok := ctx.Value(bridgeDialTargetKey{}).(bridgeDialTarget)
+			if !ok {
+				return nil, errors.New("missing ingress bridge dial target in request context")
+			}
+			return h.dialConnectBridge(ctx, dt.ingress, dt.port)
+		},
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       30 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+	}
+	return h, nil
+}
+
+// Close releases any idle pooled bridge connections held by the Handler.
+func (h *Handler) Close() {
+	if h != nil && h.transport != nil {
+		h.transport.CloseIdleConnections()
+	}
 }
 
 // ServeHTTP handles /healthz and routes sandbox ingress requests via path
@@ -282,7 +317,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	target, forwardPath, err := resolveRequestTarget(r)
+	target, forwardPath, pathRewritten, err := resolveRequestTarget(r)
 	if err != nil {
 		h.writeError(w, r, RouteEntry{}, 0, http.StatusBadRequest, "invalid-target", err.Error())
 		return
@@ -311,26 +346,34 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tr := &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return h.dialConnectBridge(ctx, entry.Ingress, port)
-		},
-		DisableKeepAlives:     true,
-		ResponseHeaderTimeout: 30 * time.Second,
-	}
-	defer tr.CloseIdleConnections()
+	// Pool keep-alive connections strictly per (podUID, port) by keying Out.URL.Host
+	// on the sandbox identity while preserving the caller's Host header.
+	poolHost := net.JoinHostPort(entry.PodUID, strconv.Itoa(int(port)))
+	reqWithTarget := r.WithContext(context.WithValue(r.Context(), bridgeDialTargetKey{}, bridgeDialTarget{
+		ingress: entry.Ingress,
+		port:    port,
+	}))
 
 	var bridgeErr error
 	proxy := &httputil.ReverseProxy{
-		Transport: tr,
+		Transport: h.transport,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(&url.URL{
 				Scheme: "http",
-				Host:   fmt.Sprintf("127.0.0.1:%d", port),
+				Host:   poolHost,
 			})
-			pr.Out.URL.Path = forwardPath
-			pr.Out.URL.RawPath = ""
-			pr.Out.Host = fmt.Sprintf("127.0.0.1:%d", port)
+			if pathRewritten {
+				pr.Out.URL.Path = forwardPath
+				pr.Out.URL.RawPath = ""
+			} else {
+				pr.Out.URL.Path = pr.In.URL.Path
+				pr.Out.URL.RawPath = pr.In.URL.RawPath
+			}
+			if pr.In.Host != "" {
+				pr.Out.Host = pr.In.Host
+			} else {
+				pr.Out.Host = fmt.Sprintf("127.0.0.1:%d", port)
+			}
 			pr.Out.Header.Del(HeaderNamespace)
 			pr.Out.Header.Del(HeaderPod)
 			pr.Out.Header.Del(HeaderPodUID)
@@ -343,7 +386,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if be.proxyStatus != "" {
 					rw.Header().Set("Proxy-Status", be.proxyStatus)
 				} else {
-					rw.Header().Set("Proxy-Status", apis.FormatProxyStatus("agents-net-gateway", be.status, "bridge-denied"))
+					rw.Header().Set("Proxy-Status", apis.FormatProxyStatus("agents-net-gateway", be.status, be.reason))
 				}
 				http.Error(rw, be.Error(), be.status)
 				return
@@ -354,7 +397,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
-	proxy.ServeHTTP(rec, r)
+	proxy.ServeHTTP(rec, reqWithTarget)
 
 	reason := "delivered"
 	if bridgeErr != nil {
@@ -386,11 +429,11 @@ type requestTarget struct {
 //   - /agents/<namespace>/<pod>[:<port>][/<rest>]
 //   - X-Agents-Net-Pod (+ optional X-Agents-Net-Namespace, X-Agents-Net-Port)
 //   - X-Agents-Net-Pod-Uid (+ optional X-Agents-Net-Port)
-func resolveRequestTarget(r *http.Request) (requestTarget, string, error) {
+func resolveRequestTarget(r *http.Request) (requestTarget, string, bool, error) {
 	if rest, ok := strings.CutPrefix(r.URL.Path, "/agents/"); ok {
 		parts := strings.SplitN(rest, "/", 3)
 		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
-			return requestTarget{}, "", errors.New("path must be /agents/<namespace>/<pod>[:<port>]/<path>")
+			return requestTarget{}, "", false, errors.New("path must be /agents/<namespace>/<pod>[:<port>]/<path>")
 		}
 		ns := parts[0]
 		podSpec := parts[1]
@@ -403,21 +446,21 @@ func resolveRequestTarget(r *http.Request) (requestTarget, string, error) {
 		if name, portStr, hasPort := strings.Cut(podSpec, ":"); hasPort {
 			p, err := parsePort(portStr)
 			if err != nil {
-				return requestTarget{}, "", err
+				return requestTarget{}, "", false, err
 			}
 			podName = name
 			port = p
 		}
 		if podName == "" {
-			return requestTarget{}, "", errors.New("pod name is required")
+			return requestTarget{}, "", false, errors.New("pod name is required")
 		}
-		return requestTarget{namespace: ns, podName: podName, port: port}, forwardPath, nil
+		return requestTarget{namespace: ns, podName: podName, port: port}, forwardPath, true, nil
 	}
 
 	podUID := strings.TrimSpace(r.Header.Get(HeaderPodUID))
 	podName := strings.TrimSpace(r.Header.Get(HeaderPod))
 	if podUID == "" && podName == "" {
-		return requestTarget{}, "", errors.New("specify /agents/<namespace>/<pod>/... or X-Agents-Net-Pod / X-Agents-Net-Pod-Uid header")
+		return requestTarget{}, "", false, errors.New("specify /agents/<namespace>/<pod>/... or X-Agents-Net-Pod / X-Agents-Net-Pod-Uid header")
 	}
 	ns := strings.TrimSpace(r.Header.Get(HeaderNamespace))
 	if ns == "" {
@@ -427,7 +470,7 @@ func resolveRequestTarget(r *http.Request) (requestTarget, string, error) {
 	if rawPort := strings.TrimSpace(r.Header.Get(HeaderPort)); rawPort != "" {
 		p, err := parsePort(rawPort)
 		if err != nil {
-			return requestTarget{}, "", err
+			return requestTarget{}, "", false, err
 		}
 		port = p
 	}
@@ -435,7 +478,7 @@ func resolveRequestTarget(r *http.Request) (requestTarget, string, error) {
 	if forwardPath == "" {
 		forwardPath = "/"
 	}
-	return requestTarget{namespace: ns, podName: podName, podUID: podUID, port: port}, forwardPath, nil
+	return requestTarget{namespace: ns, podName: podName, podUID: podUID, port: port}, forwardPath, false, nil
 }
 
 func parsePort(raw string) (int32, error) {
@@ -466,13 +509,21 @@ func (e *bridgeDeniedError) Error() string {
 }
 
 func (h *Handler) dialConnectBridge(ctx context.Context, ing apis.IngressStatus, port int32) (net.Conn, error) {
+	// Never downgrade to plaintext unless AllowInsecureBridge is explicitly enabled.
+	if !ing.TLS && !h.allowInsecureBridge {
+		return nil, &bridgeDeniedError{
+			status: http.StatusBadGateway,
+			reason: "bridge-tls-required",
+		}
+	}
+
 	dialer := &net.Dialer{Timeout: h.dialTimeout}
 	conn, err := dialer.DialContext(ctx, "tcp", ing.Endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("dial ingress bridge %s: %w", ing.Endpoint, err)
 	}
 
-	if ing.TLS {
+	if ing.TLS || !h.allowInsecureBridge {
 		var tlsCfg *tls.Config
 		if h.tlsConfig != nil {
 			tlsCfg = h.tlsConfig.Clone()

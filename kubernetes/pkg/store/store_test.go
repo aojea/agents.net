@@ -69,7 +69,7 @@ func TestBoltStoreCheckpointAndReload(t *testing.T) {
 	if err := s1.UpdateNetNS(podUID, "/var/run/netns/cni-1", time.Now().UTC()); err != nil {
 		t.Fatalf("UpdateNetNS: %v", err)
 	}
-	if err := s1.UpdateIdentity(podUID, "sb-1", "agents", "coding-sa", "sb-1", "sc-uid-1", "claim-alpha"); err != nil {
+	if err := s1.UpdateIdentity(podUID, "sb-1", "agents", "coding-sa"); err != nil {
 		t.Fatalf("UpdateIdentity: %v", err)
 	}
 	if err := s1.Close(); err != nil {
@@ -90,7 +90,7 @@ func TestBoltStoreCheckpointAndReload(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected pod %s after reload", podUID)
 	}
-	if got.ServiceAccount != "coding-sa" || got.SandboxClaimName != "claim-alpha" || got.ShareID != "11111111-1111-1111-1111-111111111111" {
+	if got.ServiceAccount != "coding-sa" || got.ShareID != "11111111-1111-1111-1111-111111111111" {
 		t.Fatalf("identity/shareID lost after reload: %+v", got)
 	}
 	if got.Parameters.PolicyEnforcementPoint == nil || got.Parameters.PolicyEnforcementPoint.URL != "https://portal.sandbox-system.svc:8443" {

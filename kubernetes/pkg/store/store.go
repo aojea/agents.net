@@ -43,25 +43,22 @@ type SocketPaths struct {
 
 // PodConfig holds the checkpointed plumbing state for one sandbox Pod on this node.
 type PodConfig struct {
-	PodUID           types.UID                  `json:"podUID"`
-	PodName          string                     `json:"podName,omitempty"`
-	PodNamespace     string                     `json:"podNamespace,omitempty"`
-	ServiceAccount   string                     `json:"serviceAccount,omitempty"`
-	SandboxName      string                     `json:"sandboxName,omitempty"`
-	ClaimUID         types.UID                  `json:"claimUID"`
-	ClaimNamespace   string                     `json:"claimNamespace"`
-	ClaimName        string                     `json:"claimName"`
-	SandboxClaimUID  string                     `json:"sandboxClaimUID,omitempty"`
-	SandboxClaimName string                     `json:"sandboxClaimName,omitempty"`
-	DeviceName       string                     `json:"deviceName"`
-	PoolName         string                     `json:"poolName"`
-	ShareID          string                     `json:"shareID,omitempty"`
-	SandboxID        string                     `json:"sandboxID,omitempty"`
-	NetNS            string                     `json:"netNS,omitempty"`
-	Parameters       params.NetworkParameters   `json:"parameters"`
-	SocketPaths      SocketPaths                `json:"socketPaths"`
-	CABundle         catrust.MaterializedBundle `json:"caBundle,omitzero"`
-	LastNRIActivity  time.Time                  `json:"lastNRIActivity,omitzero"`
+	PodUID          types.UID                  `json:"podUID"`
+	PodName         string                     `json:"podName,omitempty"`
+	PodNamespace    string                     `json:"podNamespace,omitempty"`
+	ServiceAccount  string                     `json:"serviceAccount,omitempty"`
+	ClaimUID        types.UID                  `json:"claimUID"`
+	ClaimNamespace  string                     `json:"claimNamespace"`
+	ClaimName       string                     `json:"claimName"`
+	DeviceName      string                     `json:"deviceName"`
+	PoolName        string                     `json:"poolName"`
+	ShareID         string                     `json:"shareID,omitempty"`
+	SandboxID       string                     `json:"sandboxID,omitempty"`
+	NetNS           string                     `json:"netNS,omitempty"`
+	Parameters      params.NetworkParameters   `json:"parameters"`
+	SocketPaths     SocketPaths                `json:"socketPaths"`
+	CABundle        catrust.MaterializedBundle `json:"caBundle,omitzero"`
+	LastNRIActivity time.Time                  `json:"lastNRIActivity,omitzero"`
 }
 
 // Backend abstracts persistent checkpoint storage (BoltDB on tmpfs in production, nil in memory-only tests).
@@ -207,8 +204,8 @@ func (s *PodConfigStore) UpdateSandbox(podUID types.UID, sandboxID, netNS string
 	return nil
 }
 
-// UpdateIdentity refreshes the attested Pod/Sandbox/Claim metadata for podUID.
-func (s *PodConfigStore) UpdateIdentity(podUID types.UID, podName, podNamespace, sa, sandboxName, claimUID, claimName string) error {
+// UpdateIdentity refreshes the attested Pod metadata for podUID.
+func (s *PodConfigStore) UpdateIdentity(podUID types.UID, podName, podNamespace, sa string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	cfg, ok := s.byPod[podUID]
@@ -224,11 +221,6 @@ func (s *PodConfigStore) UpdateIdentity(podUID types.UID, podName, podNamespace,
 	if sa != "" {
 		cfg.ServiceAccount = sa
 	}
-	if sandboxName != "" {
-		cfg.SandboxName = sandboxName
-	}
-	cfg.SandboxClaimUID = claimUID
-	cfg.SandboxClaimName = claimName
 	if err := s.persistLocked(podUID, cfg); err != nil {
 		return err
 	}
@@ -326,12 +318,6 @@ func clonePodConfig(cfg PodConfig) PodConfig {
 	}
 	if cfg.Parameters.Custom != nil {
 		out.Parameters.Custom = maps.Clone(cfg.Parameters.Custom)
-	}
-	if cfg.Parameters.Opaque != nil {
-		out.Parameters.Opaque = make(map[string]json.RawMessage, len(cfg.Parameters.Opaque))
-		for k, v := range cfg.Parameters.Opaque {
-			out.Parameters.Opaque[k] = slices.Clone(v)
-		}
 	}
 	return out
 }

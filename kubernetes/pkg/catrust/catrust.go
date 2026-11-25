@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package catrust resolves declarative CA certificate sources (ConfigMap, Secret,
-// Kubernetes ClusterTrustBundle, HostPath) following Kubernetes, cert-manager,
-// trust-manager, and Gateway API conventions, materializes per-Pod PEM bundles
+// Package catrust resolves declarative CA certificate sources (ConfigMap,
+// Kubernetes ClusterTrustBundle, HostPath), materializes per-Pod PEM bundles
 // (merged system roots + custom CAs, and custom-only CAs for additive runtimes),
 // and computes the agents.net and multi-language TLS trust environment variables.
 package catrust
@@ -235,27 +234,6 @@ func loadSource(ctx context.Context, kubeClient kubernetes.Interface, src apis.C
 			return nil, fmt.Errorf("ConfigMap %s/%s missing non-empty key %q", namespace, cm.Name, key)
 		}
 		return []byte(val), nil
-
-	case apis.CASourceTypeSecret:
-		if src.SecretRef == nil || src.SecretRef.Name == "" {
-			return nil, errors.New("secretRef.name is required")
-		}
-		if kubeClient == nil {
-			return nil, errors.New("kubernetes client is required to read Secret CA source")
-		}
-		sec, err := kubeClient.CoreV1().Secrets(namespace).Get(ctx, src.SecretRef.Name, metav1.GetOptions{})
-		if err != nil {
-			return nil, fmt.Errorf("get Secret %s/%s: %w", namespace, src.SecretRef.Name, err)
-		}
-		key := src.SecretRef.Key
-		if key == "" {
-			key = "ca.crt"
-		}
-		val, ok := sec.Data[key]
-		if !ok || len(bytes.TrimSpace(val)) == 0 {
-			return nil, fmt.Errorf("secret %s/%s missing non-empty key %q", namespace, sec.Name, key)
-		}
-		return val, nil
 
 	case apis.CASourceTypeClusterTrustBundle:
 		if src.ClusterTrustBundle == nil {

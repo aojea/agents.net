@@ -144,7 +144,6 @@ func main() {
 	proxy := flag.String("proxy", "unix:///tmp/boundary.sock", "boundary address (unix:///path or tcp://host:port)")
 	udp := flag.Bool("udp", false, "tunnel UDP sessions via connect-udp (DNS is always answered locally)")
 	dnsTTL := flag.Duration("dns-ttl", tun2connect.DefaultTTL, "TTL on synthetic DNS answers, in whole seconds (0 asks clients not to cache)")
-	sandboxID := flag.String("sandbox-id", "", "value for the Sandbox-Id header on every tunnel request")
 	flag.Parse()
 	dns := virtualDNS(*dnsTTL)
 
@@ -161,9 +160,6 @@ func main() {
 		log.Fatalf("link endpoint: %v", err)
 	}
 	client := &tun2connect.BoundaryClient{DialBoundary: dial}
-	if *sandboxID != "" {
-		client.Header = map[string][]string{"Sandbox-Id": {*sandboxID}}
-	}
 	eng, err := tun2connect.New(tun2connect.Config{
 		Device:    dev,
 		Dialer:    client,

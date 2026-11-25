@@ -75,12 +75,11 @@ type AuditRecord struct {
 }
 
 // ListenerConfig configures a single Pod's agents.net egress UDS listener and its
-// authenticated Policy Enforcement Point (PEP) forwarding channel.
+// mTLS Policy Enforcement Point (PEP) forwarding channel.
 type ListenerConfig struct {
 	Identity               auth.WorkloadIdentity
 	PolicyEnforcementPoint *apis.PolicyEnforcementPointConfig
 	PodCertVolumeName      string
-	SATokenVolumeName      string
 	HasIngress             bool
 	MaxConnections         int
 	IdleTimeoutSeconds     int
@@ -227,14 +226,13 @@ func (m *Manager) EnsureListener(ctx context.Context, podUID types.UID, cfg List
 	m.mu.Unlock()
 
 	var dialer *upstreamDialer
-	authMode := auth.AuthModeNone
+	authMode := "none"
 	if cfg.PolicyEnforcementPoint != nil && cfg.PolicyEnforcementPoint.URL != "" {
 		clientCfg, err := m.authRes.Resolve(ctx, auth.ResolveRequest{
 			PolicyEnforcementPoint: cfg.PolicyEnforcementPoint,
 			PodNamespace:           cfg.Identity.Namespace,
 			PodUID:                 podUID,
 			PodCertVolumeName:      cfg.PodCertVolumeName,
-			SATokenVolumeName:      cfg.SATokenVolumeName,
 		})
 		if err != nil {
 			return store.SocketPaths{}, fmt.Errorf("resolve PEP auth for pod %s: %w", podUID, err)
@@ -759,7 +757,7 @@ func (l *sandboxListener) serveConn(conn net.Conn) {
 		}
 		klog.ErrorS(err, "upstream tunnel dial failed",
 			"podUID", l.podUID,
-			"sandbox", id.Namespace+"/"+id.SandboxName,
+			"sandbox", id.Namespace+"/"+id.PodName,
 			"target", target,
 			"upstream", l.dialer.target.address,
 			"authMode", l.authMode,
@@ -814,9 +812,7 @@ func (l *sandboxListener) emitAudit(rec AuditRecord) {
 	id := l.snapshotIdentity()
 	rec.PodUID = string(l.podUID)
 	rec.AuthMode = l.authMode
-	if id.Namespace != "" && id.SandboxName != "" {
-		rec.Sandbox = id.Namespace + "/" + id.SandboxName
-	} else if id.Namespace != "" && id.PodName != "" {
+	if id.Namespace != "" && id.PodName != "" {
 		rec.Sandbox = id.Namespace + "/" + id.PodName
 	}
 	l.manager.emitAudit(rec)

@@ -8,6 +8,7 @@ package main
 
 import (
 	"bufio"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -75,7 +76,6 @@ func runLauncher(args []string) {
 	ingress := fs.String("ingress-socket", "", "serve the ingress channel (HTTP CONNECT 127.0.0.1:<port> or [::1]:<port>) on this Unix socket path or vsock://PORT; requires -ingress-port")
 	ingressPorts := fs.String("ingress-port", "", "comma-separated ports or ranges ingress streams may be joined to, e.g. 8081 or 443,8000-9000 (1-65535); nothing else is reachable")
 	joinTarget := fs.String("ingress-target", ingressTargetLoopback, "where ingress streams are joined: \"loopback\" (the requested loopback address) or \"tun\" (the device's own address, so services listening only on loopback stay unreachable)")
-	sandboxID := fs.String("sandbox-id", "", "value for the Sandbox-Id header on every tunnel request")
 	fs.Usage = runUsage(fs)
 	fs.Parse(args)
 	boundary, argv, ok := parseRunArgs(fs.Args())
@@ -92,17 +92,19 @@ func runLauncher(args []string) {
 	}
 	dns := virtualDNS(*dnsTTL)
 
-	// Refuse to start if the namespace has any interface besides loopback:
-	// a half-configured sandbox must be a startup error, not a second route.
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		log.Fatalf("listing interfaces: %v", err)
-	}
-	for _, ifc := range ifaces {
-		if ifc.Flags&net.FlagLoopback != 0 || ifc.Name == *device {
-			continue
+	// Refuse to start if the namespace has any interface besides loopback,
+	// unless the runtime explicitly marks CNI-compat isolation (AGENTS_NET_COMPAT_ISOLATED=1).
+	if os.Getenv("AGENTS_NET_COMPAT_ISOLATED") != "1" {
+		ifaces, err := net.Interfaces()
+		if err != nil {
+			log.Fatalf("listing interfaces: %v", err)
 		}
-		log.Fatalf("refusing to start: unexpected interface %q (the sandbox must have loopback only)", ifc.Name)
+		for _, ifc := range ifaces {
+			if ifc.Flags&net.FlagLoopback != 0 || ifc.Name == *device {
+				continue
+			}
+			log.Fatalf("refusing to start: unexpected interface %q (the sandbox must have loopback only)", ifc.Name)
+		}
 	}
 
 	dial, err := boundaryDialer(boundary)
@@ -133,9 +135,6 @@ func runLauncher(args []string) {
 		log.Fatalf("link endpoint: %v", err)
 	}
 	client := &tun2connect.BoundaryClient{DialBoundary: dial}
-	if *sandboxID != "" {
-		client.Header = map[string][]string{"Sandbox-Id": {*sandboxID}}
-	}
 	eng, err := tun2connect.New(tun2connect.Config{
 		Device:    dev,
 		Dialer:    client,
@@ -400,7 +399,11 @@ func serveIngress(ln net.Listener, pinned *portSet, viaTUN bool) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			return
+			if errors.Is(err, net.ErrClosed) {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+			continue
 		}
 		go func(conn net.Conn) {
 			defer conn.Close()

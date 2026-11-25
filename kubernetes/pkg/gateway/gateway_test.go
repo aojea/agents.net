@@ -15,8 +15,15 @@
 package gateway
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -35,7 +42,72 @@ import (
 	"github.com/aojea/agents.net/kubernetes/pkg/store"
 )
 
-func makeStatusClaim(ns, claimName, podName, podUID, endpoint string, ready metav1.ConditionStatus, ports []apis.IngressPort) *resourceapi.ResourceClaim {
+func makeBridgeMTLSConfigs(t *testing.T) (serverTLS, clientTLS *tls.Config) {
+	t.Helper()
+	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("gen CA key: %v", err)
+	}
+	caTmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-bridge-ca"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTmpl, caTmpl, &caKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatalf("create CA cert: %v", err)
+	}
+	caCert, _ := x509.ParseCertificate(caDER)
+	caPool := x509.NewCertPool()
+	caPool.AddCert(caCert)
+
+	issue := func(cn string, isServer bool) tls.Certificate {
+		k, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		serial, _ := rand.Int(rand.Reader, big.NewInt(1<<60))
+		tmpl := &x509.Certificate{
+			SerialNumber: serial,
+			Subject:      pkix.Name{CommonName: cn},
+			NotBefore:    time.Now().Add(-time.Hour),
+			NotAfter:     time.Now().Add(24 * time.Hour),
+			KeyUsage:     x509.KeyUsageDigitalSignature,
+			DNSNames:     []string{cn},
+			IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		}
+		if isServer {
+			tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+		} else {
+			tmpl.ExtKeyUsage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, caCert, &k.PublicKey, caKey)
+		if err != nil {
+			t.Fatalf("create leaf cert: %v", err)
+		}
+		return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: k}
+	}
+
+	srvCert := issue("dra-agents-net.local", true)
+	cliCert := issue("agents-net-ingress-gateway", false)
+
+	serverTLS = &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{srvCert},
+		ClientCAs:    caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+	}
+	clientTLS = &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{cliCert},
+		RootCAs:      caPool,
+		ServerName:   "dra-agents-net.local",
+	}
+	return serverTLS, clientTLS
+}
+
+func makeStatusClaim(ns, claimName, podName, podUID, endpoint string, useTLS bool, ready metav1.ConditionStatus, ports []apis.IngressPort) *resourceapi.ResourceClaim {
 	devStatus := apis.DeviceStatus{
 		APIVersion: apis.DeviceStatusAPIVersion,
 		Kind:       apis.DeviceStatusKind,
@@ -45,10 +117,12 @@ func makeStatusClaim(ns, claimName, podName, podUID, endpoint string, ready meta
 	}
 	if len(ports) > 0 && endpoint != "" {
 		devStatus.Ingress = &apis.IngressStatus{
-			Endpoint: endpoint,
-			Protocol: apis.IngressTunnelProtocolHTTPConnect,
-			Target:   podUID,
-			Ports:    ports,
+			Endpoint:   endpoint,
+			Protocol:   apis.IngressTunnelProtocolHTTPConnect,
+			Target:     podUID,
+			TLS:        useTLS,
+			ServerName: "dra-agents-net.local",
+			Ports:      ports,
 		}
 	}
 	raw, _ := json.Marshal(devStatus)
@@ -80,7 +154,9 @@ func makeStatusClaim(ns, claimName, podName, podUID, endpoint string, ready meta
 	}
 }
 
-func TestGatewayDiscoversFromResourceClaimAndProxiesThroughIngressBridge(t *testing.T) {
+func TestGatewayDiscoversFromResourceClaimAndProxiesThroughMTLSBridge(t *testing.T) {
+	srvTLS, cliTLS := makeBridgeMTLSConfigs(t)
+
 	// 1. Start a local HTTP server standing in for the isolated Pod's loopback service.
 	podApp := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get(HeaderPod) != "" {
@@ -91,7 +167,7 @@ func TestGatewayDiscoversFromResourceClaimAndProxiesThroughIngressBridge(t *test
 	defer podApp.Close()
 	podAppAddr := strings.TrimPrefix(podApp.URL, "http://")
 
-	// 2. Start a real dra-agents-net ingress.Server whose dialNetNS connects to podApp.
+	// 2. Start a real mTLS dra-agents-net ingress.Server whose dialNetNS connects to podApp.
 	st, err := store.New(nil)
 	if err != nil {
 		t.Fatalf("store.New: %v", err)
@@ -115,6 +191,7 @@ func TestGatewayDiscoversFromResourceClaimAndProxiesThroughIngressBridge(t *test
 	bridgeSrv, err := ingress.NewServer(ingress.Config{
 		ListenAddr: "127.0.0.1:0",
 		Store:      st,
+		TLSConfig:  srvTLS,
 		DialNetNS: func(_, _, _ string, timeout time.Duration) (net.Conn, error) {
 			return net.DialTimeout("tcp", podAppAddr, timeout)
 		},
@@ -128,22 +205,27 @@ func TestGatewayDiscoversFromResourceClaimAndProxiesThroughIngressBridge(t *test
 	}
 	defer func() { _ = bridgeSrv.Close() }()
 
-	// 3. Populate Registry from a ResourceClaim carrying Option 3 DeviceStatus.Ingress.
+	// 3. Verify NewHandler requires mTLS by default.
 	reg := NewRegistry(apis.DriverName)
-	claim := makeStatusClaim("demo", "web-agent-agents-net", "web-agent", podUID, bridgeAddr.String(), metav1.ConditionTrue, []apis.IngressPort{
+	if _, err := NewHandler(Config{Registry: reg, AuditWriter: io.Discard}); err == nil {
+		t.Fatal("expected NewHandler without TLSConfig to fail closed")
+	}
+
+	claim := makeStatusClaim("demo", "web-agent-agents-net", "web-agent", podUID, bridgeAddr.String(), true, metav1.ConditionTrue, []apis.IngressPort{
 		{Port: 8080, Protocol: apis.IngressProtocolTCP},
 		{Port: 9000, EndPort: 9005, Protocol: apis.IngressProtocolTCP},
 	})
 	reg.SyncClaim(claim)
 
-	h, err := NewHandler(Config{Registry: reg, AuditWriter: io.Discard})
+	h, err := NewHandler(Config{Registry: reg, TLSConfig: cliTLS, AuditWriter: io.Discard})
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
+	defer h.Close()
 	gwSrv := httptest.NewServer(h)
 	defer gwSrv.Close()
 
-	// 4. Path-routed request reaches the Pod via CONNECT <podUID>:8080.
+	// 4. Path-routed request reaches the Pod via mTLS CONNECT <podUID>:8080.
 	resp, err := http.Get(gwSrv.URL + "/agents/demo/web-agent/hello/world")
 	if err != nil {
 		t.Fatalf("GET path route: %v", err)
@@ -189,8 +271,22 @@ func TestGatewayDiscoversFromResourceClaimAndProxiesThroughIngressBridge(t *test
 		t.Fatalf("unpinned port status = %d Proxy-Status=%q, want 403 port-not-permitted", resp.StatusCode, resp.Header.Get("Proxy-Status"))
 	}
 
+	// 6b. Plaintext downgrade attempt (tls: false in ResourceClaim status) MUST be rejected.
+	downgraded := makeStatusClaim("demo", "plain-claim", "plain-agent", "22222222-2222-2222-2222-222222222222", bridgeAddr.String(), false, metav1.ConditionTrue, []apis.IngressPort{
+		{Port: 8080, Protocol: apis.IngressProtocolTCP},
+	})
+	reg.SyncClaim(downgraded)
+	resp, err = http.Get(gwSrv.URL + "/agents/demo/plain-agent/nope")
+	if err != nil {
+		t.Fatalf("GET downgraded claim: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway || !strings.Contains(resp.Header.Get("Proxy-Status"), "reason=bridge-tls-required") {
+		t.Fatalf("downgraded claim status = %d Proxy-Status=%q, want 502 bridge-tls-required", resp.StatusCode, resp.Header.Get("Proxy-Status"))
+	}
+
 	// 7. Revoking Ready=False on the ResourceClaim immediately evicts the route (404 + Proxy-Status).
-	revoked := makeStatusClaim("demo", "web-agent-agents-net", "web-agent", podUID, "", metav1.ConditionFalse, nil)
+	revoked := makeStatusClaim("demo", "web-agent-agents-net", "web-agent", podUID, "", true, metav1.ConditionFalse, nil)
 	reg.SyncClaim(revoked)
 
 	resp, err = http.Get(gwSrv.URL + "/agents/demo/web-agent/after-revoke")
