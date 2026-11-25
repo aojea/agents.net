@@ -40,6 +40,7 @@ import (
 	"k8s.io/klog/v2"
 
 	"github.com/aojea/agents.net/kubernetes/pkg/apis"
+	"github.com/aojea/agents.net/kubernetes/pkg/auth"
 	"github.com/aojea/agents.net/kubernetes/pkg/metrics"
 	"github.com/aojea/agents.net/kubernetes/pkg/socketat"
 	"github.com/aojea/agents.net/kubernetes/pkg/store"
@@ -351,10 +352,10 @@ func (s *Server) serveConn(conn net.Conn) {
 var errPodNotReady = errors.New("sandbox network namespace not ready")
 
 func (s *Server) dialPod(ctx context.Context, cfg store.PodConfig, port int32) (net.Conn, error) {
-	// Only dial agents.net ingress.sock in TunSidecar / TunVM modes, and verify via Lstat
+	// Only dial agents.net ingress.sock in TunSidecar mode, and verify via Lstat
 	// that the path is a real Unix domain socket (never a container-planted symlink).
 	mode := cfg.Parameters.EffectiveAdapterMode()
-	if mode == apis.AdapterModeTunSidecar || mode == apis.AdapterModeTunVM {
+	if mode == apis.AdapterModeTunSidecar {
 		if sock := cfg.SocketPaths.IngressSocketPath; sock != "" {
 			info, err := os.Lstat(sock)
 			if err == nil {
@@ -549,6 +550,9 @@ func readConnectHead(br *bufio.Reader) (types.UID, int32, int, string) {
 
 	rawUID, rawPort, err := net.SplitHostPort(target)
 	if err != nil || rawUID == "" || rawPort == "" {
+		return "", 0, http.StatusBadRequest, "malformed-authority"
+	}
+	if err := auth.ValidatePodUID(types.UID(rawUID)); err != nil {
 		return "", 0, http.StatusBadRequest, "malformed-authority"
 	}
 	portNum, err := strconv.ParseInt(rawPort, 10, 32)

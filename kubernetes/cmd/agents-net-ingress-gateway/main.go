@@ -14,8 +14,9 @@
 
 // Command agents-net-ingress-gateway is a stateless Kubernetes ingress gateway
 // for dra.agents.net. Place it behind a LoadBalancer Service, Kubernetes Ingress,
-// or Gateway API HTTTPRoute to attract inbound traffic and deliver it to isolated
-// Pods discovered via ResourceClaim.status.devices[].data.
+// or Gateway API HTTTPRoute to attract inbound traffic and deliver it over
+// mandatory mTLS HTTP CONNECT tunnels to isolated Pods discovered via
+// ResourceClaim.status.devices[].data.
 package main
 
 import (
@@ -28,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -57,9 +59,9 @@ func main() {
 	flag.StringVar(&kubeconfig, "kubeconfig", "", "Path to kubeconfig (defaults to in-cluster config)")
 	flag.StringVar(&listenAddr, "listen-addr", ":8080", "HTTP listen address for inbound ingress requests and /healthz")
 	flag.StringVar(&driverName, "driver-name", apis.DriverName, "DRA driver name to read from ResourceClaim.status.devices")
-	flag.StringVar(&bridgeCA, "bridge-ca", "", "Optional PEM CA certificate path for verifying node ingress bridge TLS")
-	flag.StringVar(&bridgeClientCert, "bridge-client-cert", "", "Optional PEM client certificate path for mTLS to node ingress bridges")
-	flag.StringVar(&bridgeClientKey, "bridge-client-key", "", "Optional PEM client private key path for mTLS to node ingress bridges")
+	flag.StringVar(&bridgeCA, "bridge-ca", "", "PEM CA certificate path for verifying node ingress bridge TLS (required)")
+	flag.StringVar(&bridgeClientCert, "bridge-client-cert", "", "PEM client certificate path for mandatory mTLS to node ingress bridges (required)")
+	flag.StringVar(&bridgeClientKey, "bridge-client-key", "", "PEM client private key path for mandatory mTLS to node ingress bridges (required)")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -74,9 +76,9 @@ func main() {
 		klog.Fatalf("create kubernetes client: %v", err)
 	}
 
-	tlsCfg, err := buildBridgeTLSConfig(bridgeCA, bridgeClientCert, bridgeClientKey)
+	tlsCfg, err := buildBridgeMTLSConfig(bridgeCA, bridgeClientCert, bridgeClientKey)
 	if err != nil {
-		klog.Fatalf("configure bridge TLS: %v", err)
+		klog.Fatalf("configure mandatory bridge mTLS: %v", err)
 	}
 
 	reg := gateway.NewRegistry(driverName)
@@ -114,6 +116,7 @@ func main() {
 	if err != nil {
 		klog.Fatalf("create gateway handler: %v", err)
 	}
+	defer handler.Close()
 
 	srv := &http.Server{
 		Addr:              listenAddr,
@@ -149,31 +152,128 @@ func loadRestConfig(kubeconfig string) (*rest.Config, error) {
 	return rest.InClusterConfig()
 }
 
-func buildBridgeTLSConfig(caPath, certPath, keyPath string) (*tls.Config, error) {
-	if caPath == "" && certPath == "" && keyPath == "" {
-		return nil, nil
+type tlsFileStamp struct {
+	mtime time.Time
+	size  int64
+	ino   uint64
+}
+
+func statTLSFile(path string) (tlsFileStamp, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return tlsFileStamp{}, err
 	}
-	if (certPath == "") != (keyPath == "") {
-		return nil, errors.New("--bridge-client-cert and --bridge-client-key must be set together")
+	st := tlsFileStamp{mtime: info.ModTime(), size: info.Size()}
+	if sys, ok := info.Sys().(*syscall.Stat_t); ok && sys != nil {
+		st.ino = sys.Ino
 	}
-	cfg := &tls.Config{MinVersion: tls.VersionTLS12}
-	if caPath != "" {
-		pemBytes, err := os.ReadFile(caPath)
-		if err != nil {
-			return nil, fmt.Errorf("read bridge CA %q: %w", caPath, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pemBytes) {
-			return nil, fmt.Errorf("no valid CA certificates in %q", caPath)
-		}
-		cfg.RootCAs = pool
+	return st, nil
+}
+
+type rotatingBridgeTLS struct {
+	caFile   string
+	certFile string
+	keyFile  string
+
+	mu        sync.Mutex
+	cert      *tls.Certificate
+	certStamp tlsFileStamp
+	keyStamp  tlsFileStamp
+	caPool    *x509.CertPool
+	caStamp   tlsFileStamp
+}
+
+func (r *rotatingBridgeTLS) getClientCertificate(_ *tls.CertificateRequestInfo) (*tls.Certificate, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	cStamp, err := statTLSFile(r.certFile)
+	if err != nil {
+		return nil, fmt.Errorf("stat bridge client cert %q: %w", r.certFile, err)
 	}
-	if certPath != "" {
-		cert, err := tls.LoadX509KeyPair(certPath, keyPath)
-		if err != nil {
-			return nil, fmt.Errorf("load bridge client cert/key: %w", err)
-		}
-		cfg.Certificates = []tls.Certificate{cert}
+	kStamp, err := statTLSFile(r.keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("stat bridge client key %q: %w", r.keyFile, err)
 	}
-	return cfg, nil
+	if r.cert != nil && cStamp == r.certStamp && kStamp == r.keyStamp {
+		return r.cert, nil
+	}
+	pair, err := tls.LoadX509KeyPair(r.certFile, r.keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("load bridge client keypair: %w", err)
+	}
+	r.cert = &pair
+	r.certStamp = cStamp
+	r.keyStamp = kStamp
+	return r.cert, nil
+}
+
+func (r *rotatingBridgeTLS) loadCAPool() (*x509.CertPool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st, err := statTLSFile(r.caFile)
+	if err != nil {
+		return nil, fmt.Errorf("stat bridge CA %q: %w", r.caFile, err)
+	}
+	if r.caPool != nil && st == r.caStamp {
+		return r.caPool, nil
+	}
+	pemBytes, err := os.ReadFile(r.caFile)
+	if err != nil {
+		return nil, fmt.Errorf("read bridge CA %q: %w", r.caFile, err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemBytes) {
+		return nil, fmt.Errorf("no valid CA certificates in %q", r.caFile)
+	}
+	r.caPool = pool
+	r.caStamp = st
+	return r.caPool, nil
+}
+
+func (r *rotatingBridgeTLS) verifyServerConnection(cs tls.ConnectionState) error {
+	if len(cs.PeerCertificates) == 0 {
+		return errors.New("ingress bridge presented no server certificate")
+	}
+	pool, err := r.loadCAPool()
+	if err != nil {
+		return err
+	}
+	intermediates := x509.NewCertPool()
+	for _, cert := range cs.PeerCertificates[1:] {
+		intermediates.AddCert(cert)
+	}
+	opts := x509.VerifyOptions{
+		DNSName:       cs.ServerName,
+		Roots:         pool,
+		Intermediates: intermediates,
+		KeyUsages:     []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	if _, err := cs.PeerCertificates[0].Verify(opts); err != nil {
+		return fmt.Errorf("verify ingress bridge certificate: %w", err)
+	}
+	return nil
+}
+
+func buildBridgeMTLSConfig(caPath, certPath, keyPath string) (*tls.Config, error) {
+	if caPath == "" || certPath == "" || keyPath == "" {
+		return nil, errors.New("--bridge-ca, --bridge-client-cert, and --bridge-client-key are all required (mTLS is mandatory)")
+	}
+	loader := &rotatingBridgeTLS{
+		caFile:   caPath,
+		certFile: certPath,
+		keyFile:  keyPath,
+	}
+	// Validate initial files eagerly at startup so broken paths fail fast.
+	if _, err := loader.loadCAPool(); err != nil {
+		return nil, err
+	}
+	if _, err := loader.getClientCertificate(nil); err != nil {
+		return nil, err
+	}
+	return &tls.Config{
+		MinVersion:           tls.VersionTLS12,
+		InsecureSkipVerify:   true, // Verified in VerifyConnection against hot-reloaded CA pool.
+		GetClientCertificate: loader.getClientCertificate,
+		VerifyConnection:     loader.verifyServerConnection,
+	}, nil
 }

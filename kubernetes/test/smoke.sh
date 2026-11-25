@@ -101,8 +101,11 @@ cleanup() {
     # Delete LoadBalancer Service first while cloud-provider-kind is still running so
     # it removes its Envoy LB container cleanly before we stop cloud-provider-kind.
     k -n "${NS}" delete svc agents-net-ingress-gateway --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    k delete deviceclass dra.agents.net-smoke --ignore-not-found >/dev/null 2>&1 || true
     k delete clusterrolebinding "${NS}-ingress-gateway" --ignore-not-found >/dev/null 2>&1 || true
     k delete clusterrole "${NS}-ingress-gateway" --ignore-not-found >/dev/null 2>&1 || true
+    k -n kube-system delete secret smoke-driver-client-tls smoke-bridge-tls --ignore-not-found >/dev/null 2>&1 || true
+    k -n kube-system delete configmap smoke-ca --ignore-not-found >/dev/null 2>&1 || true
     k delete namespace "${NS}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
     if [ -n "${CPK_PID}" ]; then
       sleep 2
@@ -163,17 +166,7 @@ if [ "${USE_CLOUD_PROVIDER_KIND}" = "true" ] || { [ "${USE_CLOUD_PROVIDER_KIND}"
   fi
 fi
 
-echo "=== 4. Install kubernetes/install.yaml into kube-system ==="
-sed "s|image: ghcr.io/aojea/agents.net/dra-agents-net:latest|image: ${DRIVER_IMAGE}|g" \
-  "${KUBE_DIR}/install.yaml" | k apply -f -
-if [ "${USE_EXISTING_CLUSTER}" = "true" ]; then
-  k -n kube-system rollout restart daemonset/dra-agents-net
-fi
-k -n kube-system rollout status daemonset/dra-agents-net --timeout=120s
-k get deviceclass dra.agents.net
-k get resourceslices --field-selector=spec.driver=dra.agents.net
-
-echo "=== 5. Generate ephemeral PKI for connect-proxy mTLS + echo HTTPS ==="
+echo "=== 4. Generate ephemeral PKI for mandatory mTLS (egress PEP + ingress bridge) ==="
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
   -keyout "${TMPDIR}/ca.key" -out "${TMPDIR}/ca.crt" -days 1 \
   -subj "/CN=agents-net-smoke-ca" \
@@ -196,15 +189,77 @@ EOF
     -out "${TMPDIR}/${name}.crt" -days 1 -extfile "${TMPDIR}/${name}.ext" 2>/dev/null
 }
 
+NODE_IP_ADDR="$(k get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
 gen_cert "pep" "connect-proxy.${NS}.svc.cluster.local" \
   "DNS:connect-proxy.${NS}.svc.cluster.local,DNS:connect-proxy.${NS}.svc,DNS:connect-proxy" \
   "serverAuth"
 gen_cert "client" "dra-agents-net-smoke-client" \
   "DNS:dra-agents-net-smoke-client" \
   "clientAuth"
+gen_cert "bridge" "dra-agents-net.kube-system.svc" \
+  "DNS:dra-agents-net.kube-system.svc,IP:${NODE_IP_ADDR}" \
+  "serverAuth"
+gen_cert "gateway-client" "agents-net-ingress-gateway" \
+  "DNS:agents-net-ingress-gateway" \
+  "clientAuth"
 gen_cert "echo" "echo.${NS}.svc.cluster.local" \
   "DNS:echo.${NS}.svc.cluster.local,DNS:echo.${NS}.svc" \
   "serverAuth"
+
+echo "=== 5. Install kubernetes/install.yaml into kube-system (with mounted mTLS certs) ==="
+k -n kube-system delete secret smoke-driver-client-tls smoke-bridge-tls --ignore-not-found >/dev/null 2>&1 || true
+k -n kube-system delete configmap smoke-ca --ignore-not-found >/dev/null 2>&1 || true
+k -n kube-system create configmap smoke-ca --from-file=ca.crt="${TMPDIR}/ca.crt"
+k -n kube-system create secret tls smoke-driver-client-tls --cert="${TMPDIR}/client.crt" --key="${TMPDIR}/client.key"
+k -n kube-system create secret tls smoke-bridge-tls --cert="${TMPDIR}/bridge.crt" --key="${TMPDIR}/bridge.key"
+
+sed "s|image: ghcr.io/aojea/agents.net/dra-agents-net:latest|image: ${DRIVER_IMAGE}|g" \
+  "${KUBE_DIR}/install.yaml" | k apply -f -
+
+# Mount node mTLS client cert (egress PEP) and mTLS bridge server cert/client CA (ingress)
+# directly onto the DaemonSet so dra-agents-net needs ZERO Kubernetes Secret RBAC.
+k -n kube-system patch daemonset dra-agents-net --type=strategic --patch '
+spec:
+  template:
+    spec:
+      containers:
+        - name: dra-agents-net
+          args:
+            - --driver-name=dra.agents.net
+            - --socket-root=/run/dra-agents-net/pods
+            - --checkpoint-path=/run/dra-agents-net/state.db
+            - --kubelet-root-dir=/var/lib/kubelet
+            - --metrics-addr=:9102
+            - --ingress-addr=:15080
+            - --ingress-tls-cert=/etc/dra-agents-net/ingress/tls.crt
+            - --ingress-tls-key=/etc/dra-agents-net/ingress/tls.key
+            - --ingress-client-ca=/etc/dra-agents-net/ca/ca.crt
+            - --ingress-allowed-client-san=agents-net-ingress-gateway
+            - --ingress-server-name=dra-agents-net.kube-system.svc
+          volumeMounts:
+            - name: smoke-client-tls
+              mountPath: /etc/dra-agents-net/client
+              readOnly: true
+            - name: smoke-bridge-tls
+              mountPath: /etc/dra-agents-net/ingress
+              readOnly: true
+            - name: smoke-ca
+              mountPath: /etc/dra-agents-net/ca
+              readOnly: true
+      volumes:
+        - name: smoke-client-tls
+          secret:
+            secretName: smoke-driver-client-tls
+        - name: smoke-bridge-tls
+          secret:
+            secretName: smoke-bridge-tls
+        - name: smoke-ca
+          configMap:
+            name: smoke-ca
+'
+k -n kube-system rollout status daemonset/dra-agents-net --timeout=120s
+k get deviceclass dra.agents.net
+k get resourceslices --field-selector=spec.driver=dra.agents.net
 
 echo "=== 6. Deploy echo target & agents.net reference connect-proxy PEP in ${NS} ==="
 k delete namespace "${NS}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
@@ -212,7 +267,7 @@ k create namespace "${NS}"
 
 k -n "${NS}" create configmap smoke-ca --from-file=ca.crt="${TMPDIR}/ca.crt"
 k -n "${NS}" create secret tls pep-tls --cert="${TMPDIR}/pep.crt" --key="${TMPDIR}/pep.key"
-k -n "${NS}" create secret tls driver-client-tls --cert="${TMPDIR}/client.crt" --key="${TMPDIR}/client.key"
+k -n "${NS}" create secret tls gateway-client-tls --cert="${TMPDIR}/gateway-client.crt" --key="${TMPDIR}/gateway-client.key"
 k -n "${NS}" create secret tls echo-tls --cert="${TMPDIR}/echo.crt" --key="${TMPDIR}/echo.key"
 
 cat <<EOF | k apply -f -
@@ -406,8 +461,41 @@ EOF
 k -n "${NS}" rollout status deployment/echo --timeout=90s
 k -n "${NS}" rollout status deployment/connect-proxy --timeout=90s
 
-echo "=== 7. Deploy ResourceClaimTemplate + isolated Pod (egress + pinned ingress :8080) ==="
+echo "=== 7. Deploy smoke DeviceClass (admin PEP + mTLS) + ResourceClaimTemplate + isolated Pod ==="
 cat <<EOF | k apply -f -
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: dra.agents.net-smoke
+spec:
+  selectors:
+    - cel:
+        expression: device.driver == "dra.agents.net"
+  config:
+    - opaque:
+        driver: dra.agents.net
+        parameters:
+          apiVersion: dra.agents.net/v1alpha1
+          kind: DriverConfig
+          confinementMode: NetworkPolicyDenyAll
+          nicBlockMode: DropAll
+          adapterMode: ExplicitProxy
+          proxy:
+            port: 15001
+          policyEnforcementPoint:
+            url: https://connect-proxy.${NS}.svc.cluster.local:8443
+            tls:
+              serverName: connect-proxy.${NS}.svc.cluster.local
+              caCertificateRefs:
+                - type: HostPath
+                  hostPath: /etc/dra-agents-net/ca/ca.crt
+            auth:
+              type: MTLS
+              mtls:
+                certDir: /etc/dra-agents-net/client
+          custom:
+            suite: smoke
+---
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
@@ -419,7 +507,7 @@ spec:
       requests:
         - name: agents-net
           exactly:
-            deviceClassName: dra.agents.net
+            deviceClassName: dra.agents.net-smoke
             allocationMode: ExactCount
             count: 1
       config:
@@ -429,21 +517,6 @@ spec:
             parameters:
               apiVersion: dra.agents.net/v1alpha1
               kind: DriverConfig
-              confinementMode: NetworkPolicyDenyAll
-              policyEnforcementPoint:
-                url: https://connect-proxy.${NS}.svc.cluster.local:8443
-                tls:
-                  serverName: connect-proxy.${NS}.svc.cluster.local
-                  caCertificateRefs:
-                    - type: ConfigMap
-                      configMapRef:
-                        name: smoke-ca
-                        key: ca.crt
-                auth:
-                  type: MTLS
-                  mtls:
-                    secretRef:
-                      name: driver-client-tls
               caTrust:
                 mode: InjectEnv
                 bundleMode: AppendSystemRoots
@@ -458,8 +531,6 @@ spec:
                 - port: 9000
                   endPort: 9002
                   protocol: TCP
-              custom:
-                suite: smoke
 ---
 apiVersion: v1
 kind: Pod
@@ -644,6 +715,8 @@ ing = data.get("ingress")
 assert ing is not None, f"missing ingress in DeviceStatus: {data}"
 assert ing["protocol"] == "http-connect", ing
 assert ing["target"] == pod_uid, ing
+assert ing["tls"] is True, ing
+assert ing.get("serverName") == "dra-agents-net.kube-system.svc", ing
 assert ing["endpoint"] and not ing["endpoint"].startswith(":"), ing
 assert any(p["port"] == 8080 and p["protocol"] == "TCP" for p in ing["ports"]), ing
 assert any(p["port"] == 9000 and p.get("endPort") == 9002 and p["protocol"] == "TCP" for p in ing["ports"]), ing
@@ -708,13 +781,30 @@ spec:
           imagePullPolicy: IfNotPresent
           args:
             - --listen-addr=:8080
+            - --bridge-ca=/ca/ca.crt
+            - --bridge-client-cert=/tls/tls.crt
+            - --bridge-client-key=/tls/tls.key
           ports:
             - containerPort: 8080
+          volumeMounts:
+            - name: ca
+              mountPath: /ca
+              readOnly: true
+            - name: tls
+              mountPath: /tls
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /healthz
               port: 8080
             periodSeconds: 2
+      volumes:
+        - name: ca
+          configMap:
+            name: smoke-ca
+        - name: tls
+          secret:
+            secretName: gateway-client-tls
 ---
 apiVersion: v1
 kind: Service
@@ -799,11 +889,25 @@ spec:
         - python3
         - -c
         - "import time; time.sleep(300)"
+      volumeMounts:
+        - name: ca
+          mountPath: /ca
+          readOnly: true
+        - name: tls
+          mountPath: /tls
+          readOnly: true
+  volumes:
+    - name: ca
+      configMap:
+        name: smoke-ca
+    - name: tls
+      secret:
+        secretName: gateway-client-tls
 EOF
 k -n "${NS}" wait --for=condition=Ready pod/ingress-caller --timeout=60s
 
 k -n "${NS}" exec -i ingress-caller -- env INGRESS_ENDPOINT="${INGRESS_ENDPOINT}" POD_UID="${POD_UID}" python3 - <<'PY'
-import os, socket
+import os, socket, ssl
 
 ep = os.environ["INGRESS_ENDPOINT"]
 pod_uid = os.environ["POD_UID"]
@@ -813,8 +917,21 @@ else:
     host, port = ep.rsplit(":", 1)
 port = int(port)
 
+# 0. Plaintext or non-mTLS client MUST be rejected by the mandatory mTLS bridge.
+raw = socket.create_connection((host, port), timeout=5)
+raw.settimeout(5)
+raw.sendall(f"CONNECT {pod_uid}:8080 HTTP/1.1\r\nHost: {pod_uid}:8080\r\n\r\n".encode())
+plain_resp = raw.recv(1024)
+raw.close()
+assert not plain_resp.startswith(b"HTTP/1.1 200"), f"plaintext client unexpectedly succeeded: {plain_resp!r}"
+print("PASS mandatory mTLS bridge rejected plaintext client")
+
+tls_ctx = ssl.create_default_context(cafile="/ca/ca.crt")
+tls_ctx.load_cert_chain("/tls/tls.crt", "/tls/tls.key")
+
 def connect_tunnel(target_port):
-    s = socket.create_connection((host, port), timeout=5)
+    raw_sock = socket.create_connection((host, port), timeout=5)
+    s = tls_ctx.wrap_socket(raw_sock, server_hostname="dra-agents-net.kube-system.svc")
     req = f"CONNECT {pod_uid}:{target_port} HTTP/1.1\r\nHost: {pod_uid}:{target_port}\r\n\r\n"
     s.sendall(req.encode())
     buf = b""
@@ -826,7 +943,7 @@ def connect_tunnel(target_port):
     head, rest = buf.split(b"\r\n\r\n", 1)
     return s, head.decode(), rest
 
-# 1. Pinned port 8080 must succeed and reach smoke-agent's loopback HTTP server
+# 1. Pinned port 8080 must succeed over mTLS and reach smoke-agent's loopback HTTP server
 s, head, rest = connect_tunnel(8080)
 assert head.startswith("HTTP/1.1 200"), f"expected 200 OK, got: {head!r}"
 s.sendall(b"GET /hello-ingress HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -839,9 +956,9 @@ while True:
 s.close()
 text = body.decode()
 assert "200 OK" in text and "smoke-ingress-ok:/hello-ingress" in text, f"unexpected ingress body: {text!r}"
-print("PASS direct node ingress bridge :8080 delivered HTTP 200:", text.splitlines()[-1])
+print("PASS direct mTLS node ingress bridge :8080 delivered HTTP 200:", text.splitlines()[-1])
 
-# 2. Pinned range port 9001 must succeed via direct node bridge too
+# 2. Pinned range port 9001 must succeed via direct mTLS node bridge too
 s, head, rest = connect_tunnel(9001)
 assert head.startswith("HTTP/1.1 200"), f"expected 200 OK on range port 9001, got: {head!r}"
 s.sendall(b"GET /hello-range HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
@@ -854,14 +971,14 @@ while True:
 s.close()
 text = body.decode()
 assert "200 OK" in text and "smoke-range-9001:/hello-range" in text, f"unexpected range ingress body: {text!r}"
-print("PASS direct node ingress bridge range port :9001 delivered HTTP 200:", text.splitlines()[-1])
+print("PASS direct mTLS node ingress bridge range port :9001 delivered HTTP 200:", text.splitlines()[-1])
 
 # 3. Unpinned port 9999 must be rejected with 403 + RFC 9209 Proxy-Status at the node bridge too
 s, head, _ = connect_tunnel(9999)
 s.close()
 assert head.startswith("HTTP/1.1 403") and "Proxy-Status:" in head and "port-not-permitted" in head, f"expected 403 with Proxy-Status port-not-permitted, got: {head!r}"
 assert "Boundary-Reason:" not in head, f"unexpected legacy Boundary-Reason header: {head!r}"
-print("PASS direct node ingress bridge unpinned port :9999 rejected:", head.splitlines()[0])
+print("PASS direct mTLS node ingress bridge unpinned port :9999 rejected:", head.splitlines()[0])
 PY
 
 echo "=== 12. Delete smoke-agent and verify ResourceClaim GC + immediate ingress revocation ==="
@@ -890,14 +1007,17 @@ if [ -n "${LB_IP}" ]; then
 fi
 
 k -n "${NS}" exec -i ingress-caller -- env INGRESS_ENDPOINT="${INGRESS_ENDPOINT}" POD_UID="${POD_UID}" python3 - <<'PY'
-import os, socket
+import os, socket, ssl
 ep = os.environ["INGRESS_ENDPOINT"]
 pod_uid = os.environ["POD_UID"]
 if ep.startswith("["):
     host, port = ep[1:].rsplit("]:", 1)
 else:
     host, port = ep.rsplit(":", 1)
-s = socket.create_connection((host, int(port)), timeout=5)
+tls_ctx = ssl.create_default_context(cafile="/ca/ca.crt")
+tls_ctx.load_cert_chain("/tls/tls.crt", "/tls/tls.key")
+raw_sock = socket.create_connection((host, int(port)), timeout=5)
+s = tls_ctx.wrap_socket(raw_sock, server_hostname="dra-agents-net.kube-system.svc")
 s.sendall(f"CONNECT {pod_uid}:8080 HTTP/1.1\r\nHost: {pod_uid}:8080\r\n\r\n".encode())
 resp = s.recv(4096).decode()
 s.close()

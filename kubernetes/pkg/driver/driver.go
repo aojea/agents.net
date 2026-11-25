@@ -52,6 +52,7 @@ import (
 	corev1listers "k8s.io/client-go/listers/core/v1"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/util/retry"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
@@ -596,9 +597,8 @@ func (d *Driver) lookupPod(namespace, name string) *corev1.Pod {
 	return pod
 }
 
-// SyncPod updates attested Pod/Sandbox/Claim metadata for a tracked Pod on this node.
-// When warm-pool adoption changes the owning SandboxClaim UID, existing pre-claim tunnels
-// are revoked immediately so subsequent connections carry the new claim identity.
+// SyncPod updates attested Pod metadata (name, namespace, ServiceAccount) for a
+// tracked Pod on this node from the node-scoped Pod informer.
 func (d *Driver) SyncPod(pod *corev1.Pod) {
 	if pod == nil {
 		return
@@ -607,25 +607,17 @@ func (d *Driver) SyncPod(pod *corev1.Pod) {
 	if !ok {
 		return
 	}
-	newClaimUID := pod.Labels[apis.ClaimUIDLabel]
-	newClaimName := pod.Annotations[apis.ClaimNameAnnotation]
-	sandboxName := resolveSandboxName(pod)
-
-	claimChanged := cfg.SandboxClaimUID != newClaimUID && newClaimUID != ""
 	metaChanged := cfg.PodName != pod.Name ||
 		cfg.PodNamespace != pod.Namespace ||
-		cfg.ServiceAccount != pod.Spec.ServiceAccountName ||
-		cfg.SandboxName != sandboxName ||
-		cfg.SandboxClaimUID != newClaimUID ||
-		cfg.SandboxClaimName != newClaimName
+		cfg.ServiceAccount != pod.Spec.ServiceAccountName
 
 	if !metaChanged {
 		return
 	}
-	if err := d.store.UpdateIdentity(pod.UID, pod.Name, pod.Namespace, pod.Spec.ServiceAccountName, sandboxName, newClaimUID, newClaimName); err != nil {
+	if err := d.store.UpdateIdentity(pod.UID, pod.Name, pod.Namespace, pod.Spec.ServiceAccountName); err != nil {
 		klog.ErrorS(err, "failed to checkpoint updated Pod identity", "podUID", pod.UID)
 	}
-	d.tunnel.UpdateIdentity(pod.UID, d.buildWorkloadIdentity(pod.UID, pod.Name, pod.Namespace, pod.Spec.ServiceAccountName, sandboxName, newClaimUID, newClaimName, cfg.Parameters.Custom), claimChanged)
+	d.tunnel.UpdateIdentity(pod.UID, d.buildWorkloadIdentity(pod.UID, cfg.SandboxID, pod.Name, pod.Namespace, pod.Spec.ServiceAccountName, cfg.Parameters.Custom), false)
 }
 
 // resolveNodeInfo discovers the node's consumable sandbox capacity and routable IP
@@ -853,31 +845,17 @@ func (d *Driver) prepareResourceClaim(ctx context.Context, claim *resourceapi.Re
 
 	existing, existed := d.store.Get(podUID)
 	serviceAccount := existing.ServiceAccount
-	sandboxName := existing.SandboxName
-	sandboxClaimUID := existing.SandboxClaimUID
-	sandboxClaimName := existing.SandboxClaimName
-	if sandboxName == "" {
-		sandboxName = reserved.Name
-	}
 	if podObj := d.lookupPod(claim.Namespace, reserved.Name); podObj != nil && podObj.UID == podUID {
 		if podObj.Spec.ServiceAccountName != "" {
 			serviceAccount = podObj.Spec.ServiceAccountName
 		}
-		sandboxName = resolveSandboxName(podObj)
-		if v := podObj.Labels[apis.ClaimUIDLabel]; v != "" {
-			sandboxClaimUID = v
-		}
-		if v := podObj.Annotations[apis.ClaimNameAnnotation]; v != "" {
-			sandboxClaimName = v
-		}
 	}
 
-	identity := d.buildWorkloadIdentity(podUID, reserved.Name, claim.Namespace, serviceAccount, sandboxName, sandboxClaimUID, sandboxClaimName, netParams.Custom)
+	identity := d.buildWorkloadIdentity(podUID, existing.SandboxID, reserved.Name, claim.Namespace, serviceAccount, netParams.Custom)
 	paths, err := d.tunnel.EnsureListener(ctx, podUID, tunnel.ListenerConfig{
 		Identity:               identity,
 		PolicyEnforcementPoint: netParams.PolicyEnforcementPoint,
 		PodCertVolumeName:      netParams.PodCertVolumeName,
-		SATokenVolumeName:      netParams.SATokenVolumeName,
 		HasIngress:             len(netParams.IngressPorts) > 0,
 		MaxConnections:         int(*netParams.MaxConnections),
 		IdleTimeoutSeconds:     int(*netParams.IdleTimeoutSeconds),
@@ -899,25 +877,22 @@ func (d *Driver) prepareResourceClaim(ctx context.Context, claim *resourceapi.Re
 		shareID = string(*matchedResult.ShareID)
 	}
 	podCfg := store.PodConfig{
-		PodUID:           podUID,
-		PodName:          reserved.Name,
-		PodNamespace:     claim.Namespace,
-		ServiceAccount:   serviceAccount,
-		SandboxName:      sandboxName,
-		ClaimUID:         claim.UID,
-		ClaimNamespace:   claim.Namespace,
-		ClaimName:        claim.Name,
-		SandboxClaimUID:  sandboxClaimUID,
-		SandboxClaimName: sandboxClaimName,
-		DeviceName:       matchedResult.Device,
-		PoolName:         matchedResult.Pool,
-		ShareID:          shareID,
-		SandboxID:        existing.SandboxID,
-		NetNS:            existing.NetNS,
-		Parameters:       netParams,
-		SocketPaths:      paths,
-		CABundle:         caBundle,
-		LastNRIActivity:  existing.LastNRIActivity,
+		PodUID:          podUID,
+		PodName:         reserved.Name,
+		PodNamespace:    claim.Namespace,
+		ServiceAccount:  serviceAccount,
+		ClaimUID:        claim.UID,
+		ClaimNamespace:  claim.Namespace,
+		ClaimName:       claim.Name,
+		DeviceName:      matchedResult.Device,
+		PoolName:        matchedResult.Pool,
+		ShareID:         shareID,
+		SandboxID:       existing.SandboxID,
+		NetNS:           existing.NetNS,
+		Parameters:      netParams,
+		SocketPaths:     paths,
+		CABundle:        caBundle,
+		LastNRIActivity: existing.LastNRIActivity,
 	}
 	if err := d.store.Upsert(podCfg); err != nil {
 		if !existed {
@@ -1052,19 +1027,16 @@ func (d *Driver) Synchronize(ctx context.Context, pods []*nriapi.PodSandbox, con
 
 		identity := d.buildWorkloadIdentity(
 			uid,
+			pod.GetId(),
 			cfg.PodName,
 			cfg.PodNamespace,
 			cfg.ServiceAccount,
-			cfg.SandboxName,
-			cfg.SandboxClaimUID,
-			cfg.SandboxClaimName,
 			cfg.Parameters.Custom,
 		)
 		if _, err := d.tunnel.EnsureListener(ctx, uid, tunnel.ListenerConfig{
 			Identity:               identity,
 			PolicyEnforcementPoint: cfg.Parameters.PolicyEnforcementPoint,
 			PodCertVolumeName:      cfg.Parameters.PodCertVolumeName,
-			SATokenVolumeName:      cfg.Parameters.SATokenVolumeName,
 			HasIngress:             len(cfg.Parameters.IngressPorts) > 0,
 			MaxConnections:         maxConns,
 			IdleTimeoutSeconds:     idleSecs,
@@ -1126,14 +1098,14 @@ func (d *Driver) reportMissingPlumbing(pod *nriapi.PodSandbox, runningCtrs []*nr
 				missing = append(missing, "loopback-only-netns")
 			}
 		case apis.ConfinementModeNetworkPolicyDenyAll:
-			hasRoutes, err := d.netns.HasNonLoopbackRoutes(ns)
-			if err != nil {
-				klog.ErrorS(err, "failed to inspect Pod routes during Synchronize",
-					"pod", klog.KRef(pod.GetNamespace(), pod.GetName()), "podUID", pod.GetUid())
-			} else if hasRoutes {
-				missing = append(missing, "non-loopback-routes-unflushed")
-			}
 			if cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDropAll {
+				hasRoutes, err := d.netns.HasNonLoopbackRoutes(ns)
+				if err != nil {
+					klog.ErrorS(err, "failed to inspect Pod routes during Synchronize",
+						"pod", klog.KRef(pod.GetNamespace(), pod.GetName()), "podUID", pod.GetUid())
+				} else if hasRoutes {
+					missing = append(missing, "non-loopback-routes-unflushed")
+				}
 				allowTunTap := cfg.Parameters.EffectiveAdapterMode() == apis.AdapterModeTunSidecar
 				blocked, err := d.netns.VerifyNonLoopbackNICsBlocked(ns, allowTunTap)
 				if err != nil {
@@ -1254,11 +1226,13 @@ func (d *Driver) RunPodSandbox(_ context.Context, pod *nriapi.PodSandbox) error 
 			return fmt.Errorf("PodNetworkIsolated check failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
 		}
 	case apis.ConfinementModeNetworkPolicyDenyAll:
-		if err := d.netns.FlushNonLoopbackRoutes(ns); err != nil {
-			status = metrics.StatusFailed
-			return fmt.Errorf("NetworkPolicyDenyAll route flush failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
-		}
+		// Under nicBlockMode=Disabled, defer eth0 isolation to CNI NetworkPolicy
+		// so host-to-Pod kubelet probes and CNI drop visibility keep working.
 		if cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDropAll {
+			if err := d.netns.FlushNonLoopbackRoutes(ns); err != nil {
+				status = metrics.StatusFailed
+				return fmt.Errorf("NetworkPolicyDenyAll route flush failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
+			}
 			allowTunTap := cfg.Parameters.EffectiveAdapterMode() == apis.AdapterModeTunSidecar
 			if err := d.netns.BlockNonLoopbackNICs(ns, allowTunTap); err != nil {
 				status = metrics.StatusFailed
@@ -1297,20 +1271,8 @@ func (d *Driver) RunPodSandbox(_ context.Context, pod *nriapi.PodSandbox) error 
 	cfg.SandboxID = pod.GetId()
 	cfg.NetNS = ns
 
-	sandboxName := cfg.SandboxName
-	if sandboxName == "" {
-		sandboxName = pod.GetName()
-	}
-	claimUID := pod.GetLabels()[apis.ClaimUIDLabel]
-	if claimUID == "" {
-		claimUID = cfg.SandboxClaimUID
-	}
-	claimName := pod.GetAnnotations()[apis.ClaimNameAnnotation]
-	if claimName == "" {
-		claimName = cfg.SandboxClaimName
-	}
-	_ = d.store.UpdateIdentity(podUID, pod.GetName(), pod.GetNamespace(), cfg.ServiceAccount, sandboxName, claimUID, claimName)
-	d.tunnel.UpdateIdentity(podUID, d.buildWorkloadIdentity(podUID, pod.GetName(), pod.GetNamespace(), cfg.ServiceAccount, sandboxName, claimUID, claimName, cfg.Parameters.Custom), false)
+	_ = d.store.UpdateIdentity(podUID, pod.GetName(), pod.GetNamespace(), cfg.ServiceAccount)
+	d.tunnel.UpdateIdentity(podUID, d.buildWorkloadIdentity(podUID, cfg.SandboxID, pod.GetName(), pod.GetNamespace(), cfg.ServiceAccount, cfg.Parameters.Custom), false)
 
 	d.reportResourceClaimDeviceStatusAsync(cfg, true)
 	status = metrics.StatusSuccess
@@ -1510,29 +1472,18 @@ func recordNRIMetric(method, status string, start time.Time) {
 
 func (d *Driver) buildWorkloadIdentity(
 	podUID types.UID,
-	podName, namespace, sa, sandboxName, claimUID, claimName string,
+	sandboxID, podName, namespace, sa string,
 	custom map[string]string,
 ) auth.WorkloadIdentity {
 	return auth.WorkloadIdentity{
 		Namespace:      namespace,
 		PodName:        podName,
 		PodUID:         podUID,
+		SandboxID:      sandboxID,
 		ServiceAccount: sa,
 		NodeName:       d.nodeName,
-		SandboxName:    sandboxName,
-		ClaimUID:       claimUID,
-		ClaimName:      claimName,
 		Custom:         custom,
 	}
-}
-
-func resolveSandboxName(pod *corev1.Pod) string {
-	for _, ref := range pod.OwnerReferences {
-		if ref.Controller != nil && *ref.Controller && ref.Kind == "Sandbox" {
-			return ref.Name
-		}
-	}
-	return pod.Name
 }
 
 func (d *Driver) reportResourceClaimDeviceStatusAsync(cfg store.PodConfig, ready bool) {
@@ -1540,21 +1491,8 @@ func (d *Driver) reportResourceClaimDeviceStatusAsync(cfg store.PodConfig, ready
 		return
 	}
 	d.statusWG.Go(func() {
-		// Prevent a delayed revoke for a retired PodSandbox from overwriting a newer sandbox generation.
-		if !ready && cfg.SandboxID != "" {
-			if cur, ok := d.store.Get(cfg.PodUID); ok && cur.SandboxID != "" && cur.SandboxID != cfg.SandboxID {
-				return
-			}
-		}
-
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-
-		claim, err := d.kubeClient.ResourceV1().ResourceClaims(cfg.ClaimNamespace).Get(ctx, cfg.ClaimName, metav1.GetOptions{})
-		if err != nil {
-			klog.V(2).InfoS("skipping ResourceClaim.status.devices update; get failed", "claim", cfg.ClaimNamespace+"/"+cfg.ClaimName, "err", err)
-			return
-		}
 
 		cond := metav1.Condition{
 			Type:               "Ready",
@@ -1614,33 +1552,35 @@ func (d *Driver) reportResourceClaimDeviceStatusAsync(cfg store.PodConfig, ready
 			entry.ShareID = &shareID
 		}
 
-		devices := make([]resourceapi.AllocatedDeviceStatus, 0, len(claim.Status.Devices)+1)
-		replaced := false
-		for i := range claim.Status.Devices {
-			existing := claim.Status.Devices[i]
-			if existing.Driver == entry.Driver && existing.Pool == entry.Pool && existing.Device == entry.Device && sameShareID(existing.ShareID, entry.ShareID) {
-				devices = append(devices, entry)
-				replaced = true
-				continue
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			// Prevent a delayed revoke for a retired PodSandbox from overwriting a newer generation.
+			if !ready && cfg.SandboxID != "" {
+				if cur, ok := d.store.Get(cfg.PodUID); ok && cur.SandboxID != "" && cur.SandboxID != cfg.SandboxID {
+					return nil
+				}
 			}
-			devices = append(devices, existing)
-		}
-		if !replaced {
-			devices = append(devices, entry)
-		}
 
-		patchBytes, err := json.Marshal(map[string]any{
-			"status": map[string]any{
-				"devices": devices,
-			},
+			claim, err := d.kubeClient.ResourceV1().ResourceClaims(cfg.ClaimNamespace).Get(ctx, cfg.ClaimName, metav1.GetOptions{})
+			if err != nil {
+				return err
+			}
+			updated := claim.DeepCopy()
+			replaced := false
+			for i := range updated.Status.Devices {
+				existing := &updated.Status.Devices[i]
+				if existing.Driver == entry.Driver && existing.Pool == entry.Pool && existing.Device == entry.Device && sameShareID(existing.ShareID, entry.ShareID) {
+					updated.Status.Devices[i] = entry
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				updated.Status.Devices = append(updated.Status.Devices, entry)
+			}
+			_, err = d.kubeClient.ResourceV1().ResourceClaims(cfg.ClaimNamespace).UpdateStatus(ctx, updated, metav1.UpdateOptions{})
+			return err
 		})
 		if err != nil {
-			klog.ErrorS(err, "marshal ResourceClaim.status.devices patch", "claim", cfg.ClaimNamespace+"/"+cfg.ClaimName)
-			return
-		}
-		if _, err := d.kubeClient.ResourceV1().ResourceClaims(cfg.ClaimNamespace).Patch(
-			ctx, cfg.ClaimName, types.MergePatchType, patchBytes, metav1.PatchOptions{}, "status",
-		); err != nil {
 			klog.ErrorS(err, "failed to update ResourceClaim.status.devices", "claim", cfg.ClaimNamespace+"/"+cfg.ClaimName)
 		}
 	})

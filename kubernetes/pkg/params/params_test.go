@@ -37,15 +37,15 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 						"adapterMode": "ExplicitProxy",
 						"proxy": {"port": 18080, "noProxy": [".internal.corp"]},
 						"policyEnforcementPoint": {
+							"url": "https://tenant-pep.team-a.svc:8443",
 							"tls": {"trustDomain": "cluster.local"},
-							"auth": {"type": "SPIFFE", "spiffe": {"mode": "Node"}}
+							"auth": {"type": "SPIFFE"}
 						},
 						"caTrust": {
 							"mode": "InjectEnv",
 							"sources": [{"type": "HostPath", "hostPath": "/etc/corp/ca.crt"}]
 						},
 						"custom": {"env": "prod", "region": "us-central1"},
-						"opaque": {"vendorFlag": {"tier": "gold"}},
 						"maxConnections": 128
 					}`)},
 				},
@@ -57,7 +57,7 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 			DeviceConfiguration: resourceapi.DeviceConfiguration{
 				Opaque: &resourceapi.OpaqueDeviceConfiguration{
 					Driver:     "dra.other.io",
-					Parameters: runtime.RawExtension{Raw: []byte(`{"adapterMode": "TunVM"}`)},
+					Parameters: runtime.RawExtension{Raw: []byte(`{"adapterMode": "Unknown"}`)},
 				},
 			},
 		},
@@ -69,18 +69,11 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 					Parameters: runtime.RawExtension{Raw: []byte(`{
 						"apiVersion": "dra.agents.net/v1alpha1",
 						"kind": "DriverConfig",
-						"confinementMode": "NetworkPolicyDenyAll",
-						"policyEnforcementPoint": {
-							"url": "https://tenant-pep.team-a.svc:8443"
-						},
+						"proxy": {"noProxy": [".team-a.local"]},
 						"caTrust": {
 							"sources": [{"type": "ConfigMap", "configMapRef": {"name": "team-ca"}}]
 						},
-						"ingressPorts": [{"port": 8080, "protocol": "TCP"}, {"port": 9000, "endPort": 9005, "protocol": "TCP"}],
-						"custom": {
-							"env": "staging",
-							"tenant": "team-a"
-						}
+						"ingressPorts": [{"port": 8080, "protocol": "TCP"}, {"port": 9000, "endPort": 9005, "protocol": "TCP"}]
 					}`)},
 				},
 			},
@@ -91,8 +84,8 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Decode: %v", err)
 	}
-	if got.ConfinementMode != apis.ConfinementModeNetworkPolicyDenyAll {
-		t.Fatalf("ConfinementMode = %q, want NetworkPolicyDenyAll", got.ConfinementMode)
+	if got.ConfinementMode != apis.ConfinementModePodNetworkIsolated {
+		t.Fatalf("ConfinementMode = %q, want PodNetworkIsolated", got.ConfinementMode)
 	}
 	if got.AdapterMode != apis.AdapterModeExplicitProxy {
 		t.Fatalf("AdapterMode = %q, want ExplicitProxy from DeviceClass DriverConfig", got.AdapterMode)
@@ -100,7 +93,7 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 	if got.EffectiveProxyPort() != 18080 {
 		t.Fatalf("EffectiveProxyPort = %d, want 18080 from DeviceClass DriverConfig", got.EffectiveProxyPort())
 	}
-	if got.Proxy == nil || len(got.Proxy.NoProxy) != 1 || got.Proxy.NoProxy[0] != ".internal.corp" {
+	if got.Proxy == nil || len(got.Proxy.NoProxy) != 2 || got.Proxy.NoProxy[0] != ".internal.corp" || got.Proxy.NoProxy[1] != ".team-a.local" {
 		t.Fatalf("unexpected Proxy config: %+v", got.Proxy)
 	}
 	if got.CATrust == nil || len(got.CATrust.Sources) != 2 {
@@ -118,54 +111,15 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 	if len(got.IngressPorts) != 2 || got.IngressPorts[0].Port != 8080 || got.IngressPorts[1].Port != 9000 || got.IngressPorts[1].EndPort != 9005 {
 		t.Fatalf("unexpected ingressPorts: %+v", got.IngressPorts)
 	}
-	if got.Custom["region"] != "us-central1" || got.Custom["env"] != "staging" || got.Custom["tenant"] != "team-a" {
-		t.Fatalf("unexpected merged custom params: %+v", got.Custom)
-	}
-	if string(got.Opaque["vendorFlag"]) != `{"tier": "gold"}` {
-		t.Fatalf("unexpected opaque field: %s", string(got.Opaque["vendorFlag"]))
+	if got.Custom["region"] != "us-central1" || got.Custom["env"] != "prod" {
+		t.Fatalf("unexpected class custom params: %+v", got.Custom)
 	}
 	if got.MaxConnections == nil || *got.MaxConnections != 128 {
 		t.Fatalf("maxConnections = %v, want 128", got.MaxConnections)
 	}
 }
 
-func TestDecodeStandaloneDriverConfigClaim(t *testing.T) {
-	configs := []resourceapi.DeviceAllocationConfiguration{
-		{
-			Source: resourceapi.AllocationConfigSourceClaim,
-			DeviceConfiguration: resourceapi.DeviceConfiguration{
-				Opaque: &resourceapi.OpaqueDeviceConfiguration{
-					Driver: apis.DriverName,
-					Parameters: runtime.RawExtension{Raw: []byte(`{
-						"apiVersion": "dra.agents.net/v1alpha1",
-						"kind": "DriverConfig",
-						"adapterMode": "TunSidecar",
-						"policyEnforcementPoint": {
-							"url": "https://standalone-pep.svc:8443"
-						},
-						"custom": {"app": "raw-pod"}
-					}`)},
-				},
-			},
-		},
-	}
-
-	got, err := Decode(configs, apis.DriverName)
-	if err != nil {
-		t.Fatalf("Decode standalone DriverConfig: %v", err)
-	}
-	if got.AdapterMode != apis.AdapterModeTunSidecar {
-		t.Fatalf("AdapterMode = %q, want TunSidecar", got.AdapterMode)
-	}
-	if got.PolicyEnforcementPoint == nil || got.PolicyEnforcementPoint.URL != "https://standalone-pep.svc:8443" {
-		t.Fatalf("unexpected PEP: %+v", got.PolicyEnforcementPoint)
-	}
-	if got.Custom["app"] != "raw-pod" {
-		t.Fatalf("custom[app] = %q, want raw-pod", got.Custom["app"])
-	}
-}
-
-func TestDecodeRejectsPrivilegedClaimFieldsAndOrdersClassBeforeClaim(t *testing.T) {
+func TestDecodeRejectsPrivilegedClaimFieldsAndUnknownKeys(t *testing.T) {
 	// 1. Out-of-order configs: FromClaim appears before FromClass, yet FromClass still applies first.
 	reversed := []resourceapi.DeviceAllocationConfiguration{
 		{
@@ -174,7 +128,7 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndOrdersClassBeforeClaim(t *testing.
 			DeviceConfiguration: resourceapi.DeviceConfiguration{
 				Opaque: &resourceapi.OpaqueDeviceConfiguration{
 					Driver:     apis.DriverName,
-					Parameters: runtime.RawExtension{Raw: []byte(`{"confinementMode":"NetworkPolicyDenyAll","custom":{"k":"from-claim"}}`)},
+					Parameters: runtime.RawExtension{Raw: []byte(`{"ingressPorts":[{"port":8080}],"proxy":{"port":19000}}`)},
 				},
 			},
 		},
@@ -184,7 +138,7 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndOrdersClassBeforeClaim(t *testing.
 			DeviceConfiguration: resourceapi.DeviceConfiguration{
 				Opaque: &resourceapi.OpaqueDeviceConfiguration{
 					Driver:     apis.DriverName,
-					Parameters: runtime.RawExtension{Raw: []byte(`{"confinementMode":"PodNetworkIsolated","custom":{"k":"from-class","c":"1"}}`)},
+					Parameters: runtime.RawExtension{Raw: []byte(`{"confinementMode":"PodNetworkIsolated","proxy":{"port":15001},"custom":{"c":"1"}}`)},
 				},
 			},
 		},
@@ -194,7 +148,7 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndOrdersClassBeforeClaim(t *testing.
 			DeviceConfiguration: resourceapi.DeviceConfiguration{
 				Opaque: &resourceapi.OpaqueDeviceConfiguration{
 					Driver:     apis.DriverName,
-					Parameters: runtime.RawExtension{Raw: []byte(`{"custom":{"k":"wrong-request"}}`)},
+					Parameters: runtime.RawExtension{Raw: []byte(`{"ingressPorts":[{"port":9999}]}`)},
 				},
 			},
 		},
@@ -203,17 +157,17 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndOrdersClassBeforeClaim(t *testing.
 	if err != nil {
 		t.Fatalf("DecodeForRequest: %v", err)
 	}
-	if got.ConfinementMode != apis.ConfinementModeNetworkPolicyDenyAll {
-		t.Fatalf("ConfinementMode = %q, want NetworkPolicyDenyAll (claim overlays class)", got.ConfinementMode)
+	if got.EffectiveProxyPort() != 19000 {
+		t.Fatalf("EffectiveProxyPort = %d, want 19000 (claim overlays class)", got.EffectiveProxyPort())
 	}
-	if got.EffectiveNICBlockMode() != apis.NICBlockModeDropAll {
-		t.Fatalf("default EffectiveNICBlockMode() = %q, want DropAll", got.EffectiveNICBlockMode())
+	if len(got.IngressPorts) != 1 || got.IngressPorts[0].Port != 8080 {
+		t.Fatalf("unexpected ingressPorts: %+v", got.IngressPorts)
 	}
-	if got.Custom["k"] != "from-claim" || got.Custom["c"] != "1" {
-		t.Fatalf("unexpected merged custom: %+v", got.Custom)
+	if got.Custom["c"] != "1" {
+		t.Fatalf("unexpected class custom: %+v", got.Custom)
 	}
 
-	// 1b. FromClass (DeviceClass) MAY set nicBlockMode: Disabled (opt-out) and invalid values fail.
+	// 2. FromClass (DeviceClass) validation: nicBlockMode, mandatory mTLS, unknown fields, UDP rejection.
 	optOut, err := Decode([]resourceapi.DeviceAllocationConfiguration{
 		{
 			Source: resourceapi.AllocationConfigSourceClass,
@@ -231,41 +185,60 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndOrdersClassBeforeClaim(t *testing.
 	if optOut.EffectiveNICBlockMode() != apis.NICBlockModeDisabled {
 		t.Fatalf("EffectiveNICBlockMode() = %q, want Disabled", optOut.EffectiveNICBlockMode())
 	}
-	if _, err := Decode([]resourceapi.DeviceAllocationConfiguration{
-		{
-			Source: resourceapi.AllocationConfigSourceClass,
-			DeviceConfiguration: resourceapi.DeviceConfiguration{
-				Opaque: &resourceapi.OpaqueDeviceConfiguration{
-					Driver:     apis.DriverName,
-					Parameters: runtime.RawExtension{Raw: []byte(`{"nicBlockMode":"BogusMode"}`)},
+
+	rejectedClass := []struct {
+		name string
+		raw  string
+	}{
+		{"invalid nicBlockMode", `{"nicBlockMode":"BogusMode"}`},
+		{"unknown JSON field", `{"unknownField":true}`},
+		{"plaintext http PEP URL", `{"policyEnforcementPoint":{"url":"http://pep:8080"}}`},
+		{"https PEP without mandatory mTLS auth", `{"policyEnforcementPoint":{"url":"https://pep:8443"}}`},
+		{"unsupported UDP ingressPort", `{"ingressPorts":[{"port":53,"protocol":"UDP"}]}`},
+		{"path traversal podCertVolumeName", `{"podCertVolumeName":"../../etc"}`},
+	}
+	for _, tc := range rejectedClass {
+		t.Run("class/"+tc.name, func(t *testing.T) {
+			_, err := Decode([]resourceapi.DeviceAllocationConfiguration{
+				{
+					Source: resourceapi.AllocationConfigSourceClass,
+					DeviceConfiguration: resourceapi.DeviceConfiguration{
+						Opaque: &resourceapi.OpaqueDeviceConfiguration{
+							Driver:     apis.DriverName,
+							Parameters: runtime.RawExtension{Raw: []byte(tc.raw)},
+						},
+					},
 				},
-			},
-		},
-	}, apis.DriverName); err == nil {
-		t.Fatal("expected error for invalid nicBlockMode, got nil")
+			}, apis.DriverName)
+			if err == nil {
+				t.Fatalf("expected error for class %s, got nil", tc.name)
+			}
+		})
 	}
 
-	// 2. FromClaim must reject host-level paths, socket overrides, nicBlockMode, and resource limits.
+	// 3. FromClaim MUST reject all cluster-admin fields (PEP hijack, confinement downgrade,
+	// adapterMode flip, spoofed custom attributes, hostPath CA, limits, and unknown fields).
 	rejectedClaims := []struct {
 		name string
 		raw  string
 	}{
+		{"confinementMode downgrade", `{"confinementMode":"NetworkPolicyDenyAll"}`},
+		{"adapterMode TunSidecar escalation", `{"adapterMode":"TunSidecar"}`},
+		{"policyEnforcementPoint hijack", `{"policyEnforcementPoint":{"url":"https://attacker.example:8443","auth":{"type":"SPIFFE"}}}`},
+		{"policyEnforcementPoint unix SSRF", `{"policyEnforcementPoint":{"url":"unix:///var/run/nri/nri.sock"}}`},
+		{"custom attested attribute spoof", `{"custom":{"tenant":"admin"}}`},
 		{"caTrust hostPath", `{"caTrust":{"sources":[{"type":"HostPath","hostPath":"/etc/shadow"}]}}`},
-		{"pep tls hostPath", `{"policyEnforcementPoint":{"url":"https://pep:8443","tls":{"caCertificateRefs":[{"type":"HostPath","hostPath":"/dev/zero"}]}}}`},
-		{"mtls certDir", `{"policyEnforcementPoint":{"url":"https://pep:8443","auth":{"type":"MTLS","mtls":{"certDir":"/etc/kubernetes/pki"}}}}`},
-		{"spiffe workloadSocketPath", `{"policyEnforcementPoint":{"url":"https://pep:8443","auth":{"type":"SPIFFE","spiffe":{"workloadSocketPath":"/run/containerd/containerd.sock"}}}}`},
-		{"spiffe delegatedSocketPath", `{"policyEnforcementPoint":{"url":"https://pep:8443","auth":{"type":"SPIFFE","spiffe":{"mode":"DelegatedPod","delegatedSocketPath":"/run/spire/admin.sock"}}}}`},
 		{"maxConnections override", `{"maxConnections":99999}`},
 		{"idleTimeoutSeconds override", `{"idleTimeoutSeconds":99999}`},
 		{"nicBlockMode Disabled override", `{"nicBlockMode":"Disabled"}`},
-		{"nicBlockMode DropAll override", `{"nicBlockMode":"DropAll"}`},
-		{"path traversal podCertVolumeName", `{"podCertVolumeName":"../../etc"}`},
+		{"podCertVolumeName override", `{"podCertVolumeName":"my-cert"}`},
 		{"bad noProxy chars", `{"proxy":{"noProxy":["ok.local","bad host"]}}`},
 		{"ingress endPort below port", `{"ingressPorts":[{"port":9005,"endPort":9000}]}`},
 		{"ingress endPort above 65535", `{"ingressPorts":[{"port":9000,"endPort":70000}]}`},
+		{"unknown JSON field", `{"typoField":"x"}`},
 	}
 	for _, tc := range rejectedClaims {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run("claim/"+tc.name, func(t *testing.T) {
 			_, err := Decode([]resourceapi.DeviceAllocationConfiguration{
 				{
 					Source: resourceapi.AllocationConfigSourceClaim,
@@ -278,7 +251,7 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndOrdersClassBeforeClaim(t *testing.
 				},
 			}, apis.DriverName)
 			if err == nil {
-				t.Fatalf("expected error for %s, got nil", tc.name)
+				t.Fatalf("expected error for claim %s, got nil", tc.name)
 			}
 		})
 	}

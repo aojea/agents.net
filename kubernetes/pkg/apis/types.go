@@ -12,20 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Package apis defines the internal Kubernetes DRA OpaqueDeviceConfiguration
-// wire schema and constants for the dra-agents-net Kubernetes Network Driver
-// (driver: dra.agents.net, apiVersion: dra.agents.net/v1alpha1, kind: DriverConfig).
-//
-// Any Kubernetes workload (raw Pods, Deployments, StatefulSets, or sandbox
-// controllers such as agent-sandbox) attaches agents.net traffic plumbing via
-// standard Kubernetes DeviceClass, ResourceClaimTemplate, and ResourceClaim objects.
+// Package apis defines the Kubernetes DRA OpaqueDeviceConfiguration schema and
+// constants for dra-agents-net (driver: dra.agents.net, apiVersion:
+// dra.agents.net/v1alpha1, kind: DriverConfig).
 package apis
 
 import (
 	"slices"
 	"strings"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -63,31 +58,16 @@ const (
 	Tun2ConnectSidecarName = "agents-net-tun2connect"
 
 	// PodCertVolumeName is the projected volume name used for KEP-4317 PodCertificate
-	// authentication when isolated on the tun2connect native sidecar.
+	// authentication.
 	PodCertVolumeName = "agents-net-pod-cert"
 
 	// PodCertBundleFile is the credential bundle filename written by kubelet inside
 	// PodCertVolumeName.
 	PodCertBundleFile = "credential-bundle.pem"
 
-	// SATokenVolumeName is the projected volume name used for Pod-mode
-	// ServiceAccountToken authentication when isolated on the tun2connect sidecar.
-	SATokenVolumeName = "agents-net-sa-token"
-
-	// SATokenFile is the token filename written by kubelet inside SATokenVolumeName.
-	SATokenFile = "token"
-
 	// DefaultProxyPort is the default Pod loopback port (127.0.0.1:15001) bound via
 	// socketat when adapterMode is ExplicitProxy.
 	DefaultProxyPort int32 = 15001
-
-	// ClaimUIDLabel is the optional Pod label key carrying the owning claim UID
-	// (set by workload controllers such as agent-sandbox SandboxClaim adoption).
-	ClaimUIDLabel = "agents.x-k8s.io/claim-uid"
-
-	// ClaimNameAnnotation is the optional Pod annotation key carrying the owning claim name
-	// (set by workload controllers such as agent-sandbox SandboxClaim adoption).
-	ClaimNameAnnotation = "agents.x-k8s.io/claim-name"
 )
 
 // ConfinementMode defines how the backing Pod is isolated from direct network egress.
@@ -98,25 +78,26 @@ const (
 	// namespace (KEP-6313) with no CNI attachment and no Pod IP.
 	ConfinementModePodNetworkIsolated ConfinementMode = "PodNetworkIsolated"
 
-	// ConfinementModeNetworkPolicyDenyAll pairs a deny-all NetworkPolicy with NRI
-	// RunPodSandbox non-loopback route flushing and tc clsact NIC blocking for clusters without KEP-6313.
+	// ConfinementModeNetworkPolicyDenyAll isolates Pods on CNI clusters without KEP-6313.
+	// With nicBlockMode=DropAll (default), dra-agents-net flushes non-loopback routes and
+	// attaches tc clsact drop filters inside the Pod netns. With nicBlockMode=Disabled,
+	// eth0 isolation and kubelet probes are deferred to CNI NetworkPolicy.
 	ConfinementModeNetworkPolicyDenyAll ConfinementMode = "NetworkPolicyDenyAll"
 )
 
-// NICBlockMode controls whether dra-agents-net attaches pure-netlink tc clsact
-// drop filters (ingress and egress) to non-loopback NICs inside the Pod network
-// namespace. This is a driver-only, DeviceClass-restricted (FromClass) setting.
+// NICBlockMode controls whether dra-agents-net flushes non-loopback routes and attaches
+// tc clsact drop filters inside the Pod network namespace under NetworkPolicyDenyAll.
+// This setting is restricted to DeviceClass (FromClass).
 type NICBlockMode string
 
 const (
-	// NICBlockModeDropAll (default) attaches tc clsact matchall DROP filters to
-	// both ingress and egress of every non-loopback NIC inside the Pod netns
-	// (excluding tuntap in TunSidecar mode), isolating the Pod independently of
-	// CNI NetworkPolicy enforcement.
+	// NICBlockModeDropAll (default) flushes non-loopback routes and attaches tc clsact
+	// matchall DROP filters on ingress and egress of every non-loopback NIC inside the
+	// Pod netns (excluding tuntap in TunSidecar mode).
 	NICBlockModeDropAll NICBlockMode = "DropAll"
 
-	// NICBlockModeDisabled disables tc NIC blocking and relies only on non-loopback
-	// route flushing and external CNI NetworkPolicy enforcement.
+	// NICBlockModeDisabled leaves eth0 routes and tc filters untouched so CNI NetworkPolicy
+	// enforces isolation while preserving host-to-Pod kubelet probes and CNI flow logs.
 	NICBlockModeDisabled NICBlockMode = "Disabled"
 )
 
@@ -128,48 +109,18 @@ const (
 	// AdapterModeTunSidecar injects one tun2connect native sidecar per Pod netns.
 	AdapterModeTunSidecar AdapterMode = "TunSidecar"
 
-	// AdapterModeTunVM attaches one tun2connect per microVM over vsock or Unix socket.
-	AdapterModeTunVM AdapterMode = "TunVM"
-
 	// AdapterModeExplicitProxy binds 127.0.0.1:<port> inside the Pod loopback netns
-	// via socketat and injects multi-language proxy environment variables.
+	// via socketat alongside egress.sock and injects proxy environment variables.
 	AdapterModeExplicitProxy AdapterMode = "ExplicitProxy"
 )
 
-// PEPAuthType selects the authentication mechanism to the Policy Enforcement Point (PEP).
+// PEPAuthType selects the mandatory mTLS authentication mechanism to the PEP.
 type PEPAuthType string
 
 const (
-	PEPAuthTypeMTLS                PEPAuthType = "MTLS"
-	PEPAuthTypeSPIFFE              PEPAuthType = "SPIFFE"
-	PEPAuthTypePodCertificate      PEPAuthType = "PodCertificate"
-	PEPAuthTypeServiceAccountToken PEPAuthType = "ServiceAccountToken"
-)
-
-// SPIFFEMode selects node-level or per-Pod delegated SPIFFE X.509-SVID authentication.
-type SPIFFEMode string
-
-const (
-	SPIFFEModeNode         SPIFFEMode = "Node"
-	SPIFFEModeDelegatedPod SPIFFEMode = "DelegatedPod"
-)
-
-// PodCertificateKeyType selects the private key algorithm for KEP-4317 PodCertificate.
-type PodCertificateKeyType string
-
-const (
-	PodCertificateKeyTypeECDSAP256 PodCertificateKeyType = "ECDSAP256"
-	PodCertificateKeyTypeECDSAP384 PodCertificateKeyType = "ECDSAP384"
-	PodCertificateKeyTypeED25519   PodCertificateKeyType = "ED25519"
-	PodCertificateKeyTypeRSA3072   PodCertificateKeyType = "RSA3072"
-)
-
-// ServiceAccountTokenMode selects node-level or Pod-projected JWT authentication.
-type ServiceAccountTokenMode string
-
-const (
-	ServiceAccountTokenModeNode ServiceAccountTokenMode = "Node"
-	ServiceAccountTokenModePod  ServiceAccountTokenMode = "Pod"
+	PEPAuthTypeMTLS           PEPAuthType = "MTLS"
+	PEPAuthTypeSPIFFE         PEPAuthType = "SPIFFE"
+	PEPAuthTypePodCertificate PEPAuthType = "PodCertificate"
 )
 
 // CATrustMode controls how declarative Pod CA certificates are exposed to containers.
@@ -194,7 +145,6 @@ type CASourceType string
 
 const (
 	CASourceTypeConfigMap          CASourceType = "ConfigMap"
-	CASourceTypeSecret             CASourceType = "Secret"
 	CASourceTypeClusterTrustBundle CASourceType = "ClusterTrustBundle"
 	CASourceTypeHostPath           CASourceType = "HostPath"
 )
@@ -204,18 +154,10 @@ type IngressProtocol string
 
 const (
 	IngressProtocolTCP IngressProtocol = "TCP"
-	IngressProtocolUDP IngressProtocol = "UDP"
 )
 
 // ConfigMapKeyRef selects a key inside a ConfigMap in the Pod namespace.
 type ConfigMapKeyRef struct {
-	Name string `json:"name"`
-	Key  string `json:"key,omitempty"`
-}
-
-// SecretKeyRef selects a key inside a Secret in the Pod namespace.
-// Only valid CERTIFICATE PEM blocks are extracted; private keys are never exposed.
-type SecretKeyRef struct {
 	Name string `json:"name"`
 	Key  string `json:"key,omitempty"`
 }
@@ -232,7 +174,6 @@ type ClusterTrustBundleRef struct {
 type CASource struct {
 	Type               CASourceType           `json:"type"`
 	ConfigMapRef       *ConfigMapKeyRef       `json:"configMapRef,omitempty"`
-	SecretRef          *SecretKeyRef          `json:"secretRef,omitempty"`
 	ClusterTrustBundle *ClusterTrustBundleRef `json:"clusterTrustBundle,omitempty"`
 	HostPath           string                 `json:"hostPath,omitempty"`
 }
@@ -246,10 +187,6 @@ func (s *CASource) DeepCopy() *CASource {
 	if s.ConfigMapRef != nil {
 		cm := *s.ConfigMapRef
 		out.ConfigMapRef = &cm
-	}
-	if s.SecretRef != nil {
-		sec := *s.SecretRef
-		out.SecretRef = &sec
 	}
 	if s.ClusterTrustBundle != nil {
 		ctb := *s.ClusterTrustBundle
@@ -305,7 +242,7 @@ func (p *ExplicitProxyConfig) DeepCopy() *ExplicitProxyConfig {
 	return &out
 }
 
-// IngressPort declares one allowed container port or inclusive port range
+// IngressPort declares one allowed container TCP port or inclusive port range
 // (when EndPort is set) exposed through the host ingress bridge.
 type IngressPort struct {
 	Port     int32           `json:"port"`
@@ -361,7 +298,7 @@ func proxyErrorType(status int, reason string) string {
 		return "proxy_configuration_error"
 	case "unsupported-version", "unsupported-http-version":
 		return "http_protocol_error"
-	case "ingress-dial-failed", "upstream-connect-failed", "sandbox-not-ready", "dial-failed", "upstream-auth-failed":
+	case "ingress-dial-failed", "upstream-connect-failed", "sandbox-not-ready", "dial-failed", "upstream-auth-failed", "bridge-tls-required":
 		return "destination_unavailable"
 	}
 	switch status {
@@ -392,9 +329,6 @@ func sanitizeProxyStatusToken(s string) string {
 
 // DeviceStatus is the structured DRA status payload published by dra-agents-net in
 // ResourceClaim.status.devices[].data once a Pod's sandbox is prepared and running.
-// Cluster routers and ingress gateways watch ResourceClaims and read this payload
-// to discover how to attract and tunnel traffic to isolated Pods without relying on
-// a Pod IP.
 type DeviceStatus struct {
 	APIVersion string         `json:"apiVersion"`
 	Kind       string         `json:"kind"`
@@ -405,7 +339,7 @@ type DeviceStatus struct {
 }
 
 // IngressStatus advertises how an authorized cluster ingress gateway or router
-// reaches a Pod's pinned loopback ports via the node HTTP CONNECT ingress bridge.
+// reaches a Pod's pinned loopback ports via the node mTLS HTTP CONNECT ingress bridge.
 type IngressStatus struct {
 	// Endpoint is the routable host:port of the node ingress bridge (for example "10.0.0.5:15080").
 	Endpoint string `json:"endpoint"`
@@ -413,7 +347,7 @@ type IngressStatus struct {
 	Protocol string `json:"protocol"`
 	// Target is the CONNECT authority host (Pod UID), used in "CONNECT <target>:<port> HTTP/1.1".
 	Target string `json:"target"`
-	// TLS reports whether Endpoint requires TLS/mTLS.
+	// TLS reports whether Endpoint requires mTLS.
 	TLS bool `json:"tls"`
 	// ServerName is the optional TLS server name expected by Endpoint.
 	ServerName string `json:"serverName,omitempty"`
@@ -447,40 +381,28 @@ func (t *PEPTLS) DeepCopy() *PEPTLS {
 	return &out
 }
 
-// MTLSAuth configures client mTLS credentials from a host directory or Kubernetes Secret.
+// MTLSAuth configures rotating client mTLS credentials from a host or mounted directory
+// containing tls.crt and tls.key.
 type MTLSAuth struct {
-	CertDir   string                       `json:"certDir,omitempty"`
-	SecretRef *corev1.LocalObjectReference `json:"secretRef,omitempty"`
+	CertDir string `json:"certDir"`
 }
 
-// SPIFFEAuth configures SPIFFE Workload API or SPIRE Delegated Identity authentication.
+// SPIFFEAuth configures SPIFFE Workload API X.509-SVID mTLS authentication.
 type SPIFFEAuth struct {
-	Mode                SPIFFEMode `json:"mode,omitempty"`
-	WorkloadSocketPath  string     `json:"workloadSocketPath,omitempty"`
-	DelegatedSocketPath string     `json:"delegatedSocketPath,omitempty"`
+	WorkloadSocketPath string `json:"workloadSocketPath,omitempty"`
 }
 
-// PodCertificateAuth configures KEP-4317 kubelet-projected PodCertificate authentication.
+// PodCertificateAuth configures KEP-4317 kubelet-projected PodCertificate mTLS authentication.
 type PodCertificateAuth struct {
-	SignerName           string                `json:"signerName"`
-	KeyType              PodCertificateKeyType `json:"keyType,omitempty"`
-	MaxExpirationSeconds *int32                `json:"maxExpirationSeconds,omitempty"`
+	SignerName string `json:"signerName"`
 }
 
-// ServiceAccountTokenAuth configures audience-bound Kubernetes ServiceAccount JWT authentication.
-type ServiceAccountTokenAuth struct {
-	Audience          string                  `json:"audience"`
-	Mode              ServiceAccountTokenMode `json:"mode,omitempty"`
-	ExpirationSeconds *int32                  `json:"expirationSeconds,omitempty"`
-}
-
-// PEPAuth is a discriminated union selecting client authentication to the Policy Enforcement Point (PEP).
+// PEPAuth is a discriminated union selecting mandatory mTLS client authentication to the PEP.
 type PEPAuth struct {
-	Type                PEPAuthType              `json:"type"`
-	MTLS                *MTLSAuth                `json:"mtls,omitempty"`
-	SPIFFE              *SPIFFEAuth              `json:"spiffe,omitempty"`
-	PodCertificate      *PodCertificateAuth      `json:"podCertificate,omitempty"`
-	ServiceAccountToken *ServiceAccountTokenAuth `json:"serviceAccountToken,omitempty"`
+	Type           PEPAuthType         `json:"type"`
+	MTLS           *MTLSAuth           `json:"mtls,omitempty"`
+	SPIFFE         *SPIFFEAuth         `json:"spiffe,omitempty"`
+	PodCertificate *PodCertificateAuth `json:"podCertificate,omitempty"`
 }
 
 // DeepCopy returns a deep copy of a.
@@ -491,10 +413,6 @@ func (a *PEPAuth) DeepCopy() *PEPAuth {
 	out := *a
 	if a.MTLS != nil {
 		m := *a.MTLS
-		if a.MTLS.SecretRef != nil {
-			ref := *a.MTLS.SecretRef
-			m.SecretRef = &ref
-		}
 		out.MTLS = &m
 	}
 	if a.SPIFFE != nil {
@@ -503,24 +421,12 @@ func (a *PEPAuth) DeepCopy() *PEPAuth {
 	}
 	if a.PodCertificate != nil {
 		pc := *a.PodCertificate
-		if a.PodCertificate.MaxExpirationSeconds != nil {
-			v := *a.PodCertificate.MaxExpirationSeconds
-			pc.MaxExpirationSeconds = &v
-		}
 		out.PodCertificate = &pc
-	}
-	if a.ServiceAccountToken != nil {
-		sa := *a.ServiceAccountToken
-		if a.ServiceAccountToken.ExpirationSeconds != nil {
-			v := *a.ServiceAccountToken.ExpirationSeconds
-			sa.ExpirationSeconds = &v
-		}
-		out.ServiceAccountToken = &sa
 	}
 	return &out
 }
 
-// PolicyEnforcementPointConfig defines the Policy Enforcement Point (PEP) proxy or portal endpoint.
+// PolicyEnforcementPointConfig defines the Policy Enforcement Point (PEP) endpoint.
 type PolicyEnforcementPointConfig struct {
 	URL  string   `json:"url"`
 	TLS  *PEPTLS  `json:"tls,omitempty"`

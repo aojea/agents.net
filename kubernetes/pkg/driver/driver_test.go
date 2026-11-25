@@ -507,7 +507,7 @@ func TestPrepareRunCreateStopRemoveCATrustAndPodSync(t *testing.T) {
 		},
 		IngressPorts: []apis.IngressPort{{Port: 8080}},
 		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
-			URL: "https://portal.sandbox-system.svc:8443",
+			URL: "unix:///run/pep/egress.sock",
 		},
 		Custom: map[string]string{"tenant": "team-a"},
 	})
@@ -566,19 +566,17 @@ func TestPrepareRunCreateStopRemoveCATrustAndPodSync(t *testing.T) {
 		t.Fatalf("missing expected CA trust env vars: %+v", agentEnv)
 	}
 
-	// 4. SyncPod captures ServiceAccount & warm-pool SandboxClaim adoption metadata.
+	// 4. SyncPod captures attested ServiceAccount metadata from the Pod informer.
 	drv.SyncPod(&corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        "sb-1",
-			Namespace:   "agents",
-			UID:         podUID,
-			Labels:      map[string]string{apis.ClaimUIDLabel: "claim-uid-99"},
-			Annotations: map[string]string{apis.ClaimNameAnnotation: "claim-alpha"},
+			Name:      "sb-1",
+			Namespace: "agents",
+			UID:       podUID,
 		},
 		Spec: corev1.PodSpec{ServiceAccountName: "agent-sa"},
 	})
 	updatedCfg, ok := st.Get(podUID)
-	if !ok || updatedCfg.ServiceAccount != "agent-sa" || updatedCfg.SandboxClaimName != "claim-alpha" {
+	if !ok || updatedCfg.ServiceAccount != "agent-sa" {
 		t.Fatalf("SyncPod did not update identity: %+v", updatedCfg)
 	}
 
@@ -652,7 +650,8 @@ func TestExplicitProxySocketAtAndMagicLanguageEnvVars(t *testing.T) {
 		t.Fatalf("expected socketat ListenAt on 127.0.0.1:18080, got %v", netns.listenedAddrs)
 	}
 
-	// Verify nicBlockMode=Disabled (DeviceClass opt-out) skips BlockNonLoopbackNICs.
+	// Verify nicBlockMode=Disabled (DeviceClass opt-out) skips both FlushNonLoopbackRoutes
+	// and BlockNonLoopbackNICs so CNI NetworkPolicy and kubelet probes keep working.
 	podUIDOptOut := types.UID("pod-nic-disabled")
 	claimUIDOptOut := types.UID("claim-nic-disabled")
 	claimOptOut := makeTestClaim(podUIDOptOut, claimUIDOptOut, params.NetworkParameters{
@@ -671,8 +670,8 @@ func TestExplicitProxySocketAtAndMagicLanguageEnvVars(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("RunPodSandbox opt-out: %v", err)
 	}
-	if len(netns.blockedPaths) != 1 {
-		t.Fatalf("expected BlockNonLoopbackNICs skipped when nicBlockMode=Disabled, got %v", netns.blockedPaths)
+	if len(netns.flushedPaths) != 1 || len(netns.blockedPaths) != 1 {
+		t.Fatalf("expected FlushNonLoopbackRoutes and BlockNonLoopbackNICs skipped when nicBlockMode=Disabled, got flushed=%v blocked=%v", netns.flushedPaths, netns.blockedPaths)
 	}
 
 	// Verify BlockNonLoopbackNICs failure fails closed under default DropAll.
@@ -818,12 +817,12 @@ func TestPodSandboxRecreationStaleGCAndIdempotentPrepare(t *testing.T) {
 	}
 
 	// 3. Idempotent re-invocation of PrepareResourceClaims preserves live NetNS, SandboxID, and ServiceAccount.
-	_ = st.UpdateIdentity(podUID, "sb", "agents", "my-sa", "my-sb", "sc-uid", "sc-name")
+	_ = st.UpdateIdentity(podUID, "sb", "agents", "my-sa")
 	if res, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim}); err != nil || res[claimUID].Err != nil {
 		t.Fatalf("idempotent PrepareResourceClaims: err=%v res=%+v", err, res)
 	}
 	cfgAfter, ok := st.Get(podUID)
-	if !ok || cfgAfter.NetNS != "/var/run/netns/sb2" || cfgAfter.SandboxID != "sb-id-2" || cfgAfter.ServiceAccount != "my-sa" || cfgAfter.SandboxClaimName != "sc-name" {
+	if !ok || cfgAfter.NetNS != "/var/run/netns/sb2" || cfgAfter.SandboxID != "sb-id-2" || cfgAfter.ServiceAccount != "my-sa" {
 		t.Fatalf("idempotent PrepareResourceClaims wiped live state: %+v", cfgAfter)
 	}
 }

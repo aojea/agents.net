@@ -18,9 +18,12 @@
 package params
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"maps"
+	"net/url"
 	"slices"
 	"strings"
 
@@ -58,13 +61,11 @@ type NetworkParameters struct {
 	Proxy                  *apis.ExplicitProxyConfig          `json:"proxy,omitempty"`
 	IngressPorts           []apis.IngressPort                 `json:"ingressPorts,omitempty"`
 	PodCertVolumeName      string                             `json:"podCertVolumeName,omitempty"`
-	SATokenVolumeName      string                             `json:"saTokenVolumeName,omitempty"`
 	MaxConnections         *int32                             `json:"maxConnections,omitempty"`
 	IdleTimeoutSeconds     *int32                             `json:"idleTimeoutSeconds,omitempty"`
-	// Custom holds string key-value metadata forwarded as attested Agents-Net-Param-* headers.
+	// Custom holds admin-attested string key-value attributes from DeviceClass
+	// forwarded in the RFC 8941 Agents-Net-Attributes header.
 	Custom map[string]string `json:"custom,omitempty"`
-	// Opaque holds arbitrary private JSON configuration objects supplied via DRA Opaque config.
-	Opaque map[string]json.RawMessage `json:"opaque,omitempty"`
 }
 
 // EffectiveAdapterMode returns the configured AdapterMode or the default (ExplicitProxy).
@@ -110,9 +111,9 @@ func Decode(configs []resourceapi.DeviceAllocationConfiguration, driverName stri
 
 // DecodeForRequest merges OpaqueDeviceConfiguration entries matching driverName and
 // requestName (when non-empty), applying DeviceClass (FromClass) entries strictly
-// before ResourceClaim (FromClaim) entries. Privileged host-node fields (HostPath,
-// MTLS.CertDir, SPIFFE socket overrides, and per-Pod resource limits) are rejected
-// unless sourced from FromClass.
+// before ResourceClaim (FromClaim) entries. Security-sensitive fields (confinementMode,
+// nicBlockMode, adapterMode, policyEnforcementPoint, podCertVolumeName, custom attributes,
+// HostPath CA sources, and resource limits) are restricted strictly to DeviceClass.
 func DecodeForRequest(configs []resourceapi.DeviceAllocationConfiguration, driverName, requestName string) (NetworkParameters, error) {
 	out := Defaults()
 
@@ -165,8 +166,14 @@ func DecodeForRequest(configs []resourceapi.DeviceAllocationConfiguration, drive
 
 func unmarshalLayer(raw []byte, driverName string) (NetworkParameters, error) {
 	var layer NetworkParameters
-	if err := json.Unmarshal(raw, &layer); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&layer); err != nil {
 		return NetworkParameters{}, fmt.Errorf("unmarshal opaque parameters for driver %q: %w", driverName, err)
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return NetworkParameters{}, fmt.Errorf("unexpected trailing data in opaque parameters for driver %q", driverName)
 	}
 	if layer.Kind != "" && layer.Kind != apis.DriverConfigKind {
 		return NetworkParameters{}, fmt.Errorf("unsupported opaque parameter kind %q for driver %q (expected %q)", layer.Kind, driverName, apis.DriverConfigKind)
@@ -177,10 +184,32 @@ func unmarshalLayer(raw []byte, driverName string) (NetworkParameters, error) {
 	return layer, nil
 }
 
-// validateClaimLayer rejects host-node filesystem/socket references and admin resource
-// limit overrides when supplied by a namespace-scoped ResourceClaim (FromClaim) rather
-// than a cluster-admin DeviceClass (FromClass).
+// validateClaimLayer enforces the trust boundary between cluster-admin DeviceClass
+// (FromClass) and namespace-scoped ResourceClaim (FromClaim) configuration.
+// Namespace claims may only configure workload-local ingressPorts, explicit proxy
+// port/noProxy, and non-HostPath caTrust sources.
 func validateClaimLayer(layer *NetworkParameters) error {
+	if layer.ConfinementMode != "" {
+		return fmt.Errorf("confinementMode is restricted to DeviceClass configuration")
+	}
+	if layer.NICBlockMode != "" {
+		return fmt.Errorf("nicBlockMode is restricted to DeviceClass configuration")
+	}
+	if layer.AdapterMode != "" {
+		return fmt.Errorf("adapterMode is restricted to DeviceClass configuration")
+	}
+	if layer.PolicyEnforcementPoint != nil {
+		return fmt.Errorf("policyEnforcementPoint is restricted to DeviceClass configuration")
+	}
+	if layer.PodCertVolumeName != "" {
+		return fmt.Errorf("podCertVolumeName is restricted to DeviceClass configuration")
+	}
+	if layer.MaxConnections != nil || layer.IdleTimeoutSeconds != nil {
+		return fmt.Errorf("maxConnections and idleTimeoutSeconds are restricted to DeviceClass configuration")
+	}
+	if len(layer.Custom) > 0 {
+		return fmt.Errorf("custom attested attributes are restricted to DeviceClass configuration")
+	}
 	if layer.CATrust != nil {
 		for _, src := range layer.CATrust.Sources {
 			if src.Type == apis.CASourceTypeHostPath || src.HostPath != "" {
@@ -188,33 +217,10 @@ func validateClaimLayer(layer *NetworkParameters) error {
 			}
 		}
 	}
-	if pep := layer.PolicyEnforcementPoint; pep != nil {
-		if pep.TLS != nil {
-			for _, src := range pep.TLS.CACertificateRefs {
-				if src.Type == apis.CASourceTypeHostPath || src.HostPath != "" {
-					return fmt.Errorf("policyEnforcementPoint.tls hostPath CA source is restricted to DeviceClass configuration")
-				}
-			}
-		}
-		if pep.Auth != nil {
-			if pep.Auth.MTLS != nil && pep.Auth.MTLS.CertDir != "" {
-				return fmt.Errorf("mtls.certDir is restricted to DeviceClass configuration")
-			}
-			if pep.Auth.SPIFFE != nil && (pep.Auth.SPIFFE.WorkloadSocketPath != "" || pep.Auth.SPIFFE.DelegatedSocketPath != "") {
-				return fmt.Errorf("spiffe host socket path overrides are restricted to DeviceClass configuration")
-			}
-		}
-	}
-	if layer.MaxConnections != nil || layer.IdleTimeoutSeconds != nil {
-		return fmt.Errorf("maxConnections and idleTimeoutSeconds are restricted to DeviceClass configuration")
-	}
-	if layer.NICBlockMode != "" {
-		return fmt.Errorf("nicBlockMode is restricted to DeviceClass configuration")
-	}
 	return nil
 }
 
-// Validate checks bounds, enum values, and safe identifiers on decoded NetworkParameters.
+// Validate checks bounds, enum values, mandatory mTLS rules, and safe identifiers.
 func (p NetworkParameters) Validate() error {
 	switch p.ConfinementMode {
 	case "", apis.ConfinementModePodNetworkIsolated, apis.ConfinementModeNetworkPolicyDenyAll:
@@ -227,9 +233,14 @@ func (p NetworkParameters) Validate() error {
 		return fmt.Errorf("invalid nicBlockMode %q", p.NICBlockMode)
 	}
 	switch p.AdapterMode {
-	case "", apis.AdapterModeExplicitProxy, apis.AdapterModeTunSidecar, apis.AdapterModeTunVM:
+	case "", apis.AdapterModeExplicitProxy, apis.AdapterModeTunSidecar:
 	default:
 		return fmt.Errorf("invalid adapterMode %q", p.AdapterMode)
+	}
+	if p.PolicyEnforcementPoint != nil {
+		if err := validatePEP(p.PolicyEnforcementPoint); err != nil {
+			return err
+		}
 	}
 	if p.MaxConnections != nil && (*p.MaxConnections < 1 || *p.MaxConnections > MaxAllowedConnections) {
 		return fmt.Errorf("maxConnections %d out of range [1, %d]", *p.MaxConnections, MaxAllowedConnections)
@@ -250,9 +261,6 @@ func (p NetworkParameters) Validate() error {
 	if p.PodCertVolumeName != "" && !isDNS1123Label(p.PodCertVolumeName) {
 		return fmt.Errorf("invalid podCertVolumeName %q: must be a DNS-1123 label", p.PodCertVolumeName)
 	}
-	if p.SATokenVolumeName != "" && !isDNS1123Label(p.SATokenVolumeName) {
-		return fmt.Errorf("invalid saTokenVolumeName %q: must be a DNS-1123 label", p.SATokenVolumeName)
-	}
 	for _, port := range p.IngressPorts {
 		if port.Port < 1 || port.Port > 65535 {
 			return fmt.Errorf("ingressPort %d out of range [1, 65535]", port.Port)
@@ -261,9 +269,9 @@ func (p NetworkParameters) Validate() error {
 			return fmt.Errorf("ingressPort endPort %d out of range [%d, 65535]", port.EndPort, port.Port)
 		}
 		switch port.Protocol {
-		case "", apis.IngressProtocolTCP, apis.IngressProtocolUDP:
+		case "", apis.IngressProtocolTCP:
 		default:
-			return fmt.Errorf("invalid ingressPort protocol %q", port.Protocol)
+			return fmt.Errorf("invalid ingressPort protocol %q (only TCP is supported)", port.Protocol)
 		}
 	}
 	if p.CATrust != nil {
@@ -277,6 +285,38 @@ func (p NetworkParameters) Validate() error {
 		default:
 			return fmt.Errorf("invalid caTrust.bundleMode %q", p.CATrust.BundleMode)
 		}
+	}
+	return nil
+}
+
+func validatePEP(pep *apis.PolicyEnforcementPointConfig) error {
+	rawURL := strings.TrimSpace(pep.URL)
+	if rawURL == "" {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid policyEnforcementPoint.url %q: %w", pep.URL, err)
+	}
+	switch u.Scheme {
+	case "https":
+		if u.Hostname() == "" {
+			return fmt.Errorf("policyEnforcementPoint.url %q missing host", pep.URL)
+		}
+		if pep.Auth == nil || pep.Auth.Type == "" {
+			return fmt.Errorf("policyEnforcementPoint.auth (MTLS, SPIFFE, or PodCertificate) is required for https:// endpoints")
+		}
+		switch pep.Auth.Type {
+		case apis.PEPAuthTypeMTLS, apis.PEPAuthTypeSPIFFE, apis.PEPAuthTypePodCertificate:
+		default:
+			return fmt.Errorf("invalid policyEnforcementPoint.auth.type %q", pep.Auth.Type)
+		}
+	case "unix":
+		if u.Path == "" && u.Opaque == "" {
+			return fmt.Errorf("policyEnforcementPoint.url %q missing unix socket path", pep.URL)
+		}
+	default:
+		return fmt.Errorf("unsupported policyEnforcementPoint.url scheme %q (want https or unix; plaintext http is forbidden)", u.Scheme)
 	}
 	return nil
 }
@@ -328,9 +368,6 @@ func Merge(dst, src *NetworkParameters) {
 	if src.PodCertVolumeName != "" {
 		dst.PodCertVolumeName = src.PodCertVolumeName
 	}
-	if src.SATokenVolumeName != "" {
-		dst.SATokenVolumeName = src.SATokenVolumeName
-	}
 	if src.MaxConnections != nil {
 		dst.MaxConnections = new(*src.MaxConnections)
 	}
@@ -342,14 +379,6 @@ func Merge(dst, src *NetworkParameters) {
 			dst.Custom = make(map[string]string, len(src.Custom))
 		}
 		maps.Copy(dst.Custom, src.Custom)
-	}
-	if len(src.Opaque) > 0 {
-		if dst.Opaque == nil {
-			dst.Opaque = make(map[string]json.RawMessage, len(src.Opaque))
-		}
-		for k, v := range src.Opaque {
-			dst.Opaque[k] = slices.Clone(v)
-		}
 	}
 }
 

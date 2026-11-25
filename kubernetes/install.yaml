@@ -39,7 +39,7 @@ rules:
     verbs: ["get"]
   - apiGroups: ["resource.k8s.io"]
     resources: ["resourceclaims/status"]
-    verbs: ["patch"]
+    verbs: ["patch", "update"]
   - apiGroups: ["resource.k8s.io"]
     resources: ["resourceclaims/driver"]
     resourceNames: ["dra.agents.net"]
@@ -54,7 +54,7 @@ rules:
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
   - apiGroups: [""]
-    resources: ["configmaps", "secrets"]
+    resources: ["configmaps"]
     verbs: ["get"]
   - apiGroups: ["certificates.k8s.io"]
     resources: ["clustertrustbundles"]
@@ -77,12 +77,10 @@ subjects:
 # Pairs with DRAConsumableCapacity (Beta, enabled by default since Kubernetes 1.36):
 # each node publishes a single shared "agents-net" device whose requestPolicy defaults
 # to consuming 1 sandbox unit per ResourceClaim.
-# Cluster-admin datapath defaults (confinementMode, nicBlockMode, adapterMode,
-# proxy port/noProxy, connection limits, and optional cluster-wide TLS/CA/auth defaults)
-# live here under dra.agents.net/v1alpha1 DriverConfig. Workloads layer per-claim
-# dra.agents.net/v1alpha1 DriverConfig overrides (such as policyEnforcementPoint,
-# caTrust, and custom metadata) via standard Kubernetes ResourceClaimTemplate or
-# ResourceClaim objects.
+# Cluster-admin datapath and PEP settings (confinementMode, nicBlockMode, adapterMode,
+# policyEnforcementPoint with mandatory mTLS, limits, and attested attributes) belong
+# in DeviceClass (FromClass). Workloads may only layer ingressPorts, proxy port/noProxy,
+# and non-HostPath caTrust sources in ResourceClaimTemplate / ResourceClaim.
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
 metadata:
@@ -138,7 +136,13 @@ spec:
             - --checkpoint-path=/run/dra-agents-net/state.db
             - --kubelet-root-dir=/var/lib/kubelet
             - --metrics-addr=:9102
-            - --ingress-addr=:15080
+            # To enable the node ingress bridge (mandatory mTLS), mount server cert/key
+            # and client CA and pass:
+            # - --ingress-addr=:15080
+            # - --ingress-tls-cert=/etc/dra-agents-net/ingress/tls.crt
+            # - --ingress-tls-key=/etc/dra-agents-net/ingress/tls.key
+            # - --ingress-client-ca=/etc/dra-agents-net/ingress/ca.crt
+            # - --ingress-allowed-client-san=agents-net-ingress-gateway
           env:
             - name: NODE_NAME
               valueFrom:
@@ -151,9 +155,6 @@ spec:
           ports:
             - name: metrics
               containerPort: 9102
-              protocol: TCP
-            - name: ingress
-              containerPort: 15080
               protocol: TCP
           resources:
             requests:
@@ -191,9 +192,6 @@ spec:
               mountPath: /var/run/nri
             - name: dra-agents-net-run
               mountPath: /run/dra-agents-net
-            - name: node-token
-              mountPath: /var/run/secrets/dra-agents-net
-              readOnly: true
       volumes:
         - name: kubelet-plugins
           hostPath:
@@ -219,10 +217,3 @@ spec:
           hostPath:
             path: /run/dra-agents-net
             type: DirectoryOrCreate
-        - name: node-token
-          projected:
-            sources:
-              - serviceAccountToken:
-                  audience: agents.net/upstream
-                  expirationSeconds: 3600
-                  path: token

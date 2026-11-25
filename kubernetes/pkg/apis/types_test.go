@@ -61,7 +61,7 @@ func TestIngressPortContains(t *testing.T) {
 		},
 		{
 			name:  "protocol mismatch rejected",
-			spec:  IngressPort{Port: 5353, Protocol: IngressProtocolUDP},
+			spec:  IngressPort{Port: 5353, Protocol: IngressProtocol("UDP")},
 			port:  5353,
 			proto: IngressProtocolTCP,
 			want:  false,
