@@ -76,7 +76,7 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 						"caTrust": {
 							"sources": [{"type": "ConfigMap", "configMapRef": {"name": "team-ca"}}]
 						},
-						"ingressPorts": [{"port": 8080, "protocol": "TCP"}],
+						"ingressPorts": [{"port": 8080, "protocol": "TCP"}, {"port": 9000, "endPort": 9005, "protocol": "TCP"}],
 						"custom": {
 							"env": "staging",
 							"tenant": "team-a"
@@ -115,7 +115,7 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 	if got.PolicyEnforcementPoint.Auth == nil || got.PolicyEnforcementPoint.Auth.Type != apis.PEPAuthTypeSPIFFE {
 		t.Fatalf("expected DeviceClass auth preserved, got %+v", got.PolicyEnforcementPoint.Auth)
 	}
-	if len(got.IngressPorts) != 1 || got.IngressPorts[0].Port != 8080 {
+	if len(got.IngressPorts) != 2 || got.IngressPorts[0].Port != 8080 || got.IngressPorts[1].Port != 9000 || got.IngressPorts[1].EndPort != 9005 {
 		t.Fatalf("unexpected ingressPorts: %+v", got.IngressPorts)
 	}
 	if got.Custom["region"] != "us-central1" || got.Custom["env"] != "staging" || got.Custom["tenant"] != "team-a" {
@@ -261,6 +261,8 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndOrdersClassBeforeClaim(t *testing.
 		{"nicBlockMode DropAll override", `{"nicBlockMode":"DropAll"}`},
 		{"path traversal podCertVolumeName", `{"podCertVolumeName":"../../etc"}`},
 		{"bad noProxy chars", `{"proxy":{"noProxy":["ok.local","bad host"]}}`},
+		{"ingress endPort below port", `{"ingressPorts":[{"port":9005,"endPort":9000}]}`},
+		{"ingress endPort above 65535", `{"ingressPorts":[{"port":9000,"endPort":70000}]}`},
 	}
 	for _, tc := range rejectedClaims {
 		t.Run(tc.name, func(t *testing.T) {

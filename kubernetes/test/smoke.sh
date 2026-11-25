@@ -228,6 +228,10 @@ spec:
     - name: https
       port: 8443
       targetPort: 8443
+    - name: udp-echo
+      port: 8444
+      targetPort: 8444
+      protocol: UDP
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -252,7 +256,14 @@ spec:
             - python3
             - -c
             - |
-              import http.server, json, ssl
+              import http.server, json, socket, ssl, threading
+              def udp_echo():
+                  s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                  s.bind(("0.0.0.0", 8444))
+                  while True:
+                      data, addr = s.recvfrom(65535)
+                      s.sendto(data, addr)
+              threading.Thread(target=udp_echo, daemon=True).start()
               class H(http.server.BaseHTTPRequestHandler):
                   def do_GET(self):
                       body = json.dumps({"ok": True, "path": self.path, "host": self.headers.get("Host")}).encode()
@@ -270,6 +281,8 @@ spec:
               srv.serve_forever()
           ports:
             - containerPort: 8443
+            - containerPort: 8444
+              protocol: UDP
           volumeMounts:
             - name: tls
               mountPath: /tls
@@ -304,12 +317,18 @@ cat > "${TMPDIR}/policy.json" <<EOF
       "name": "echo.${NS}.svc.cluster.local",
       "ports": [8443],
       "transports": ["tcp"]
+    },
+    {
+      "id": "allow-echo-udp",
+      "name": "echo.${NS}.svc.cluster.local",
+      "ports": [8444],
+      "transports": ["udp"]
     }
   ],
   "resolved_addresses": [
     {
       "cidr": "${ECHO_CIDR}",
-      "ports": [8443]
+      "ports": [8443, 8444]
     }
   ]
 }
@@ -436,6 +455,9 @@ spec:
               ingressPorts:
                 - port: 8080
                   protocol: TCP
+                - port: 9000
+                  endPort: 9002
+                  protocol: TCP
               custom:
                 suite: smoke
 ---
@@ -462,18 +484,24 @@ spec:
         - python3
         - -c
         - |
-          import http.server, os
+          import http.server, os, threading
           port = int(os.environ.get("AGENT_INGRESS_PORT", "8080"))
-          class H(http.server.BaseHTTPRequestHandler):
-              def do_GET(self):
-                  body = f"smoke-ingress-ok:{self.path}".encode()
-                  self.send_response(200)
-                  self.send_header("Content-Length", str(len(body)))
-                  self.end_headers()
-                  self.wfile.write(body)
-              def log_message(self, *args):
-                  pass
-          http.server.ThreadingHTTPServer(("127.0.0.1", port), H).serve_forever()
+          def make_handler(label):
+              class H(http.server.BaseHTTPRequestHandler):
+                  def do_GET(self):
+                      body = f"{label}:{self.path}".encode()
+                      self.send_response(200)
+                      self.send_header("Content-Length", str(len(body)))
+                      self.end_headers()
+                      self.wfile.write(body)
+                  def log_message(self, *args):
+                      pass
+              return H
+          threading.Thread(
+              target=http.server.ThreadingHTTPServer(("127.0.0.1", 9001), make_handler("smoke-range-9001")).serve_forever,
+              daemon=True,
+          ).start()
+          http.server.ThreadingHTTPServer(("127.0.0.1", port), make_handler("smoke-ingress-ok")).serve_forever()
       resources:
         claims:
           - name: agents-net
@@ -488,13 +516,14 @@ POD_UID="$(k -n "${NS}" get pod smoke-agent -o jsonpath='{.metadata.uid}')"
 CLAIM_NAME="$(k -n "${NS}" get resourceclaim -o jsonpath='{.items[0].metadata.name}')"
 echo "smoke-agent PodUID=${POD_UID} ResourceClaim=${CLAIM_NAME}"
 
-echo "=== 8. Assert egress confinement, connect-proxy mTLS/H2 allow & deny, and AGENT_INGRESS_PORT ==="
+echo "=== 8. Assert egress confinement, connect-proxy mTLS/H2 TCP + UDP, Proxy-Status, and env vars ==="
 k -n "${NS}" exec -i smoke-agent -- env ECHO_IP="${ECHO_IP}" NS="${NS}" python3 - <<'PY'
 import json, os, socket, urllib.error, urllib.request
 
-# 1. Verify AGENT_INGRESS_PORT injected by NRI CreateContainer
+# 1. Verify AGENT_INGRESS_PORT, AGENT_CA_CERT, SSL_CERT_FILE, and HTTPS_PROXY injected by NRI CreateContainer
 assert os.environ.get("AGENT_INGRESS_PORT") == "8080", f"AGENT_INGRESS_PORT={os.environ.get('AGENT_INGRESS_PORT')!r}"
 assert os.environ.get("HTTPS_PROXY") == "http://127.0.0.1:15001", f"HTTPS_PROXY={os.environ.get('HTTPS_PROXY')!r}"
+assert os.environ.get("AGENT_CA_CERT") == "/var/run/agent-ca.pem", f"AGENT_CA_CERT={os.environ.get('AGENT_CA_CERT')!r}"
 assert os.environ.get("SSL_CERT_FILE") == "/var/run/agent-ca.pem", f"SSL_CERT_FILE={os.environ.get('SSL_CERT_FILE')!r}"
 
 # 2. Verify non-loopback routes were flushed
@@ -516,16 +545,64 @@ with urllib.request.urlopen(url, timeout=10) as resp:
     assert resp.status == 200 and data["ok"] is True and data["path"] == "/smoke-ok", data
     print("PASS connect-proxy allowed HTTPS:", data)
 
-# 5. Denied host via connect-proxy policy must return 403
-try:
-    urllib.request.urlopen("https://blocked.example/nope", timeout=10)
-    raise SystemExit("FAIL: blocked.example unexpectedly succeeded")
-except urllib.error.URLError as e:
-    assert "403" in str(e), f"expected 403 Forbidden, got: {e}"
-    print("PASS connect-proxy denied blocked.example:", e)
+# 5. Denied host via connect-proxy policy must return 403 + RFC 9209 Proxy-Status (no legacy Boundary-Reason)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+s.connect("/run/agents.net/egress.sock")
+s.sendall(b"CONNECT blocked.example:443 HTTP/1.1\r\nHost: blocked.example:443\r\n\r\n")
+deny_head = s.recv(4096).decode()
+s.close()
+assert deny_head.startswith("HTTP/1.1 403 "), f"expected 403 Forbidden, got: {deny_head!r}"
+assert "Proxy-Status:" in deny_head and "not-on-allowlist" in deny_head, f"missing Proxy-Status reason: {deny_head!r}"
+assert "Boundary-Reason:" not in deny_head, f"unexpected legacy Boundary-Reason header: {deny_head!r}"
+print("PASS connect-proxy denied blocked.example with Proxy-Status:", deny_head.splitlines()[0])
+
+# 6. Malformed CONNECT Host mismatch returns 400 + RFC 9209 Proxy-Status
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(5)
+s.connect("/run/agents.net/egress.sock")
+s.sendall(b"CONNECT a.example:443 HTTP/1.1\r\nHost: b.example:443\r\n\r\n")
+bad_head = s.recv(4096).decode()
+s.close()
+assert bad_head.startswith("HTTP/1.1 400 ") and "error=http_request_error; reason=authority-mismatch" in bad_head, f"unexpected 400: {bad_head!r}"
+print("PASS malformed CONNECT rejected with RFC 9209 Proxy-Status:", bad_head.splitlines()[0])
+
+# 7. RFC 9298 connect-udp over HTTP/2 extended CONNECT (:protocol: connect-udp) to connect-proxy -h2
+udp_host = f"echo.{os.environ['NS']}.svc.cluster.local"
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(10)
+s.connect("/run/agents.net/egress.sock")
+s.sendall((
+    f"GET /.well-known/masque/udp/{udp_host}/8444/ HTTP/1.1\r\n"
+    f"Host: egress.local\r\n"
+    f"Connection: Upgrade\r\n"
+    f"Upgrade: connect-udp\r\n"
+    f"Capsule-Protocol: ?1\r\n\r\n"
+).encode())
+buf = b""
+while b"\r\n\r\n" not in buf:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    buf += chunk
+head, rest = buf.split(b"\r\n\r\n", 1)
+head_str = head.decode()
+assert head_str.startswith("HTTP/1.1 101 ") and "Capsule-Protocol: ?1" in head_str, f"connect-udp upgrade failed: {head_str!r}"
+# RFC 9297 DATAGRAM capsule: type=0x00, length=1+len(payload), context_id=0x00, payload
+payload = b"udp-h2-smoke-ok"
+capsule = bytes([0x00, 1 + len(payload), 0x00]) + payload
+s.sendall(capsule)
+while len(rest) < len(capsule):
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    rest += chunk
+s.close()
+assert rest == capsule, f"UDP capsule echo mismatch: got={rest!r} want={capsule!r}"
+print("PASS RFC 9298 connect-udp over HTTP/2 extended CONNECT echoed datagram:", payload.decode())
 PY
 
-echo "=== 9. Verify connect-proxy JSONL audit log recorded mTLS peer + allow & deny ==="
+echo "=== 9. Verify connect-proxy JSONL audit log recorded mTLS peer + h2 TCP & UDP allow + deny ==="
 PEP_LOGS="$(k -n "${NS}" logs deploy/connect-proxy)"
 echo "${PEP_LOGS}"
 python3 - "${PEP_LOGS}" <<'PY'
@@ -535,11 +612,13 @@ for line in sys.argv[1].splitlines():
     line = line.strip()
     if line.startswith("{"):
         records.append(json.loads(line))
-allows = [r for r in records if r.get("decision") == "allow" and r.get("peer") == "dra-agents-net-smoke-client" and r.get("wire") == "h2"]
+tcp_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "tcp" and r.get("peer") == "dra-agents-net-smoke-client" and r.get("wire") == "h2"]
+udp_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "udp" and r.get("peer") == "dra-agents-net-smoke-client" and r.get("wire") == "h2"]
 blocks = [r for r in records if r.get("decision") == "block" and r.get("destination") == "blocked.example:443" and r.get("reason") == "not-on-allowlist"]
-assert allows, f"missing allow audit record with mTLS peer & h2: {records}"
+assert tcp_allows, f"missing TCP allow audit record with mTLS peer & h2: {records}"
+assert udp_allows, f"missing UDP allow audit record with mTLS peer & h2: {records}"
 assert blocks, f"missing block audit record for blocked.example:443: {records}"
-print(f"PASS connect-proxy audit: {len(allows)} allow(s) (mTLS peer + h2), {len(blocks)} block(s)")
+print(f"PASS connect-proxy audit: {len(tcp_allows)} TCP allow(s), {len(udp_allows)} UDP allow(s) (mTLS peer + h2), {len(blocks)} block(s)")
 PY
 
 echo "=== 10. Assert Option 3 Ingress discovery via ResourceClaim.status.devices[].data ==="
@@ -567,6 +646,7 @@ assert ing["protocol"] == "http-connect", ing
 assert ing["target"] == pod_uid, ing
 assert ing["endpoint"] and not ing["endpoint"].startswith(":"), ing
 assert any(p["port"] == 8080 and p["protocol"] == "TCP" for p in ing["ports"]), ing
+assert any(p["port"] == 9000 and p.get("endPort") == 9002 and p["protocol"] == "TCP" for p in ing["ports"]), ing
 print(ing["endpoint"])
 PY
 )"
@@ -688,12 +768,19 @@ if [ "${RUN_CPK}" = "true" ]; then
   fi
   echo "PASS host -> cloud-provider-kind LoadBalancer (${LB_IP}) header route -> Pod loopback :8080: ${HDR_BODY}"
 
-  DENY_CODE="$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "http://${LB_IP}/agents/${NS}/smoke-agent:9999/nope")"
-  if [ "${DENY_CODE}" != "403" ]; then
-    echo "FAIL: external LoadBalancer unpinned port :9999 returned HTTP ${DENY_CODE}, want 403" >&2
+  RANGE_BODY="$(curl -sf --max-time 5 "http://${LB_IP}/agents/${NS}/smoke-agent:9001/hello-range")"
+  if [ "${RANGE_BODY}" != "smoke-range-9001:/hello-range" ]; then
+    echo "FAIL: external LoadBalancer range port :9001 returned '${RANGE_BODY}', want 'smoke-range-9001:/hello-range'" >&2
     exit 1
   fi
-  echo "PASS host -> cloud-provider-kind LoadBalancer (${LB_IP}) unpinned port :9999 rejected: HTTP 403"
+  echo "PASS host -> cloud-provider-kind LoadBalancer (${LB_IP}) port range :9001 -> Pod loopback :9001: ${RANGE_BODY}"
+
+  DENY_HEADERS="$(curl -sS --max-time 5 -D - -o /dev/null "http://${LB_IP}/agents/${NS}/smoke-agent:9999/nope")"
+  if ! grep -q '^HTTP/.* 403 ' <<<"${DENY_HEADERS}" || ! grep -qi 'Proxy-Status:.*port-not-permitted' <<<"${DENY_HEADERS}"; then
+    echo "FAIL: external LoadBalancer unpinned port :9999 headers: ${DENY_HEADERS}" >&2
+    exit 1
+  fi
+  echo "PASS host -> cloud-provider-kind LoadBalancer (${LB_IP}) unpinned port :9999 rejected: HTTP 403 + Proxy-Status"
 fi
 
 cat <<EOF | k apply -f -
@@ -754,10 +841,26 @@ text = body.decode()
 assert "200 OK" in text and "smoke-ingress-ok:/hello-ingress" in text, f"unexpected ingress body: {text!r}"
 print("PASS direct node ingress bridge :8080 delivered HTTP 200:", text.splitlines()[-1])
 
-# 2. Unpinned port 9999 must be rejected with 403 ingress-port-denied at the node bridge too
+# 2. Pinned range port 9001 must succeed via direct node bridge too
+s, head, rest = connect_tunnel(9001)
+assert head.startswith("HTTP/1.1 200"), f"expected 200 OK on range port 9001, got: {head!r}"
+s.sendall(b"GET /hello-range HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+body = rest
+while True:
+    chunk = s.recv(4096)
+    if not chunk:
+        break
+    body += chunk
+s.close()
+text = body.decode()
+assert "200 OK" in text and "smoke-range-9001:/hello-range" in text, f"unexpected range ingress body: {text!r}"
+print("PASS direct node ingress bridge range port :9001 delivered HTTP 200:", text.splitlines()[-1])
+
+# 3. Unpinned port 9999 must be rejected with 403 + RFC 9209 Proxy-Status at the node bridge too
 s, head, _ = connect_tunnel(9999)
 s.close()
-assert head.startswith("HTTP/1.1 403") and "ingress-port-denied" in head, f"expected 403 ingress-port-denied, got: {head!r}"
+assert head.startswith("HTTP/1.1 403") and "Proxy-Status:" in head and "port-not-permitted" in head, f"expected 403 with Proxy-Status port-not-permitted, got: {head!r}"
+assert "Boundary-Reason:" not in head, f"unexpected legacy Boundary-Reason header: {head!r}"
 print("PASS direct node ingress bridge unpinned port :9999 rejected:", head.splitlines()[0])
 PY
 
@@ -778,12 +881,12 @@ fi
 echo "PASS Pod-owned ResourceClaim garbage-collected"
 
 if [ -n "${LB_IP}" ]; then
-  REVOKED_CODE="$(curl -sS --max-time 5 -o /dev/null -w '%{http_code}' "http://${LB_IP}/agents/${NS}/smoke-agent/after-delete")"
-  if [ "${REVOKED_CODE}" != "404" ]; then
-    echo "FAIL: external LoadBalancer after delete returned HTTP ${REVOKED_CODE}, want 404" >&2
+  REVOKED_HEADERS="$(curl -sS --max-time 5 -D - -o /dev/null "http://${LB_IP}/agents/${NS}/smoke-agent/after-delete")"
+  if ! grep -q '^HTTP/.* 404 ' <<<"${REVOKED_HEADERS}" || ! grep -qi 'Proxy-Status:' <<<"${REVOKED_HEADERS}"; then
+    echo "FAIL: external LoadBalancer after delete headers: ${REVOKED_HEADERS}" >&2
     exit 1
   fi
-  echo "PASS host -> cloud-provider-kind LoadBalancer (${LB_IP}) revoked after delete: HTTP 404"
+  echo "PASS host -> cloud-provider-kind LoadBalancer (${LB_IP}) revoked after delete: HTTP 404 + Proxy-Status"
 fi
 
 k -n "${NS}" exec -i ingress-caller -- env INGRESS_ENDPOINT="${INGRESS_ENDPOINT}" POD_UID="${POD_UID}" python3 - <<'PY'
@@ -798,7 +901,7 @@ s = socket.create_connection((host, int(port)), timeout=5)
 s.sendall(f"CONNECT {pod_uid}:8080 HTTP/1.1\r\nHost: {pod_uid}:8080\r\n\r\n".encode())
 resp = s.recv(4096).decode()
 s.close()
-assert resp.startswith("HTTP/1.1 404") or resp.startswith("HTTP/1.1 403"), f"expected 404/403 after delete, got: {resp!r}"
+assert resp.startswith("HTTP/1.1 404 ") and "Proxy-Status:" in resp, f"expected 404 with Proxy-Status after delete, got: {resp!r}"
 print("PASS ingress revoked after Pod deletion:", resp.splitlines()[0])
 PY
 

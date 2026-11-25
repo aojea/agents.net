@@ -1584,7 +1584,7 @@ func (d *Driver) reportResourceClaimDeviceStatusAsync(cfg store.PodConfig, ready
 					if proto == "" {
 						proto = apis.IngressProtocolTCP
 					}
-					ports[i] = apis.IngressPort{Port: p.Port, Protocol: proto}
+					ports[i] = apis.IngressPort{Port: p.Port, EndPort: p.EndPort, Protocol: proto}
 				}
 				devStatus.Ingress = &apis.IngressStatus{
 					Endpoint:   endpoint,
@@ -1671,7 +1671,11 @@ func getNetworkNamespace(pod *nriapi.PodSandbox) string {
 func formatIngressPorts(ports []apis.IngressPort) string {
 	parts := make([]string, 0, len(ports))
 	for _, p := range ports {
-		parts = append(parts, strconv.FormatInt(int64(p.Port), 10))
+		if p.EndPort > p.Port {
+			parts = append(parts, fmt.Sprintf("%d-%d", p.Port, p.EndPort))
+		} else {
+			parts = append(parts, strconv.FormatInt(int64(p.Port), 10))
+		}
 	}
 	return strings.Join(parts, ",")
 }

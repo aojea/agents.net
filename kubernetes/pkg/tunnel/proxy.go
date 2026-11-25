@@ -36,8 +36,9 @@ import (
 )
 
 const (
-	maxHeadBytes    = 64 * 1024
-	udpTargetPrefix = "/.well-known/masque/udp/"
+	maxHeadBytes        = 64 * 1024
+	maxInterimResponses = 8
+	udpTargetPrefix     = "/.well-known/masque/udp/"
 )
 
 type headError struct {
@@ -91,8 +92,11 @@ func readHead(br *bufio.Reader) (*requestHead, error) {
 		return nil, &headError{status: 400, reason: "malformed-request-line"}
 	}
 	method, target, version := parts[0], parts[1], parts[2]
-	if version != "HTTP/1.1" {
-		return nil, &headError{status: 505, reason: "unsupported-http-version"}
+	if version != "HTTP/1.1" && version != "HTTP/1.0" {
+		if strings.HasPrefix(version, "HTTP/") {
+			return nil, &headError{status: 505, reason: "unsupported-version"}
+		}
+		return nil, &headError{status: 400, reason: "malformed-request-line"}
 	}
 
 	type rawHeader struct {
@@ -137,8 +141,11 @@ func readHead(br *bufio.Reader) (*requestHead, error) {
 		}
 		parsedHeaders = append(parsedHeaders, rawHeader{key: k, lower: lowerK, val: val})
 	}
-	if hostCount != 1 || hostHeader == "" {
-		return nil, &headError{status: 400, reason: "missing-or-duplicate-host"}
+	if hostCount > 1 {
+		return nil, &headError{status: 400, reason: "duplicate-host"}
+	}
+	if version == "HTTP/1.1" && (hostCount == 0 || hostHeader == "") {
+		return nil, &headError{status: 400, reason: "missing-host"}
 	}
 
 	// Collect hop-by-hop header names listed in Connection plus RFC 9110 fixed hop-by-hop headers.
@@ -179,8 +186,7 @@ func readHead(br *bufio.Reader) (*requestHead, error) {
 		if err != nil {
 			return nil, &headError{status: 400, reason: "malformed-authority"}
 		}
-		hHost, hPort, err := splitStrictAuthority(hostHeader)
-		if err != nil || !strings.EqualFold(host, hHost) || port != hPort {
+		if hostHeader != "" && !sameAuthority(hostHeader, target) {
 			return nil, &headError{status: 400, reason: "authority-mismatch"}
 		}
 		h.host = host
@@ -329,6 +335,26 @@ func splitStrictAuthority(authority string) (string, string, error) {
 	return host, port, nil
 }
 
+// sameAuthority compares two host:port authorities after normalizing case, a
+// single trailing DNS dot, and IPv4/IPv6 text representations.
+func sameAuthority(a, b string) bool {
+	hostA, portA, errA := splitStrictAuthority(a)
+	hostB, portB, errB := splitStrictAuthority(b)
+	if errA != nil || errB != nil || portA != portB {
+		return false
+	}
+	if addrA, err := netip.ParseAddr(hostA); err == nil {
+		addrB, err := netip.ParseAddr(hostB)
+		return err == nil && addrA == addrB
+	}
+	return strings.EqualFold(strings.TrimSuffix(hostA, "."), strings.TrimSuffix(hostB, "."))
+}
+
+func encodeConnectUDPHost(host string) string {
+	// RFC 9298 Section 3 requires ":" in IPv6 literals to be percent-encoded.
+	return strings.ReplaceAll(url.PathEscape(host), ":", "%3A")
+}
+
 func validatePort(value string) error {
 	n, err := strconv.ParseUint(value, 10, 16)
 	if err != nil || n == 0 {
@@ -381,19 +407,17 @@ func sanitizeHeaderOutput(s string) string {
 	return b.String()
 }
 
-// writeH1Deny emits an RFC 9110 error response with both the agents.net Boundary-Reason
-// header (agents.net Section 2.1) and an RFC 9209 Proxy-Status header.
+// writeH1Deny emits an RFC 9110 error response carrying an RFC 9209 Proxy-Status header.
 func writeH1Deny(conn net.Conn, timeout time.Duration, status int, reason string) {
 	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 	text := http.StatusText(status)
 	if text == "" {
 		text = "Error"
 	}
-	cleanReason := sanitizeHeaderOutput(reason)
-	escaped := strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(cleanReason)
+	proxyStatus := apis.FormatProxyStatus("dra-agents-net", status, reason)
 	resp := fmt.Sprintf(
-		"HTTP/1.1 %d %s\r\nBoundary-Reason: %s\r\nProxy-Status: dra-agents-net; error=http_request_denied; details=\"%s\"\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-		status, text, cleanReason, escaped,
+		"HTTP/1.1 %d %s\r\nProxy-Status: %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+		status, text, proxyStatus,
 	)
 	_, _ = io.WriteString(conn, resp)
 }
@@ -406,10 +430,10 @@ func writeH1RawDeny(conn net.Conn, timeout time.Duration, status int, proxyStatu
 	}
 	cleanStatus := sanitizeHeaderOutput(proxyStatus)
 	if cleanStatus == "" {
-		cleanStatus = `dra-agents-net; error=http_request_denied; details="upstream-denied"`
+		cleanStatus = apis.FormatProxyStatus("dra-agents-net", status, "upstream-denied")
 	}
 	resp := fmt.Sprintf(
-		"HTTP/1.1 %d %s\r\nBoundary-Reason: upstream-denied\r\nProxy-Status: %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+		"HTTP/1.1 %d %s\r\nProxy-Status: %s\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
 		status, text, cleanStatus,
 	)
 	_, _ = io.WriteString(conn, resp)
@@ -484,10 +508,11 @@ type upstreamDialer struct {
 	dialTime  time.Duration
 	dialNet   func(ctx context.Context, network, addr string) (net.Conn, error)
 
-	mu     sync.Mutex
-	closed bool
-	h2Tr   *http.Transport
-	useH1  atomic.Bool
+	mu       sync.Mutex
+	closed   bool
+	h2Tr     *http.Transport
+	useH1    atomic.Bool
+	useH1UDP atomic.Bool
 }
 
 func newUpstreamDialer(
@@ -512,7 +537,10 @@ func newUpstreamDialer(
 }
 
 func (u *upstreamDialer) negotiatedProtocol(isUDP bool) string {
-	if isUDP || u.target.scheme != "https" || u.useH1.Load() {
+	if u.target.scheme != "https" || u.useH1.Load() {
+		return "HTTP1"
+	}
+	if isUDP && u.useH1UDP.Load() {
 		return "HTTP1"
 	}
 	return "HTTP2"
@@ -649,7 +677,7 @@ func (u *upstreamDialer) dialH2Connect(ctx context.Context, authority string, hd
 		return nil, err
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		proxyStatus := resp.Header.Get("Proxy-Status")
 		_ = resp.Body.Close()
 		cancel()
@@ -730,7 +758,7 @@ func (u *upstreamDialer) dialH1Connect(ctx context.Context, authority string, hd
 
 	limiter := &boundedReader{r: conn, remaining: maxHeadBytes}
 	br := bufio.NewReader(limiter)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodConnect})
+	resp, err := readFinalH1Response(br, &http.Request{Method: http.MethodConnect})
 	if !stopCancel() {
 		_ = conn.Close()
 		if ctx.Err() != nil {
@@ -745,7 +773,7 @@ func (u *upstreamDialer) dialH1Connect(ctx context.Context, authority string, hd
 	_ = conn.SetDeadline(time.Time{})
 	limiter.remaining = -1
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		proxyStatus := resp.Header.Get("Proxy-Status")
 		_ = conn.Close()
 		return nil, &upstreamDeniedError{
@@ -762,13 +790,48 @@ func (u *upstreamDialer) dialH1Connect(ctx context.Context, authority string, hd
 	}, nil
 }
 
-// dialUDP forwards an RFC 9298 connect-udp tunnel (HTTP/1.1 Upgrade: connect-udp +
-// Capsule-Protocol: ?1) over the authenticated upstream transport.
+// readFinalH1Response skips non-101 1xx interim responses (RFC 9110 Section 15.2).
+// 101 Switching Protocols is the final response for an upgrade and is returned.
+func readFinalH1Response(br *bufio.Reader, req *http.Request) (*http.Response, error) {
+	for interim := range maxInterimResponses + 1 {
+		resp, err := http.ReadResponse(br, req)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode < 100 || resp.StatusCode >= 200 || resp.StatusCode == http.StatusSwitchingProtocols {
+			return resp, nil
+		}
+		if interim == maxInterimResponses {
+			return nil, fmt.Errorf("upstream sent more than %d interim responses", maxInterimResponses)
+		}
+	}
+	return nil, errors.New("unexpected interim response loop termination")
+}
+
+// dialUDP forwards an RFC 9298 connect-udp tunnel over the authenticated upstream
+// transport. Over https://, it prefers HTTP/2 extended CONNECT (:protocol: connect-udp,
+// RFC 8441) multiplexed on the shared HTTP/2 session and falls back to HTTP/1.1
+// Upgrade: connect-udp when the PEP negotiates http/1.1 or does not advertise
+// SETTINGS_ENABLE_CONNECT_PROTOCOL.
 func (u *upstreamDialer) dialUDP(ctx context.Context, host, port string, id auth.WorkloadIdentity) (*upstreamTunnel, error) {
 	hdrs, err := u.buildAuthHeaders(ctx, id)
 	if err != nil {
 		return nil, &upstreamDeniedError{status: 502, reason: "upstream-auth-failed"}
 	}
+	if u.target.scheme == "https" && !u.useH1.Load() && !u.useH1UDP.Load() {
+		tun, err := u.dialH2ConnectUDP(ctx, host, port, hdrs)
+		if err == nil {
+			return tun, nil
+		}
+		if errors.Is(err, errALPNFallbackHTTP1) || errors.Is(err, errExtendedConnectNotSupported) {
+			return u.dialH1ConnectUDP(ctx, host, port, hdrs)
+		}
+		return nil, err
+	}
+	return u.dialH1ConnectUDP(ctx, host, port, hdrs)
+}
+
+func (u *upstreamDialer) dialH1ConnectUDP(ctx context.Context, host, port string, hdrs http.Header) (*upstreamTunnel, error) {
 	conn, err := u.dialRawUpstreamConn(ctx, []string{"http/1.1"})
 	if err != nil {
 		return nil, err
@@ -780,7 +843,7 @@ func (u *upstreamDialer) dialUDP(ctx context.Context, host, port string, id auth
 		_ = conn.SetDeadline(time.Now())
 	})
 
-	targetPath := fmt.Sprintf("%s%s/%s/", udpTargetPrefix, url.PathEscape(host), url.PathEscape(port))
+	targetPath := fmt.Sprintf("%s%s/%s/", udpTargetPrefix, encodeConnectUDPHost(host), url.PathEscape(port))
 	var reqBuf strings.Builder
 	fmt.Fprintf(&reqBuf, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n", targetPath, u.target.host)
 	writeHTTPHeaders(&reqBuf, hdrs)
@@ -793,7 +856,7 @@ func (u *upstreamDialer) dialUDP(ctx context.Context, host, port string, id auth
 
 	limiter := &boundedReader{r: conn, remaining: maxHeadBytes}
 	br := bufio.NewReader(limiter)
-	resp, err := http.ReadResponse(br, &http.Request{Method: http.MethodGet})
+	resp, err := readFinalH1Response(br, &http.Request{Method: http.MethodGet})
 	if !stopCancel() {
 		_ = conn.Close()
 		if ctx.Err() != nil {
