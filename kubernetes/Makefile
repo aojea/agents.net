@@ -1,3 +1,4 @@
+export GOWORK := off
 IMAGE ?= ghcr.io/aojea/agents.net/dra-agents-net:latest
 
 .PHONY: build test vet fmt image smoke
