@@ -2,7 +2,7 @@
 
 This directory is the Go module `github.com/aojea/agents.net/kubernetes`. It contains two binaries:
 
-- `cmd/dra-agents-net`: a per-node Kubernetes Network Driver (DRA + NRI DaemonSet, driver name `dra.agents.net`) that isolates Pods and forwards egress to a Policy Enforcement Point (PEP) over [`agents.net`](../spec/draft/index.md).
+- `cmd/dra-agents-net`: a per-node Kubernetes Network Driver (DRA + NRI DaemonSet, driver name `dra.agents.net`) that isolates Pods and forwards egress to a Policy Enforcement Point (PEP) over [`agents.net`](../SPEC.md).
 - `cmd/agents-net-ingress-gateway`: a stateless ingress gateway that watches `ResourceClaim` status and delivers inbound HTTP traffic to isolated Pods over the node ingress bridge.
 
 Any Kubernetes Pod (`Pod`, `Deployment`, `StatefulSet`, or sandbox controllers such as [`kubernetes-sigs/agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox)) attaches `dra-agents-net` through standard `DeviceClass`, `ResourceClaimTemplate`, and `ResourceClaim` objects, with no changes to workload CRDs.
@@ -55,7 +55,7 @@ Why put `agents.net` between the Pod and the PEP:
 
 ### Adapter choices
 
-`agents.net` supports multiple adapter placements ([spec/draft/adapters.md](../spec/draft/adapters.md), [sdk/README.md](../sdk/README.md)):
+`agents.net` supports multiple adapter placements ([SPEC.md](../SPEC.md#part-2-implementation-patterns), [sdk/README.md](../sdk/README.md)):
 
 - **Explicit proxy (`adapterMode: ExplicitProxy`, default in `install.yaml`):** `dra-agents-net` binds `127.0.0.1:15001` (configurable via `proxy.port`) inside the Pod netns using `socketat` and injects `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `NODE_USE_ENV_PROXY`, `GRPC_PROXY_EXP`, and `JAVA_TOOL_OPTIONS`. No sidecar container runs in the Pod. Only proxy-aware clients can reach the PEP; clients that ignore proxy variables fail closed.
 - **In-Pod TUN sidecar (`adapterMode: TunSidecar`):** a native sidecar container named `agents-net-tun2connect` (see [sdk/cmd/tun2connect](../sdk/README.md#1-in-guest-networking-with-tun-and-virtual-dns)) runs inside the Pod with `/dev/net/tun` and `/run/agents.net/egress.sock`. It captures TCP, UDP, and DNS transparently, including clients that ignore `HTTP_PROXY`.
@@ -98,7 +98,7 @@ Every upstream `CONNECT` and `connect-udp` request carries node-attested headers
 
 Ingress is separate from egress and off by default. On the CLI, `--ingress-addr` defaults to empty (disabled); [install.yaml](install.yaml) passes `--ingress-addr=:15080`.
 
-When a Pod's `DriverConfig` sets `ingressPorts`, `dra-agents-net` serves `CONNECT <podUID>:<port> HTTP/1.1` on `--ingress-addr` (with optional TLS/mTLS via `--ingress-tls-cert`, `--ingress-tls-key`, `--ingress-client-ca`), sets `AGENT_INGRESS_PORT` in workload containers ([spec/draft/ingress.md](../spec/draft/ingress.md)), and publishes a `dra.agents.net/v1alpha1` `DeviceStatus` in `ResourceClaim.status.devices[].data`:
+When a Pod's `DriverConfig` sets `ingressPorts`, `dra-agents-net` serves `CONNECT <podUID>:<port> HTTP/1.1` on `--ingress-addr` (with optional TLS/mTLS via `--ingress-tls-cert`, `--ingress-tls-key`, `--ingress-client-ca`), sets `AGENT_INGRESS_PORT` in workload containers ([SPEC.md](../SPEC.md#ingress-path)), and publishes a `dra.agents.net/v1alpha1` `DeviceStatus` in `ResourceClaim.status.devices[].data`:
 
 ```json
 {
@@ -250,7 +250,7 @@ On Linux hosts with unprivileged user namespaces enabled, `go test` runs the mul
 ## References
 
 - Antonio Ojea, *"The Kubernetes Network Driver Model: A Composable Architecture for High-Performance Networking,"* 2025 IEEE 50th Conference on Local Computer Networks (LCN), [doi:10.1109/LCN65610.2025.11146291](https://doi.org/10.1109/LCN65610.2025.11146291) ([arXiv:2506.23628](https://arxiv.org/abs/2506.23628)).
-- [agents.net specification](../spec/draft/index.md)
+- [agents.net specification](../SPEC.md)
 - [Kubernetes KEP-6313: Network-Isolated Pods](https://github.com/kubernetes/enhancements/issues/6313) ([kubernetes#143280](https://github.com/kubernetes/kubernetes/pull/143280))
 - [DRANET (`kubernetes-sigs/dranet`)](https://github.com/kubernetes-sigs/dranet)
 - [CVE-2026-98432](https://nvd.nist.gov/vuln/detail/CVE-2026-98432) and [CVE-2024-1086](https://nvd.nist.gov/vuln/detail/CVE-2024-1086)

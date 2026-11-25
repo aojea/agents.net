@@ -214,7 +214,7 @@ func podKey(ns, name string) string {
 	return ns + "/" + name
 }
 
-// AuditRecord captures one ingress delivery decision per spec/draft/ingress.md §2.
+// AuditRecord captures one ingress delivery decision.
 type AuditRecord struct {
 	Timestamp string `json:"ts"`
 	Direction string `json:"direction"`

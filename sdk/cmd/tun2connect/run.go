@@ -391,7 +391,7 @@ func joinAddress(target string, viaTUN bool) string {
 }
 
 // serveIngress answers HTTP CONNECT on the reverse channel
-// (spec/draft/ingress.md Section 2) and joins each accepted stream to the
+// (SPEC.md) and joins each accepted stream to the
 // agent's listener, so the host can deliver inbound requests without the
 // sandbox exposing any port. Only the pinned ports are reachable: the
 // request names one, it does not choose another. With viaTUN the stream
@@ -445,7 +445,7 @@ func bufferedBytes(br *bufio.Reader) io.Reader {
 
 // ingressTarget parses one HTTP/1.1 CONNECT head and checks that it names
 // a loopback address and a pinned port. It returns the address to dial, or
-// a refusal token and its HTTP status (spec/draft/registries.md Section 2).
+// a refusal token and its HTTP status (SPEC.md).
 // The head is read here rather than with net/http, which discards the Host
 // field before it can be compared with the request-target.
 func ingressTarget(br *bufio.Reader, pinned *portSet) (target string, status int, reason string) {

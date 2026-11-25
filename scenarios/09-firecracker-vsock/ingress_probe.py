@@ -4,7 +4,7 @@
 Host side of the ingress channel: connect to Firecracker's vsock Unix socket,
 ask it for the guest's ingress port (Firecracker's own "CONNECT <port>" ->
 "OK <hostport>" exchange), then perform the agents.net ingress handshake
-(HTTP `CONNECT 127.0.0.1:<port>` -> 200, spec/draft/ingress.md) and send the
+(HTTP `CONNECT 127.0.0.1:<port>` -> 200, SPEC.md) and send the
 request. Prints the response body. A refusal prints the Proxy-Status reason.
 """
 import socket

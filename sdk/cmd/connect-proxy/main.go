@@ -1,6 +1,6 @@
 // Command connect-proxy is the reference boundary: CONNECT for TCP and
 // connect-udp (RFC 9298) for UDP, applying a deny-by-default policy
-// descriptor (spec/draft/policy.md) on destination names, addresses,
+// descriptor (conformance/schema/policy.schema.json) on destination names, addresses,
 // ports, and transports, with one JSON audit record per decision.
 // Hostnames are resolved by the boundary and only public or explicitly
 // listed resolved addresses are dialed, so an allowed name cannot reach
@@ -100,7 +100,7 @@ func boundaryTLSConfig(certPath, keyPath, clientCAPath string) (*tls.Config, err
 	return config, nil
 }
 
-// auditRecord is one JSON line per decision (spec/draft/audit.md).
+// auditRecord is one JSON line per decision (conformance/schema/audit.schema.json).
 // Guest-supplied fields are JSON-encoded, so they cannot inject line
 // breaks or additional fields.
 type auditRecord struct {
@@ -720,7 +720,7 @@ func serveListener(ln net.Listener, useH2 bool, maxConnections, maxStreams int) 
 
 func main() {
 	listen := flag.String("listen", "unix:///tmp/boundary.sock", "listen address (unix:///path or tcp://host:port)")
-	policyPath := flag.String("policy", "", "policy descriptor file (spec/draft/policy.md) bound to this listener; required")
+	policyPath := flag.String("policy", "", "policy descriptor file bound to this listener; required")
 	generation := flag.String("generation", "", "controller-assigned sandbox generation recorded in every audit record")
 	resolver := flag.String("resolver", "", "DNS server host:port the boundary resolves allowed hostnames with (default: the system resolver)")
 	maxConnections := flag.Int("max-connections", 1024, "maximum concurrently accepted client connections or HTTP/2 sessions; further connections receive 503")

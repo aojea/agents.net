@@ -1,7 +1,7 @@
 # Boundary Networking Experiments
 
 The scenarios in this directory are component experiments that support the
-[agents.net specification](../spec/draft/index.md). They aren't a complete
+[agents.net specification](../SPEC.md). They aren't a complete
 comparison of production isolation architectures; the specification defines
 the security and interoperability requirements and records the implementation
 gaps. The directory names are kept for compatibility, so read the table below
