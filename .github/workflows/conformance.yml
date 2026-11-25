@@ -5,14 +5,12 @@ on:
     branches: [ main ]
     paths:
       - 'conformance/**'
-      - 'spec/draft/schema/**'
       - 'sdk/**'
       - '.github/workflows/conformance.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'conformance/**'
-      - 'spec/draft/schema/**'
       - 'sdk/**'
       - '.github/workflows/conformance.yml'
 

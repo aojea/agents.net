@@ -2,9 +2,9 @@
 
 Build a zero-network sandbox from scratch, one command at a time.
 
-This tutorial walks through the [agents.net](../README.md) reference implementation ([sdk/](../sdk/README.md)) end to end. You'll run an unmodified agent harness in a container started with **`--network none`**, confined by a launcher that is injected at `docker run` time. Every connection the harness opens crosses one Unix socket as a named HTTP `CONNECT` tunnel ([the spec's egress wire](../spec/draft/wire.md)), and the host checks it against policy and writes an audit line. A later section swaps the boundary for other CONNECT-terminating implementations, including an unmodified Envoy.
+This tutorial walks through the [agents.net](../README.md) reference implementation ([sdk/](../sdk/README.md)) end to end. You'll run an unmodified agent harness in a container started with **`--network none`**, confined by a launcher that is injected at `docker run` time. Every connection the harness opens crosses one Unix socket as a named HTTP `CONNECT` tunnel ([SPEC.md](../SPEC.md#egress-path)), and the host checks it against policy and writes an audit line. A later section swaps the boundary for other CONNECT-terminating implementations, including an unmodified Envoy.
 
-Read the [agents.net specification](../spec/draft/index.md) first; it covers the sandbox definition, the egress boundary interface, the TLS inspection models, the ingress interface, the security model, and the decision matrix. This tutorial assumes that background and concentrates on running the pieces.
+Read [SPEC.md](../SPEC.md) first for the PEP architecture, HTTP `CONNECT` framing, ingress path, and optional TLS inspection. This tutorial concentrates on running the pieces.
 
 By default everything runs against a local model server ([Ollama](https://ollama.com)), so you don't need a paid API key or an account with any model provider. A later section points the same image at a hosted provider through the boundary's credential-inject tier; the key stays on the host, and neither the image nor the run command changes.
 
@@ -83,7 +83,7 @@ The host boundary terminates TLS locally for its fake-response tier, so it needs
 
 This creates:
 
-- `demo/certs/agent-ca.pem` / `agent-ca.key`: the demo root CA. The [Dockerfile](Dockerfile) bakes `agent-ca.pem` into the image's system trust store at build time (the trust-store coordination described in the spec's [TLS inspection models](../spec/draft/gateway.md#1-tls-inspection-and-verification-models)), so run this lab **before** Lab 5.
+- `demo/certs/agent-ca.pem` / `agent-ca.key`: the demo root CA. The [Dockerfile](Dockerfile) bakes `agent-ca.pem` into the image's system trust store at build time (see [SPEC.md](../SPEC.md#egress-path)), so run this lab **before** Lab 5.
 - `demo/certs/agent-mitm.pem` / `agent-mitm.key`: one leaf certificate with a `SAN` entry for each host the boundary terminates TLS for (`example.com` by default). The leaf stays on the host and never enters the image, so adding TLS-inspected hosts later needs no rebuild.
 
 The script lists exact hostnames as `SAN` entries rather than using a wildcard, because `*.example.com` matches one subdomain label and not the bare apex `example.com`. A private demo CA isn't bound by the CA/Browser Forum's wildcard rules, so exact names are the simpler choice and cover any host you add. Pass extra hostnames as arguments, for example `./demo/gen_certs.sh api.openai.com`; you'll need that only for the cloud-migration bonus.
@@ -138,7 +138,7 @@ the sandbox the agent sees a failed connection. The demo policy also refuses IP
 literals, but that is a choice of this sample policy rather than a limit of the
 protocol or the launcher: the [Go boundary](../sdk/cmd/connect-proxy/main.go)
 accepts addresses and CIDRs through `ip` and `cidr` rules in its
-[policy descriptor](../spec/draft/policy.md). Unlike this demo, it also
+[policy descriptor](../conformance/schema/policy.schema.json). Unlike this demo, it also
 resolves allowed hostnames itself and refuses results that aren't public
 addresses.
 
@@ -179,7 +179,7 @@ Every connection attempt fails at once, because the container has no `eth0`, no 
 
 ## Lab 6: Run the Agent Behind the Injected Launcher
 
-Now run the agent behind the launcher. This is the **entrypoint injection** the spec recommends: the launcher binary is bind-mounted read-only, `--entrypoint` puts it in front of the image's command, and three flags supply what the [egress boundary interface](../spec/draft/wire.md#1-egress-boundary-interface) needs, namely no network, a tun device, and the socket directory:
+Now run the agent behind the launcher. This is the **entrypoint injection** the spec recommends: the launcher binary is bind-mounted read-only, `--entrypoint` puts it in front of the image's command, and three flags supply what the [egress channel](../SPEC.md#capabilities-and-trust-boundary) needs, namely no network, a tun device, and the socket directory:
 
 ```bash
 docker run --rm \
@@ -244,7 +244,7 @@ From another terminal, deliver a webhook through the boundary's public ingress g
 curl -s -X POST -d 'deploy finished' http://localhost:9000/webhook
 ```
 
-The boundary dials the sandbox's ingress socket and performs the [ingress handshake](../spec/draft/ingress.md#2-wire): it sends `CONNECT 127.0.0.1:8081 HTTP/1.1`, and the launcher answers `200` and joins the stream to the agent's loopback listener. (A microVM offers the same channel over vsock.) The agent prints the delivered payload, and the audit log gains an `INGRESS` line.
+The boundary dials the sandbox's ingress socket and performs the [ingress handshake](../SPEC.md#ingress-path): it sends `CONNECT 127.0.0.1:8081 HTTP/1.1`, and the launcher answers `200` and joins the stream to the agent's loopback listener. (A microVM offers the same channel over vsock.) The agent prints the delivered payload, and the audit log gains an `INGRESS` line.
 
 *Permissions note:* the launcher creates the ingress socket file from inside the container and sets its mode to `0666` so that the unprivileged `host_proxy.py` can dial it. If you swap in a launcher that doesn't, open it yourself: `docker exec <container> chmod 666 /var/run/agents.net/ingress-proxy.sock`. Under rootless Podman the question doesn't arise, because container root is your own uid and the socket is created owned by you.
 
@@ -265,7 +265,7 @@ The startup banner now lists the host with a non-secret fingerprint (`sha256:...
 
 ## Implementation Examples
 
-The [specification](../spec/draft/wire.md) uses HTTP CONNECT between the
+The [specification](../SPEC.md#egress-path) uses HTTP CONNECT between the
 guest adapter and the boundary. The examples below put different
 implementations of that interface at the boundary. Each deployment still has
 to supply its own channel access controls, workload identity, and destination
@@ -273,7 +273,7 @@ policy.
 
 ### Lab A: the reference boundary, no root required
 
-`connect-proxy` is the Go counterpart of `host_proxy.py`. It reads a [policy descriptor](../spec/draft/policy.md), denies by default on names, addresses, ports, and transports, and writes one JSON audit record per decision. curl speaks CONNECT to HTTP proxies, so you can watch the policy work without a sandbox:
+`connect-proxy` is the Go counterpart of `host_proxy.py`. It reads a [policy descriptor](../conformance/schema/policy.schema.json), denies by default on names, addresses, ports, and transports, and writes one JSON audit record per decision. curl speaks CONNECT to HTTP proxies, so you can watch the policy work without a sandbox:
 
 ```bash
 go -C sdk build -o /tmp/connect-proxy ./cmd/connect-proxy

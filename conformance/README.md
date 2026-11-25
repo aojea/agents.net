@@ -1,15 +1,11 @@
 # agents.net Conformance Suite
 
 **Suite version:** 0.1  
-**Tests:** [agents.net specification, version 1 (draft)](../spec/draft/index.md)  
-**Fixtures:** [fixtures/](fixtures/) — **Schemas:** [spec/draft/schema/](../spec/draft/schema/) — **Harness:** [harness/](harness/)
+**Tests:** [agents.net specification](../SPEC.md)  
+**Fixtures:** [fixtures/](fixtures/) — **Schemas:** [schema/](schema/) — **Harness:** [harness/](harness/)
 
 This suite tests an implementation of one agents.net role (boundary,
-adapter, controller, or ingress gateway) against the draft specification.
-A conformance claim names the role, the profiles, and the suite version,
-and comes with two documents: the results file the harness writes and
-the implementation statement described in
-[registries.md §4](../spec/draft/registries.md#4-implementation-statement).
+adapter, controller, or ingress gateway) against [SPEC.md](../SPEC.md).
 The implementation is conformant when every case in the claimed profiles
 has the result `pass` or `skip` and you have recorded every item of the
 runtime audit checklist that applies to the role.
@@ -46,12 +42,10 @@ which of them harness 0.1 automates.
 | `controller-snapshot` | C-SNAP | 01–02 | controller.json | No |
 | `ingress-gateway` | I-ING | 01–06 | [ingress.json](fixtures/ingress.json) | No |
 
-A profile's prerequisite profiles, listed in
-[registries.md §1](../spec/draft/registries.md#1-roles-and-profiles),
-must be claimed along with it. Some cases carry a `requires` list naming
+Some cases carry a `requires` list naming
 a capability (`ipv6`, `udp_enabled`, `synthetic_dns`, `socks5`,
 `diagnostics`, `snapshot`, or `two_sandboxes`). When the environment or
-your implementation statement lacks that capability, the case's result
+your implementation lacks that capability, the case's result
 is `skip`.
 
 ## 3. Harness Architecture
@@ -100,7 +94,7 @@ The driver writes the IUT's audit lines to the file the harness names.
 After each case the harness reads the lines appended during that case
 and checks each one for the required fields, the field allowlist, the
 `wire`, `decision`, and `transport` enumerations, and the reason token
-syntax of [audit.schema.json](../spec/draft/schema/audit.schema.json).
+syntax of [audit.schema.json](schema/audit.schema.json).
 It does not load the schema itself; `check_fixtures.py` does that for
 the audit examples in the fixtures.
 
@@ -192,7 +186,7 @@ A fixture is a JSON file of cases. Each case looks like this:
 
 | Field | Content |
 | --- | --- |
-| `policy` | Key into the file's `policies`; each entry has a `descriptor` ([policy.md](../spec/draft/policy.md)) and optional `iut` hints |
+| `policy` | Key into the file's `policies`; each entry has a `descriptor` ([policy.schema.json](schema/policy.schema.json)) and optional `iut` hints |
 | `harness` | `h1`, `h1-busy`, `h1-proxystatus`, `dns`, `h2`, `udp`, `tls`, `multi`, `manual` |
 | `request.raw` | Bytes sent after connecting; `\r\n` as written; placeholders substituted |
 | `request.dns` | For `dns` cases: name to address list, or list of successive answers for rebinding |

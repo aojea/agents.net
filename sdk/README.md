@@ -1,7 +1,7 @@
 # agents.net Reference Implementation (Go)
 
 This directory is the Go module `github.com/aojea/agents.net/sdk`, the
-reference implementation of the [specification](../spec/draft/index.md). It
+reference implementation of the [specification](../SPEC.md). It
 contains a library for the egress wire and for writing adapters, three
 adapters (the in-guest TUN launcher, the namespace proxy, and the QEMU packet
 backend), and `connect-proxy`, the reference boundary. The code lives in its
@@ -159,7 +159,7 @@ host's root network namespace, and keep untrusted workload processes in a
 namespace of their own. `ip netns exec` restricts neither filesystem nor
 process access, so the runtime must also confine the proxy to its assigned
 socket and protect host files, processes, and management endpoints as
-described in [identity.md](../spec/draft/identity.md#2-isolation-and-channel-ownership).
+described in [SPEC.md](../SPEC.md#capabilities-and-trust-boundary).
 The proxy refuses to start if the namespace has any non-loopback interface
 other than the one it was given. It installs its own nftables table
 (`agents_net` by default), uses routing table and priority `16666`, and
@@ -230,7 +230,7 @@ as opaque tunnel payload; the adapter never chooses the CONNECT authority by
 inspecting application headers.
 
 The adapter needs the filesystem, process, and network confinement described
-in [identity.md](../spec/draft/identity.md#2-isolation-and-channel-ownership),
+in [SPEC.md](../SPEC.md#capabilities-and-trust-boundary),
 and QEMU must have no other external network backend. The packet channel
 lives as long as the VM and does not reconnect, so the controller stops the
 VM when its adapter fails. A restart, snapshot, or restore must not attach
@@ -256,11 +256,11 @@ what each one holds:
 - [sdk/pkg/tun2connect/forwarder.go](../sdk/pkg/tun2connect/forwarder.go): DNS-aware dialing and the TCP and UDP socket relays shared by all adapters.
 - [sdk/pkg/netnsproxy/proxy_linux.go](../sdk/pkg/netnsproxy/proxy_linux.go): the kernel socket adapter and its namespace-local nftables setup.
 - [sdk/cmd/netnsproxy/main_linux.go](../sdk/cmd/netnsproxy/main_linux.go): the namespace proxy command, which reaches the boundary over a Unix socket.
-- [sdk/cmd/connect-proxy/main.go](../sdk/cmd/connect-proxy/main.go): the reference boundary. It loads a [policy descriptor](../spec/draft/policy.md), resolves names itself and dials only the addresses it has checked, speaks HTTP/1.1 and multiplexed HTTP/2, tunnels UDP capsules, verifies mTLS client certificates, enforces connection and idle budgets, reports failures with `Proxy-Status`, and writes one JSON audit record per decision. [policy.go](../sdk/cmd/connect-proxy/policy.go) holds the descriptor loader and the authorization logic.
+- [sdk/cmd/connect-proxy/main.go](../sdk/cmd/connect-proxy/main.go): the reference boundary. It loads a [policy descriptor](../conformance/schema/policy.schema.json), resolves names itself and dials only the addresses it has checked, speaks HTTP/1.1 and multiplexed HTTP/2, tunnels UDP capsules, verifies mTLS client certificates, enforces connection and idle budgets, reports failures with `Proxy-Status`, and writes one JSON audit record per decision. [policy.go](../sdk/cmd/connect-proxy/policy.go) holds the descriptor loader and the authorization logic.
 - [sdk/cmd/tun2connect/main.go](../sdk/cmd/tun2connect/main.go): the in-guest side. It runs either as a standalone daemon or, with `run`, as the launcher that becomes PID 1, creates the TUN, and supervises the agent.
 
 The boundary reads its whole policy from one file, given as
-`-policy descriptor.json`, in the [descriptor format](../spec/draft/policy.md).
+`-policy descriptor.json`, in the [descriptor format](../conformance/schema/policy.schema.json).
 A descriptor holds allow rules on exact names, name suffixes, the `*`
 wildcard, literal addresses, and prefixes. Each rule may restrict ports
 (integers or `"a-b"` ranges) and transports, and a name rule may carry a
@@ -290,7 +290,7 @@ go -C sdk run ./cmd/connect-proxy \
 For a hostname request the boundary resolves the name itself and keeps only
 public unicast results. Loopback, private, link-local, multicast,
 shared-address-space, NAT64, documentation, and other special-purpose ranges
-([wire.md §5.1](../spec/draft/wire.md#51-special-purpose-addresses)) are
+([SPEC.md](../SPEC.md#egress-path)) are
 denied unless a `resolve` list, a literal rule for that port, or a
 `resolved_addresses` entry admits them. The boundary then dials the checked
 address rather than the name, so a rebinding answer cannot change the
@@ -336,7 +336,7 @@ that has carried no data in either direction for that long; 0 disables it.
 When the client sends EOF, the boundary half-closes the upstream.
 
 Every decision is written to standard output as one JSON object in the
-[audit record format](../spec/draft/audit.md). The fields are `ts`,
+[audit record format](../conformance/schema/audit.schema.json). The fields are `ts`,
 `listener`, `sandbox`, `generation`, `policy`, `wire`, `transport`,
 `destination` (as requested, after normalization), `address` (as dialed),
 `peer` (the mTLS identity when there is one), `connection` (an id shared by
@@ -371,7 +371,7 @@ network of its own, confined by the injected `tun2connect` launcher:
 ![agents.net terminal demo](../demo/terminal-demo.gif)
 
 - [demo/README.md](../demo/README.md): how to build and run the sandbox, step by step.
-- [demo/host_proxy.py](../demo/host_proxy.py): a Python host boundary with a four-tier allowlist (fake responses, a relay to local Ollama, cloud credential injection, and uninspected passthrough). Credential injection rewrites only the first request on each tunnel; later requests on a reused connection pass through unchanged, which a production gateway must not allow ([gateway.md](../spec/draft/gateway.md#2-credential-placement-and-tenant-isolation)).
+- [demo/host_proxy.py](../demo/host_proxy.py): a Python host boundary with a four-tier allowlist (fake responses, a relay to local Ollama, cloud credential injection, and uninspected passthrough). Credential injection rewrites only the first request on each tunnel; later requests on a reused connection pass through unchanged, which a production gateway must not allow ([SPEC.md](../SPEC.md#egress-path)).
 - [demo/agent.py](../demo/agent.py): a sample ReAct agent that reasons autonomously, runs tools, and handles connection refusals.
 - [demo/gen_certs.sh](../demo/gen_certs.sh): generates the demo root CA and multi-SAN leaf certificates.
 - [demo/Dockerfile](../demo/Dockerfile): a Debian-based container image for the agent.

@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
-"""Validate fixture policy descriptors against the specification's JSON Schemas.
+"""Validate conformance fixture descriptors against the reference JSON Schemas.
 
 Requires the jsonschema package. Placeholders such as "{port}" are rendered
-with sample values before validation; the audit schema is checked against the
-examples in spec/draft/audit.md.
+with sample values before validation.
 """
 import json
 import os
-import re
 import sys
 
 import jsonschema
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
-SCHEMA_DIR = os.path.join(ROOT, "spec", "draft", "schema")
+SCHEMA_DIR = os.path.join(ROOT, "conformance", "schema")
 FIXTURE_DIR = os.path.join(ROOT, "conformance", "fixtures")
 
 
@@ -65,13 +63,6 @@ def main():
             if "policy" in case and case["policy"] not in descriptors:
                 print(f"{name}: {case['id']} names unknown policy {case['policy']}")
                 problems += 1
-
-    with open(os.path.join(ROOT, "spec", "draft", "audit.md")) as f:
-        for line in f:
-            if line.startswith("{"):
-                for error in audit_validator.iter_errors(json.loads(line)):
-                    print(f"audit.md example: {error.message}")
-                    problems += 1
 
     print("fixture problems:", problems)
     return 1 if problems else 0

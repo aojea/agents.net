@@ -1,102 +1,49 @@
 # agents.net
 
-agents.net is a network interface between a sandbox and an external
-policy-enforcing proxy. It is meant for runtimes that execute autonomous
-agents.
+`agents.net` defines how an isolated sandbox communicates with a Policy Enforcement Point (PEP) by removing the sandbox's direct network stack, using Unix sockets (or `vsock`) as capabilities, and framing traffic with HTTP `CONNECT`.
 
-Version 1 (draft). Specification: [spec/draft](spec/draft/index.md).
+Read the specification in [SPEC.md](SPEC.md).
 
-## The Problem
+## Overview
 
-An agent runs untrusted code. The model writes the plan, and carrying it out
-means installing packages and calling tools. The agent still needs the network,
-but only to reach the few services you pick for it, such as a model API, a
-package registry, or a service of your own. Each sandbox product handles this
-in its own way today. Policy formats are product-specific, and proxies are
-advisory, so a client that ignores the proxy settings goes around them.
-Address-based firewalls go stale as soon as a service moves behind a CDN. A
-policy or an audit trail written for one provider does not carry over to
-another.
+Untrusted agent code should not hold API keys or sit directly on a host or cluster network. Instead, the runtime removes direct routes from the sandbox and uses dedicated channels for two separate paths:
 
-## The Answer
-
-The sandbox gets no network path at all. An adapter sits in front of it and
-turns each connection the workload opens into an HTTP `CONNECT` request that
-names the destination. The adapter sends those requests over a boundary socket
-that belongs to this sandbox and no other. Outside the sandbox, a boundary
-proxy checks each request against the policy descriptor bound to that socket,
-resolves the name itself, dials only the address it checked, and writes one
-audit record per decision.
+- **Egress:** Traffic from the sandbox is converted (inside the guest or on the host) into HTTP `CONNECT` and optional RFC 9298 `connect-udp` requests over a capability channel to a PEP. Policy evaluation, DNS resolution, L7 inspection, and credential injection stay in the PEP and are implementation-specific.
+- **Ingress:** The runtime publishes the sandbox's bridge endpoint, immutable identity (such as a Kubernetes Pod UID), and allowed ports so an inbound proxy can forward authorized traffic into the sandbox over `CONNECT` without the sandbox having a reachable IP.
 
 ```text
-agent (ordinary sockets) -> adapter -> CONNECT api.example.com:443 -> boundary -> policy -> upstream
-                                          no other path exists
+Egress:   sandbox -> [converter] -> UDS/vsock --(HTTP CONNECT)--> PEP -> upstream
+Ingress:  caller -> inbound proxy --(published ID + port + CONNECT)--> bridge -> sandbox:<port>
 ```
-
-Because there is no other route, the workload can't opt out. Ignoring
-`HTTP_PROXY` or replacing the adapter changes nothing. Policy is applied to
-the name the application asked for: the boundary sees `api.example.com`,
-resolves it, and dials the address it checked. Any TCP client works
-unmodified, since SSH, database drivers, raw sockets, and plain HTTP all end
-up as CONNECT tunnels.
-
-The wire is RFC 9110 CONNECT with RFC 9209 `Proxy-Status` and nothing
-agent-specific, so any CONNECT-capable proxy can act as the boundary. The
-policy descriptor and the audit record are each one JSON document that works
-across implementations. The conformance suite (black-box fixtures, a harness,
-and a driver contract) runs against any boundary.
-
-What the boundary controls is which destinations traffic reaches. It does not
-control what an allowed service does with that traffic. It works whether or
-not the workload cooperates, but only while the runtime keeps the sandbox
-confined.
 
 ## Repository
 
-| Directory | What it is | Start with |
-| --- | --- | --- |
-| [spec/](spec/README.md) | The specification: wire, policy descriptor, audit record, identity, isolation, lifecycle, adapters, ingress, gateways, registries, JSON Schemas. `draft/` is the working version; releases are frozen copies. | [spec/draft/index.md](spec/draft/index.md) |
-| [conformance/](conformance/README.md) | Conformance suite: profiles per role, fixtures, harness, driver contract, runtime audit checklist, reporting | [conformance/README.md](conformance/README.md) |
-| [sdk/](sdk/README.md) | Reference implementation in Go: library, three adapters (in-guest TUN launcher, namespace proxy, QEMU packet backend), and the `connect-proxy` boundary | [sdk/README.md](sdk/README.md) |
-| [kubernetes/](kubernetes/README.md) | Kubernetes DRA + NRI driver (`dra.agents.net`), ingress gateway, and kind smoke test | [kubernetes/README.md](kubernetes/README.md) |
-| [demo/](demo/README.md) | Runnable tutorial: an unmodified agent in a `--network none` container, confined by the injected launcher, with a Python boundary | [demo/README.md](demo/README.md) |
-| [scenarios/](scenarios/README.md) | Executed topologies and measurements: containers, namespaces, Firecracker and QEMU microVMs, revocation, benchmarks | [scenarios/README.md](scenarios/README.md) |
-| [docs/](docs/) | Informative material: [rationale and alternatives](docs/rationale.md), [implementations and status](docs/implementations.md), [test evidence](docs/evidence.md), [stakeholder reviews](docs/review-2026-09.md) ([second round](docs/review-2026-09b.md)), [roadmap](docs/roadmap.md) | [docs/roadmap.md](docs/roadmap.md) |
-
-## Roles
-
-The specification splits the system into four roles. Different parties can
-build them and combine them, and each role has its own conformance profiles
-([registries](spec/draft/registries.md)).
-
-- **Adapter**: turns workload connections into CONNECT requests. A packet adapter (TUN, network namespace, or VMM packet backend) captures every connection whether or not the workload cooperates. An explicit adapter serves proxy-aware clients on hosts where packet interception isn't available.
-- **Boundary**: any CONNECT-terminating proxy that applies the policy descriptor, resolves and checks addresses, reports failures with `Proxy-Status`, and writes audit records.
-- **Controller**: the runtime that creates the sandbox, binds its boundary socket to one policy descriptor, and revokes both.
-- **Ingress gateway** (optional): delivers authenticated inbound requests to one pinned loopback port.
+| Path | What it is |
+| --- | --- |
+| [SPEC.md](SPEC.md) | The specification: architecture (PEP model, capabilities, HTTP `CONNECT` egress, published ingress) and implementation patterns |
+| [sdk/](sdk/README.md) | Go reference implementation: library, converters (`tun2connect`, `netnsproxy`, `qemuproxy`), and reference PEP (`connect-proxy`) |
+| [kubernetes/](kubernetes/README.md) | Kubernetes DRA + NRI driver (`dra.agents.net`), stateless ingress gateway, and kind smoke test |
+| [conformance/](conformance/README.md) | Black-box boundary test fixtures, harness, JSON schemas for the reference PEP, and runtime audit checklist |
+| [demo/](demo/README.md) | Docker tutorial running an agent in a `--network none` container behind `tun2connect` |
+| [scenarios/](scenarios/README.md) | Container, namespace, Firecracker, and QEMU experiments and measurements |
 
 ## Quick Start
 
 ```bash
-# Build and test the reference implementation
+# Build and test the Go SDK and reference PEP
 go -C sdk build ./... && go -C sdk test -race ./...
 
-# Run the conformance suite against the reference boundary
+# Build and test the Kubernetes DRA + NRI driver
+make -C kubernetes build test
+
+# Validate conformance fixtures and run the boundary test harness
+python3 conformance/harness/check_fixtures.py
 python3 conformance/harness/run_boundary.py \
     --driver conformance/harness/drivers/connect-proxy.sh --keep-going
 
-# Run the container demo (Docker required)
+# Run the Docker container demo
 demo/test_demo.sh
 ```
-
-## Status
-
-The specification is a draft of version 1. The reference boundary, the
-adapters, and the launcher implement it. The HTTP/1.1 boundary groups of the
-conformance suite run in CI, and the Firecracker and QEMU microVM scenarios
-run on hosted runners. Envoy has been used as an alternative boundary for TCP
-CONNECT over loopback. [docs/implementations.md](docs/implementations.md)
-records what has been verified and what hasn't. Release rules are in
-[spec/README.md](spec/README.md).
 
 ## License
 

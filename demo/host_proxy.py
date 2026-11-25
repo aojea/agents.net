@@ -67,7 +67,7 @@ glance:
 It also serves the spec's ingress interface: a public TCP port on the host
 is reverse-proxied into the sandbox over a second Unix socket served by the
 launcher from inside, using the agents.net ingress handshake (HTTP
-`CONNECT 127.0.0.1:<port>` -> 200, spec/draft/ingress.md), so a microVM
+`CONNECT 127.0.0.1:<port>` -> 200, SPEC.md), so a microVM
 offers the identical protocol with no code change.
 
 This file is deliberately independent of any production implementation:

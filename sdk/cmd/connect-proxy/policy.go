@@ -16,7 +16,7 @@ import (
 	"golang.org/x/net/idna"
 )
 
-// descriptor is the JSON policy descriptor (spec/draft/policy.md).
+// descriptor is the reference JSON policy descriptor (conformance/schema/policy.schema.json).
 type descriptor struct {
 	Schema            int              `json:"agents_net_policy"`
 	Version           string           `json:"version"`
@@ -329,7 +329,7 @@ var nameProfile = idna.New(idna.MapForLookup(), idna.StrictDomainName(false), id
 
 // normalizeName lowercases a hostname, removes one trailing dot, converts
 // U-labels to A-labels, and checks the result against the label syntax
-// (spec/draft/wire.md Section 6). Addresses are not names.
+// (SPEC.md). Addresses are not names.
 func normalizeName(host string) (string, bool) {
 	name := strings.TrimSuffix(strings.ToLower(host), ".")
 	if name == "" {
@@ -375,7 +375,7 @@ func parsePort(value string) (uint16, error) {
 // nonPublic lists special-purpose ranges that netip's classifiers do not
 // cover. Together with loopback, private, link-local, multicast, and
 // unspecified addresses they are denied for resolved hostnames unless the
-// policy lists them (spec/draft/wire.md Section 5.1).
+// policy lists them (SPEC.md).
 var nonPublic = []netip.Prefix{
 	netip.MustParsePrefix("0.0.0.0/8"),
 	netip.MustParsePrefix("100.64.0.0/10"),
@@ -409,7 +409,7 @@ func publicAddress(address netip.Addr) bool {
 }
 
 // specialPurpose reports whether every address in prefix is special-purpose
-// (spec/draft/wire.md Section 5.1): the prefix lies within one nonPublic
+// (SPEC.md): the prefix lies within one nonPublic
 // range or within one of the classifier ranges netip provides.
 func specialPurpose(prefix netip.Prefix) bool {
 	ranges := append([]netip.Prefix{
@@ -482,8 +482,8 @@ func (v verdict) deny(status int, reason string) verdict {
 	return v
 }
 
-// authorize applies the descriptor to a destination (spec/draft/wire.md
-// Section 5.2) and returns the exact addresses the boundary may dial.
+// authorize applies the descriptor to a destination (SPEC.md)
+// and returns the exact addresses the boundary may dial.
 func (p *policy) authorize(ctx context.Context, host, port, network string) verdict {
 	v := verdict{destination: net.JoinHostPort(host, port), status: 403}
 	number, err := parsePort(port)

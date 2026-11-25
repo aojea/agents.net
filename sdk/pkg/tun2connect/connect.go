@@ -158,13 +158,12 @@ func ProxyStatusReason(h http.Header) string {
 
 // ProxyStatus builds the Proxy-Status field value for a refusal: one
 // member naming the responder, the RFC 9209 error type for the reason
-// token, and the token itself (spec/draft/wire.md Section 4).
+// token, and the token itself (SPEC.md).
 func ProxyStatus(member, reason string) string {
 	return member + "; error=" + ProxyErrorType(reason) + "; reason=" + reason
 }
 
-// ProxyErrorType maps a registered reason token to its RFC 9209 proxy error
-// type (spec/draft/registries.md Section 2).
+// ProxyErrorType maps a reason token to its RFC 9209 proxy error type.
 func ProxyErrorType(reason string) string {
 	switch reason {
 	case "not-on-allowlist", "port-not-allowed", "transport-not-allowed", "udp-disabled", "identity-unknown", "port-not-permitted":
