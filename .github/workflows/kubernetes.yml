@@ -68,11 +68,14 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: kubernetes/go.mod
+          cache-dependency-path: kubernetes/go.sum
 
       - name: Install kind
         uses: helm/kind-action@v1
         with:
           install_only: true
+          version: v0.33.0
+          kubectl_version: v1.36.1
 
       - name: Install cloud-provider-kind
         run: go install sigs.k8s.io/cloud-provider-kind@latest
