@@ -421,6 +421,140 @@ func TestNilServerAllowAndRevokeNoPanic(t *testing.T) {
 	srv.Allow("pod-uid-nil")
 }
 
+func TestIngressExplicitProxyHostUDSAndFallback(t *testing.T) {
+	tmpDir := t.TempDir()
+	ingressSock := filepath.Join(tmpDir, "ingress.sock")
+
+	// Start a mock gVisor/host-UDS ingress server accepting "CONNECT 127.0.0.1:8080".
+	udsLn, err := net.Listen("unix", ingressSock)
+	if err != nil {
+		t.Fatalf("listen unix %s: %v", ingressSock, err)
+	}
+	defer func() { _ = udsLn.Close() }()
+	go func() {
+		for {
+			c, err := udsLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				br := bufio.NewReader(conn)
+				line, err := br.ReadString('\n')
+				if err != nil || !strings.HasPrefix(line, "CONNECT 127.0.0.1:8080 ") {
+					_, _ = io.WriteString(conn, "HTTP/1.1 403 Forbidden\r\n\r\n")
+					return
+				}
+				for {
+					h, err := br.ReadString('\n')
+					if err != nil || h == "\r\n" {
+						break
+					}
+				}
+				_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+				_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\ngvisor-uds")
+			}(c)
+		}
+	}()
+
+	fallbackSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "socketat-fallback")
+	}))
+	defer fallbackSrv.Close()
+
+	st, err := store.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	podUDS := types.UID("pod-gvisor-uds")
+	podFallback := types.UID("pod-runc-fallback")
+	podSymlink := types.UID("pod-symlink-attack")
+
+	symlinkPath := filepath.Join(tmpDir, "bad-ingress.sock")
+	if err := os.Symlink(ingressSock, symlinkPath); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, cfg := range []store.PodConfig{
+		{
+			PodUID: podUDS,
+			NetNS:  "/var/run/netns/unused",
+			Parameters: params.NetworkParameters{
+				AdapterMode:  apis.AdapterModeExplicitProxy,
+				IngressPorts: []apis.IngressPort{{Port: 8080, Protocol: apis.IngressProtocolTCP}},
+			},
+			SocketPaths: store.SocketPaths{IngressSocketPath: ingressSock},
+		},
+		{
+			PodUID: podFallback,
+			NetNS:  "/var/run/netns/runc-pod",
+			Parameters: params.NetworkParameters{
+				AdapterMode:  apis.AdapterModeExplicitProxy,
+				IngressPorts: []apis.IngressPort{{Port: 8080, Protocol: apis.IngressProtocolTCP}},
+			},
+			SocketPaths: store.SocketPaths{IngressSocketPath: filepath.Join(tmpDir, "missing.sock")},
+		},
+		{
+			PodUID: podSymlink,
+			NetNS:  "/var/run/netns/unused",
+			Parameters: params.NetworkParameters{
+				AdapterMode:  apis.AdapterModeExplicitProxy,
+				IngressPorts: []apis.IngressPort{{Port: 8080, Protocol: apis.IngressProtocolTCP}},
+			},
+			SocketPaths: store.SocketPaths{IngressSocketPath: symlinkPath},
+		},
+	} {
+		if err := st.Upsert(cfg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	srv, err := NewServer(Config{
+		ListenAddr: "127.0.0.1:0",
+		Store:      st,
+		DialNetNS: func(_, network, _ string, timeout time.Duration) (net.Conn, error) {
+			return net.DialTimeout(network, fallbackSrv.Listener.Addr().String(), timeout)
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr, err := srv.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Close() }()
+
+	// 1. ExplicitProxy with live ingress.sock dials host-UDS directly.
+	conn, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = fmt.Fprintf(conn, "CONNECT %s:8080 HTTP/1.1\r\nHost: %s:8080\r\n\r\n", podUDS, podUDS)
+	data, _ := io.ReadAll(conn)
+	_ = conn.Close()
+	if !strings.Contains(string(data), "HTTP/1.1 200 Connection Established") || !strings.Contains(string(data), "gvisor-uds") {
+		t.Fatalf("host-UDS ingress response = %q, want gvisor-uds", string(data))
+	}
+
+	// 2. ExplicitProxy without ingress.sock falls back seamlessly to socketat.
+	conn2, err := net.DialTimeout("tcp", addr.String(), 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = fmt.Fprintf(conn2, "CONNECT %s:8080 HTTP/1.1\r\nHost: %s:8080\r\n\r\nGET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", podFallback, podFallback)
+	data2, _ := io.ReadAll(conn2)
+	_ = conn2.Close()
+	if !strings.Contains(string(data2), "socketat-fallback") {
+		t.Fatalf("fallback ingress response = %q, want socketat-fallback", string(data2))
+	}
+
+	// 3. Container-planted symlink at ingress.sock fails closed with 502.
+	if resp := rawConnect(t, addr.String(), fmt.Sprintf("CONNECT %s:8080 HTTP/1.1\r\nHost: %s:8080\r\n\r\n", podSymlink, podSymlink)); !strings.HasPrefix(resp, "HTTP/1.1 502 ") {
+		t.Fatalf("symlink ingress response = %q, want 502", resp)
+	}
+}
+
 func rawConnect(t *testing.T, addr, req string) string {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)

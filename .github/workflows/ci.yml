@@ -84,3 +84,21 @@ jobs:
         env:
           USE_CLOUD_PROVIDER_KIND: 'true'
         run: ./test/smoke.sh
+
+  gvisor-e2e:
+    name: Kubernetes gVisor (runsc) E2E (TCP, UDP, DoH, host-UDS inbound)
+    needs: go-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+          version: v0.33.0
+          kubectl_version: v1.36.1
+
+      - name: Run gVisor kind E2E suite
+        run: ./test/gvisor/run.sh

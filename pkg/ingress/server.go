@@ -358,21 +358,25 @@ func (s *Server) serveConn(conn net.Conn) {
 var errPodNotReady = errors.New("sandbox network namespace not ready")
 
 func (s *Server) dialPod(ctx context.Context, cfg store.PodConfig, port int32) (net.Conn, error) {
-	// Only dial agents.net ingress.sock in TunSidecar mode, and verify via Lstat
-	// that the path is a real Unix domain socket (never a container-planted symlink).
+	// Dial agents.net ingress.sock in TunSidecar mode (mandatory) or in
+	// ExplicitProxy mode when the workload bound a host-UDS ingress socket
+	// (such as gVisor runsc with --host-uds=all where Sentry owns 127.0.0.1).
+	// Always verify via Lstat that the path is a real Unix domain socket
+	// (never a container-planted symlink).
 	mode := cfg.Parameters.EffectiveAdapterMode()
-	if mode == apis.AdapterModeTunSidecar {
-		if sock := cfg.SocketPaths.IngressSocketPath; sock != "" {
-			info, err := os.Lstat(sock)
-			if err == nil {
-				if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
-					return nil, fmt.Errorf("ingress socket path %q is not a Unix domain socket", sock)
-				}
-				return s.dialIngressSocket(ctx, sock, port)
+	if (mode == apis.AdapterModeTunSidecar || mode == apis.AdapterModeExplicitProxy) && cfg.SocketPaths.IngressSocketPath != "" {
+		sock := cfg.SocketPaths.IngressSocketPath
+		info, err := os.Lstat(sock)
+		if err == nil {
+			if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
+				return nil, fmt.Errorf("ingress socket path %q is not a Unix domain socket", sock)
 			}
-			if !errors.Is(err, os.ErrNotExist) {
-				return nil, fmt.Errorf("lstat ingress socket %q: %w", sock, err)
-			}
+			return s.dialIngressSocket(ctx, sock, port)
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("lstat ingress socket %q: %w", sock, err)
+		}
+		if mode == apis.AdapterModeTunSidecar {
 			return nil, errPodNotReady
 		}
 	}

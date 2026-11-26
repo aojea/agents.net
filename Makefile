@@ -3,7 +3,7 @@ STACK_IMAGE ?= ghcr.io/aojea/agents.net/kube-netstack:latest
 PEP_IMAGE ?= ghcr.io/aojea/agents.net/kube-pep:latest
 INBOUND_IMAGE ?= ghcr.io/aojea/agents.net/kube-inbound:latest
 
-.PHONY: build test vet fmt image smoke test-envoy
+.PHONY: build test vet fmt image smoke test-envoy test-gvisor
 
 build:
 	go build ./cmd/...
@@ -28,3 +28,6 @@ smoke:
 
 test-envoy:
 	./test/envoy/run.sh
+
+test-gvisor:
+	./test/gvisor/run.sh

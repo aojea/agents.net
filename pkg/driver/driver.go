@@ -1549,6 +1549,15 @@ func (d *Driver) CreateContainer(_ context.Context, pod *nriapi.PodSandbox, ctr 
 			Type:        "bind",
 			Options:     []string{"rbind", "ro"},
 		})
+		if len(cfg.Parameters.IngressPorts) > 0 && cfg.SocketPaths.IngressDir != "" {
+			adj.AddMount(&nriapi.Mount{
+				Destination: containerIngressMountDir,
+				Source:      cfg.SocketPaths.IngressDir,
+				Type:        "bind",
+				Options:     []string{"rbind", "rw"},
+			})
+			desiredEnv["AGENTS_NET_INGRESS_SOCKET"] = filepath.Join(containerIngressMountDir, tunnel.IngressSocketName)
+		}
 		egressSock := filepath.Join(containerEgressMountDir, tunnel.EgressSocketName)
 		var extraNoProxy []string
 		if cfg.Parameters.Proxy != nil {

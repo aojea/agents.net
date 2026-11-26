@@ -991,3 +991,60 @@ func TestHostTunDefaultZeroSidecarLifecycle(t *testing.T) {
 		t.Fatalf("after RemovePodSandbox: closed=%d cleaned=%v", netns.hostTunClosed, netns.hostTunCleaned)
 	}
 }
+
+func TestExplicitProxyMountsIngressSocketDirWhenDeclared(t *testing.T) {
+	ctx := t.Context()
+	st, _ := store.New(nil)
+	tm, _ := tunnel.NewManager(shortTempDir(t), nil, tunnel.WithAuditWriter(io.Discard))
+	defer tm.Close()
+
+	podUID := types.UID("pod-explicit-ingress")
+	claimUID := types.UID("claim-explicit-ingress")
+	claim := makeTestClaim(podUID, claimUID, params.NetworkParameters{
+		ConfinementMode: apis.ConfinementModePodNetworkIsolated,
+		AdapterMode:     apis.AdapterModeExplicitProxy,
+		IngressPorts:    []apis.IngressPort{{Port: 8080}},
+	})
+
+	drv, err := New(Config{
+		NodeName:   "worker-1",
+		KubeClient: fake.NewClientset(claim),
+		Store:      st,
+		Tunnel:     tm,
+		NetNS:      &fakeNetNS{},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	drv.nriConnected.Store(true)
+	if res, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim}); err != nil || res[claimUID].Err != nil {
+		t.Fatalf("PrepareResourceClaims: err=%v res=%+v", err, res)
+	}
+	pod := &nriapi.PodSandbox{
+		Id: "sb-exp-ing", Uid: string(podUID), Name: "gvisor-agent", Namespace: "agents",
+		Linux: &nriapi.LinuxPodSandbox{Namespaces: []*nriapi.LinuxNamespace{{Type: "network", Path: "/var/run/netns/gv1"}}},
+	}
+	adj, _, err := drv.CreateContainer(ctx, pod, &nriapi.Container{Name: "agent"})
+	if err != nil || adj == nil {
+		t.Fatalf("CreateContainer: adj=%+v err=%v", adj, err)
+	}
+	var sawEgress, sawIngress bool
+	for _, m := range adj.Mounts {
+		if m.Destination == containerEgressMountDir {
+			sawEgress = true
+		}
+		if m.Destination == containerIngressMountDir {
+			sawIngress = true
+		}
+	}
+	if !sawEgress || !sawIngress {
+		t.Fatalf("ExplicitProxy with IngressPorts must mount egress and ingress dirs, got %+v", adj.Mounts)
+	}
+	envs := envMap(adj.Env)
+	if envs["AGENTS_NET_INGRESS_SOCKET"] != filepath.Join(containerIngressMountDir, tunnel.IngressSocketName) {
+		t.Fatalf("AGENTS_NET_INGRESS_SOCKET = %q", envs["AGENTS_NET_INGRESS_SOCKET"])
+	}
+	if envs["AGENT_INGRESS_PORT"] != "8080" {
+		t.Fatalf("AGENT_INGRESS_PORT = %q, want 8080", envs["AGENT_INGRESS_PORT"])
+	}
+}
