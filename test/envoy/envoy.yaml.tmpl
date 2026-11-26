@@ -1,0 +1,278 @@
+# Unmodified Envoy Proxy configuration acting as BOTH:
+#   1. Tier 2 Outbound PEP (mandatory mTLS HTTP/2):
+#      - Enforces client mTLS SAN + destination RBAC
+#      - Terminates TCP CONNECT natively via dynamic_forward_proxy
+#      - Proxies RFC 9298 connect-udp streams on the same mTLS HTTP/2 session to kube-pep
+#      - Routes RFC 8484 DoH (POST /dns-query) on the same mTLS HTTP/2 session to kube-pep
+#   2. Tier 2 Inbound Gateway (IP-less delivery):
+#      - Accepts external HTTP requests and tunnels them over mandatory mTLS
+#        HTTP/1.1 CONNECT <podUID>:<port> to the node ingress bridge (pkg/ingress)
+#        via Envoy internal_listener + tcp_proxy tunneling_config.
+
+bootstrap_extensions:
+- name: envoy.bootstrap.internal_listener
+  typed_config:
+    "@type": type.googleapis.com/envoy.extensions.bootstrap.internal_listener.v3.InternalListener
+
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: {{.AdminPort}}
+
+static_resources:
+  listeners:
+  - name: outbound_pep
+    address:
+      socket_address:
+        address: 127.0.0.1
+        port_value: {{.OutboundPort}}
+    filter_chains:
+    - transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+          require_client_certificate: true
+          common_tls_context:
+            alpn_protocols: ["h2"]
+            tls_certificates:
+            - certificate_chain: { filename: "{{.CertDir}}/envoy-pep.crt" }
+              private_key: { filename: "{{.CertDir}}/envoy-pep.key" }
+            validation_context:
+              trusted_ca: { filename: "{{.CertDir}}/ca.crt" }
+      filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: outbound_pep
+          codec_type: HTTP2
+          http2_protocol_options:
+            allow_connect: true
+          upgrade_configs:
+          - upgrade_type: connect-udp
+          route_config:
+            name: pep_routes
+            virtual_hosts:
+            - name: all
+              domains: ["*"]
+              routes:
+              - match:
+                  path: "/dns-query"
+                  headers:
+                  - name: ":method"
+                    string_match: { exact: "POST" }
+                  - name: "content-type"
+                    string_match: { prefix: "application/dns-message" }
+                route:
+                  cluster: kube_pep_doh
+              - match:
+                  prefix: "/.well-known/masque/udp/"
+                  headers:
+                  - name: "upgrade"
+                    string_match: { exact: "connect-udp" }
+                route:
+                  cluster: kube_pep_udp
+                  upgrade_configs:
+                  - upgrade_type: connect-udp
+              - match:
+                  connect_matcher: {}
+                route:
+                  cluster: dfp
+                  upgrade_configs:
+                  - upgrade_type: CONNECT
+                    connect_config: {}
+          http_filters:
+          - name: envoy.filters.http.rbac
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+              rules:
+                action: ALLOW
+                policies:
+                  allowed-driver-egress:
+                    principals:
+                    - authenticated:
+                        principal_name:
+                          exact: "kube-net-driver-envoy-test"
+                    permissions:
+                    - and_rules:
+                        rules:
+                        - header: { name: ":method", string_match: { exact: "POST" } }
+                        - header: { name: ":path", string_match: { exact: "/dns-query" } }
+                    - and_rules:
+                        rules:
+                        - header: { name: "upgrade", string_match: { exact: "connect-udp" } }
+                        - header: { name: ":path", string_match: { exact: "/.well-known/masque/udp/echo.envoy.local/{{.UDPPort}}/" } }
+                    - and_rules:
+                        rules:
+                        - header: { name: ":method", string_match: { exact: "CONNECT" } }
+                        - header: { name: ":authority", string_match: { exact: "echo.envoy.local:{{.TCPPort}}" } }
+          - name: envoy.filters.http.dynamic_forward_proxy
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+              dns_cache_config: &dfp_cache
+                name: dfp_cache
+                dns_lookup_family: V4_ONLY
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  - name: inbound_http
+    address:
+      socket_address:
+        address: 127.0.0.1
+        port_value: {{.InboundPort}}
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.http_connection_manager
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+          stat_prefix: inbound_http
+          route_config:
+            name: inbound_routes
+            virtual_hosts:
+            - name: all
+              domains: ["*"]
+              routes:
+              - match: { prefix: "/agents/default/agent-1/" }
+                route:
+                  prefix_rewrite: "/"
+                  cluster: internal_connect_agent1
+              - match: { prefix: "/agents/default/agent-1-unpinned/" }
+                route:
+                  prefix_rewrite: "/"
+                  cluster: internal_connect_agent1_unpinned
+          http_filters:
+          - name: envoy.filters.http.router
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  - name: internal_connect_agent1_listener
+    internal_listener: {}
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: inbound_tunnel_ok
+          cluster: node_ingress_bridge
+          tunneling_config:
+            hostname: "{{.PodUID}}:8080"
+
+  - name: internal_connect_agent1_unpinned_listener
+    internal_listener: {}
+    filter_chains:
+    - filters:
+      - name: envoy.filters.network.tcp_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.filters.network.tcp_proxy.v3.TcpProxy
+          stat_prefix: inbound_tunnel_denied
+          cluster: node_ingress_bridge
+          tunneling_config:
+            hostname: "{{.PodUID}}:9999"
+
+  clusters:
+  - name: dfp
+    connect_timeout: 5s
+    lb_policy: CLUSTER_PROVIDED
+    cluster_type:
+      name: envoy.clusters.dynamic_forward_proxy
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+        dns_cache_config: *dfp_cache
+
+  - name: kube_pep_doh
+    type: STATIC
+    connect_timeout: 5s
+    lb_policy: ROUND_ROBIN
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options: {}
+    load_assignment:
+      cluster_name: kube_pep_doh
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: { address: 127.0.0.1, port_value: {{.KubePEPPort}} }
+
+  - name: kube_pep_udp
+    type: STATIC
+    connect_timeout: 5s
+    lb_policy: ROUND_ROBIN
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http2_protocol_options:
+            allow_connect: true
+    load_assignment:
+      cluster_name: kube_pep_udp
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: { address: 127.0.0.1, port_value: {{.KubePEPPort}} }
+
+  - name: internal_connect_agent1
+    type: STATIC
+    connect_timeout: 5s
+    lb_policy: ROUND_ROBIN
+    transport_socket:
+      name: envoy.transport_sockets.raw_buffer
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
+    load_assignment:
+      cluster_name: internal_connect_agent1
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              envoy_internal_address:
+                server_listener_name: internal_connect_agent1_listener
+
+  - name: internal_connect_agent1_unpinned
+    type: STATIC
+    connect_timeout: 5s
+    lb_policy: ROUND_ROBIN
+    transport_socket:
+      name: envoy.transport_sockets.raw_buffer
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.raw_buffer.v3.RawBuffer
+    load_assignment:
+      cluster_name: internal_connect_agent1_unpinned
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              envoy_internal_address:
+                server_listener_name: internal_connect_agent1_unpinned_listener
+
+  - name: node_ingress_bridge
+    type: STATIC
+    connect_timeout: 5s
+    lb_policy: ROUND_ROBIN
+    typed_extension_protocol_options:
+      envoy.extensions.upstreams.http.v3.HttpProtocolOptions:
+        "@type": type.googleapis.com/envoy.extensions.upstreams.http.v3.HttpProtocolOptions
+        explicit_http_config:
+          http_protocol_options: {}
+    transport_socket:
+      name: envoy.transport_sockets.tls
+      typed_config:
+        "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+        sni: "kube-net-driver.kube-system.svc"
+        common_tls_context:
+          tls_certificates:
+          - certificate_chain: { filename: "{{.CertDir}}/envoy-inbound.crt" }
+            private_key: { filename: "{{.CertDir}}/envoy-inbound.key" }
+          validation_context:
+            trusted_ca: { filename: "{{.CertDir}}/ca.crt" }
+    load_assignment:
+      cluster_name: node_ingress_bridge
+      endpoints:
+      - lb_endpoints:
+        - endpoint:
+            address:
+              socket_address: { address: 127.0.0.1, port_value: {{.BridgePort}} }

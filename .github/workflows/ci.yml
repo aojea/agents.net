@@ -1,0 +1,104 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  go-test:
+    name: Build, vet & test (race + userns)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l cmd pkg internal)
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed:"; echo "$unformatted"; exit 1
+          fi
+
+      - name: Enable unprivileged user namespaces for netns integration tests
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+
+      - name: Test (unit + Linux multi-netns & tc integration)
+        run: go test -race -count=1 ./...
+
+  envoy-e2e:
+    name: Envoy PEP + Inbound E2E (mTLS H2 CONNECT, connect-udp, DoH, inbound)
+    needs: go-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Run Envoy interop E2E suite
+        run: ./test/envoy/run.sh
+
+  kind-smoke:
+    name: Kubernetes kind smoke test (kube-pep + cloud-provider-kind kube-inbound)
+    needs: go-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+          version: v0.33.0
+          kubectl_version: v1.36.1
+
+      - name: Install cloud-provider-kind
+        run: go install sigs.k8s.io/cloud-provider-kind@latest
+
+      - name: Run Kubernetes smoke test
+        env:
+          USE_CLOUD_PROVIDER_KIND: 'true'
+        run: ./test/smoke.sh
+
+  gvisor-e2e:
+    name: Kubernetes gVisor (runsc) E2E (TCP, UDP, DoH, host-UDS inbound)
+    needs: go-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install kind
+        uses: helm/kind-action@v1
+        with:
+          install_only: true
+          version: v0.33.0
+          kubectl_version: v1.36.1
+
+      - name: Run gVisor kind E2E suite
+        run: ./test/gvisor/run.sh
