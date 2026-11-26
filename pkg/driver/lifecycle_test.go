@@ -141,7 +141,6 @@ func TestPrepareResourceClaimsGatedWhenNRIDisconnected(t *testing.T) {
 
 	claim := makeTestClaim("pod-uid-gate", "claim-uid-gate", params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-		AdapterMode:     apis.AdapterModeExplicitProxy,
 	})
 
 	before := testutil.ToFloat64(metrics.DRAPluginRequestsTotal.WithLabelValues(methodPrepareResourceClaims, metrics.StatusFailed))
@@ -643,12 +642,12 @@ func TestEndToEndNRISessionAndRuntimeRestart(t *testing.T) {
 	// 1. Prepare claim-1 and exercise RunPodSandbox/CreateContainer on runtime 1.
 	claim1 := makeTestClaim("pod-1-uid", "claim-1-uid", params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-		AdapterMode:     apis.AdapterModeExplicitProxy,
 	})
 	res, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim1})
 	if err != nil || res[claim1.UID].Err != nil {
 		t.Fatalf("PrepareResourceClaims(claim1) = (%+v, %v), want success", res, err)
 	}
+	pod1Cfg, _ := st.Get("pod-1-uid")
 	pod1 := &nriapi.PodSandbox{
 		Id:        "pod-1-sb",
 		Uid:       "pod-1-uid",
@@ -683,13 +682,12 @@ func TestEndToEndNRISessionAndRuntimeRestart(t *testing.T) {
 	// While NRI is down, PrepareResourceClaims rejects new claims.
 	claim2 := makeTestClaim("pod-2-uid", "claim-2-uid", params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-		AdapterMode:     apis.AdapterModeExplicitProxy,
 	})
 	if _, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim2}); err == nil || !strings.Contains(err.Error(), "not connected") {
 		t.Fatalf("PrepareResourceClaims while disconnected = %v, want not connected error", err)
 	}
 
-	// 3. Start runtime 2 with pod-1 live (with /run/agents.net mount) and reconnect.
+	// 3. Start runtime 2 with pod-1 live (with /etc/resolv.conf mount) and reconnect.
 	pod1Reloaded := &nriapi.PodSandbox{
 		Id:        "pod-1-sb",
 		Uid:       "pod-1-uid",
@@ -704,7 +702,7 @@ func TestEndToEndNRISessionAndRuntimeRestart(t *testing.T) {
 		PodSandboxId: "pod-1-sb",
 		Name:         "agent",
 		State:        nriapi.ContainerState_CONTAINER_RUNNING,
-		Mounts:       []*nriapi.Mount{{Destination: containerEgressMountDir}},
+		Mounts:       []*nriapi.Mount{{Destination: containerResolvConfPath, Source: pod1Cfg.SocketPaths.ResolvConfPath}},
 	}
 	rt2 := startTestNRIRuntime(t, rt2Sock, emptyDir, []*nriapi.PodSandbox{pod1Reloaded}, []*nriapi.Container{ctr1Reloaded})
 	proxy.setTarget(rt2Sock)
@@ -783,10 +781,10 @@ func TestSynchronizeReportsMissingPlumbingUnit(t *testing.T) {
 		PodNamespace: "agents",
 		Parameters: params.NetworkParameters{
 			ConfinementMode: apis.ConfinementModeNetworkPolicyDenyAll,
-			AdapterMode:     apis.AdapterModeExplicitProxy,
 			CATrust:         &apis.CATrustConfig{Mode: apis.CATrustModeInjectEnv},
 		},
-		CABundle: catrust.MaterializedBundle{MergedHostPath: "/tmp/ca.pem"},
+		SocketPaths: store.SocketPaths{ResolvConfPath: "/run/dra-agents-net/pods/pod-missing-unit/resolv.conf"},
+		CABundle:    catrust.MaterializedBundle{MergedHostPath: "/tmp/ca.pem"},
 	}); err != nil {
 		t.Fatalf("Upsert: %v", err)
 	}
@@ -831,7 +829,7 @@ func TestSynchronizeReportsMissingPlumbingUnit(t *testing.T) {
 	if len(evs) != 1 || delta != 1 {
 		t.Fatalf("missing plumbing: events=%v delta=%v, want 1 event and delta 1", evs, delta)
 	}
-	for _, want := range []string{"Warning " + eventReasonPlumbingMissing, "ca-bundle-mount", "egress-socket-mount", "non-loopback-routes-unflushed"} {
+	for _, want := range []string{"Warning " + eventReasonPlumbingMissing, "ca-bundle-mount", "host-tun-resolv-conf", "non-loopback-routes-unflushed"} {
 		if !strings.Contains(evs[0], want) {
 			t.Errorf("event = %q, missing %q", evs[0], want)
 		}
@@ -840,7 +838,7 @@ func TestSynchronizeReportsMissingPlumbingUnit(t *testing.T) {
 	// 3. Once routes are flushed and mounts are present -> clean (no event, no metric increase).
 	netns.hasRoutes = false
 	mounts := []*nriapi.Mount{
-		{Destination: containerEgressMountDir},
+		{Destination: containerResolvConfPath, Source: "/run/dra-agents-net/pods/pod-missing-unit/resolv.conf"},
 		{Destination: catrust.ContainerCABundlePath},
 	}
 	if evs, delta := runSync(nriapi.ContainerState_CONTAINER_RUNNING, mounts); len(evs) != 0 || delta != 0 {
@@ -866,7 +864,6 @@ func TestSynchronizePreservesUnstartedPreparedPodAndReapsVanishedPod(t *testing.
 		PodName:  "unstarted",
 		Parameters: params.NetworkParameters{
 			ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-			AdapterMode:     apis.AdapterModeExplicitProxy,
 		},
 	}); err != nil {
 		t.Fatalf("Put unstarted: %v", err)
@@ -880,7 +877,6 @@ func TestSynchronizePreservesUnstartedPreparedPodAndReapsVanishedPod(t *testing.
 		NetNS:    "/var/run/netns/old",
 		Parameters: params.NetworkParameters{
 			ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-			AdapterMode:     apis.AdapterModeExplicitProxy,
 		},
 	}); err != nil {
 		t.Fatalf("Put vanished: %v", err)
@@ -900,7 +896,7 @@ func TestSynchronizePreservesUnstartedPreparedPodAndReapsVanishedPod(t *testing.
 	}
 }
 
-func TestBoltDBColdRestartSynchronizeRestoresSocketsAndSocketAt(t *testing.T) {
+func TestBoltDBColdRestartSynchronizeRestoresSocketsAndHostTun(t *testing.T) {
 	ctx := t.Context()
 	tmp := shortTempDir(t)
 	dbPath := filepath.Join(tmp, "state.db")
@@ -929,7 +925,6 @@ func TestBoltDBColdRestartSynchronizeRestoresSocketsAndSocketAt(t *testing.T) {
 	claimUID := types.UID("claim-cold-restart")
 	claim := makeTestClaim(podUID, claimUID, params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-		AdapterMode:     apis.AdapterModeExplicitProxy,
 	})
 	if res, err := drv1.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim}); err != nil || res[claimUID].Err != nil {
 		t.Fatalf("PrepareResourceClaims: err=%v res=%+v", err, res)
@@ -947,7 +942,7 @@ func TestBoltDBColdRestartSynchronizeRestoresSocketsAndSocketAt(t *testing.T) {
 	tm1.Close()
 	_ = st1.Close()
 
-	// 2. Instance 2 hydrates from BoltDB and runs Synchronize: egress.sock + socketat listener restored!
+	// 2. Instance 2 hydrates from BoltDB and runs Synchronize: egress.sock + HostTun restored!
 	b2, err := store.OpenBolt(dbPath)
 	if err != nil {
 		t.Fatalf("OpenBolt 2: %v", err)
@@ -971,10 +966,10 @@ func TestBoltDBColdRestartSynchronizeRestoresSocketsAndSocketAt(t *testing.T) {
 	if _, err := drv2.Synchronize(ctx, []*nriapi.PodSandbox{pod}, nil); err != nil {
 		t.Fatalf("Synchronize after cold restart: %v", err)
 	}
-	if !tm2.HasExtraListener(podUID) {
-		t.Fatal("expected socketat loopback listener restored after cold restart")
+	if !drv2.hasHostTun(podUID) {
+		t.Fatal("expected HostTun attachment restored after cold restart")
 	}
-	if len(netns2.listenedAddrs) != 1 || netns2.listenedAddrs[0] != "/var/run/netns/cold@127.0.0.1:15001" {
-		t.Fatalf("unexpected restored socketat listen addrs: %v", netns2.listenedAddrs)
+	if len(netns2.hostTunPaths) != 1 || netns2.hostTunPaths[0] != "/var/run/netns/cold" {
+		t.Fatalf("unexpected restored HostTun paths: %v", netns2.hostTunPaths)
 	}
 }

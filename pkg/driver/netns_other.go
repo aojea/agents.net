@@ -19,7 +19,6 @@ package driver
 import (
 	"errors"
 	"io"
-	"net"
 
 	"github.com/aojea/agents.net/pkg/hosttun"
 )
@@ -56,14 +55,10 @@ func (unsupportedNetNSManager) VerifyNonLoopbackNICsBlocked(string, bool) (bool,
 	return false, errors.New("network namespace tc NIC verification requires Linux")
 }
 
-func (unsupportedNetNSManager) ListenAt(string, string, string) (net.Listener, error) {
-	return nil, errors.New("socketat network namespace listener requires Linux")
+func (unsupportedNetNSManager) StartHostTun(HostTunRequest) (io.Closer, string, error) {
+	return nil, "", errors.New("host TUN adapter requires Linux")
 }
 
-func (unsupportedNetNSManager) StartHostTun(HostTunRequest) (io.Closer, error) {
-	return nil, errors.New("host TUN adapter requires Linux")
-}
-
-func (unsupportedNetNSManager) CleanupHostTun(string) error {
+func (unsupportedNetNSManager) CleanupHostTun(string, string) error {
 	return nil
 }

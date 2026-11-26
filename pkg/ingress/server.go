@@ -13,11 +13,11 @@
 // limitations under the License.
 
 // Package ingress implements the node-local HTTP CONNECT ingress bridge for
-// dra-agents-net. Authorized callers (such as sandbox-router) connect to this
-// host listener, issue "CONNECT <podUID>:<port> HTTP/1.1", and dra-agents-net
-// enforces the Sandbox's spec.network.ingressPorts allowlist before dialing
-// either the Pod's agents.net ingress.sock (TunSidecar) or the Pod's
-// loopback 127.0.0.1:<port> via socketat (HostTun / ExplicitProxy).
+// kube-net-driver. Authorized callers (such as kube-inbound or Envoy) connect
+// to this host listener, issue "CONNECT <podUID>:<port> HTTP/1.1", and the
+// server checks the Pod's ingressPorts allowlist before dialing either the
+// sandbox guest over kube-netstack (for L2 sandboxes such as gVisor or microVMs)
+// or the Pod's loopback 127.0.0.1:<port> via socketat (for runc containers).
 package ingress
 
 import (
@@ -29,7 +29,7 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,22 +47,26 @@ import (
 )
 
 const (
-	defaultDialTimeout  = 5 * time.Second
-	defaultHeadTimeout  = 5 * time.Second
-	maxHeadBytes        = 8 * 1024
-	maxIngressConns     = 4096
-	maxInterimResponses = 8
+	defaultDialTimeout = 5 * time.Second
+	defaultHeadTimeout = 5 * time.Second
+	maxHeadBytes       = 8 * 1024
+	maxIngressConns    = 4096
 )
 
 // DialNetNSFunc dials a literal IP:port inside a Linux network namespace.
 type DialNetNSFunc func(netnsPath, network, address string, timeout time.Duration) (net.Conn, error)
 
-// Config configures the node-local dra-agents-net ingress bridge.
+// DialGuestFunc opens an inbound TCP connection into an L2 sandbox guest
+// (such as gVisor or a microVM) through kube-netstack.
+type DialGuestFunc func(ctx context.Context, podUID types.UID, guestIP netip.Addr, port uint16) (net.Conn, error)
+
+// Config configures the node-local ingress bridge.
 type Config struct {
 	ListenAddr  string
 	Store       *store.PodConfigStore
 	TLSConfig   *tls.Config
 	DialNetNS   DialNetNSFunc
+	DialGuest   DialGuestFunc
 	DialTimeout time.Duration
 	HeadTimeout time.Duration
 }
@@ -74,6 +78,7 @@ type Server struct {
 	store       *store.PodConfigStore
 	tlsConfig   *tls.Config
 	dialNetNS   DialNetNSFunc
+	dialGuest   DialGuestFunc
 	dialTimeout time.Duration
 	headTimeout time.Duration
 
@@ -111,6 +116,7 @@ func NewServer(cfg Config) (*Server, error) {
 		store:       cfg.Store,
 		tlsConfig:   cfg.TLSConfig,
 		dialNetNS:   dialNetNS,
+		dialGuest:   cfg.DialGuest,
 		dialTimeout: dialTimeout,
 		headTimeout: headTimeout,
 		revoked:     make(map[types.UID]struct{}),
@@ -319,7 +325,7 @@ func (s *Server) serveConn(conn net.Conn) {
 			s.writeError(conn, http.StatusServiceUnavailable, "sandbox-not-ready")
 			return
 		}
-		klog.V(2).InfoS("dra-agents-net ingress dial failed", "podUID", podUID, "port", port, "err", err)
+		klog.InfoS("dra-agents-net ingress dial failed", "podUID", podUID, "guestIP", cfg.GuestIP, "port", port, "err", err)
 		metrics.IngressConnectionsTotal.WithLabelValues("error", "dial_failed").Inc()
 		s.writeError(conn, http.StatusBadGateway, "ingress-dial-failed")
 		return
@@ -358,27 +364,14 @@ func (s *Server) serveConn(conn net.Conn) {
 var errPodNotReady = errors.New("sandbox network namespace not ready")
 
 func (s *Server) dialPod(ctx context.Context, cfg store.PodConfig, port int32) (net.Conn, error) {
-	// Dial agents.net ingress.sock in TunSidecar mode (mandatory) or in
-	// ExplicitProxy mode when the workload bound a host-UDS ingress socket
-	// (such as gVisor runsc with --host-uds=all where Sentry owns 127.0.0.1).
-	// Always verify via Lstat that the path is a real Unix domain socket
-	// (never a container-planted symlink).
-	mode := cfg.Parameters.EffectiveAdapterMode()
-	if (mode == apis.AdapterModeTunSidecar || mode == apis.AdapterModeExplicitProxy) && cfg.SocketPaths.IngressSocketPath != "" {
-		sock := cfg.SocketPaths.IngressSocketPath
-		info, err := os.Lstat(sock)
-		if err == nil {
-			if info.Mode()&os.ModeSymlink != 0 || info.Mode()&os.ModeSocket == 0 {
-				return nil, fmt.Errorf("ingress socket path %q is not a Unix domain socket", sock)
-			}
-			return s.dialIngressSocket(ctx, sock, port)
+	// For L2 sandboxes (such as gVisor or microVMs) where kube-netstack owns
+	// the guest link, dial the guest IP directly through kube-netstack.
+	if cfg.GuestIP != "" && s.dialGuest != nil {
+		ip, err := netip.ParseAddr(cfg.GuestIP)
+		if err != nil {
+			return nil, fmt.Errorf("invalid guest IP %q for pod %s: %w", cfg.GuestIP, cfg.PodUID, err)
 		}
-		if !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("lstat ingress socket %q: %w", sock, err)
-		}
-		if mode == apis.AdapterModeTunSidecar {
-			return nil, errPodNotReady
-		}
+		return s.dialGuest(ctx, cfg.PodUID, ip, uint16(port))
 	}
 	if cfg.NetNS == "" {
 		return nil, errPodNotReady
@@ -394,105 +387,6 @@ func (s *Server) dialPod(ctx context.Context, cfg store.PodConfig, port int32) (
 		return conn6, nil
 	}
 	return nil, err
-}
-
-func (s *Server) dialIngressSocket(ctx context.Context, sockPath string, port int32) (net.Conn, error) {
-	var d net.Dialer
-	conn, err := d.DialContext(ctx, "unix", sockPath)
-	if err != nil {
-		return nil, fmt.Errorf("dial ingress.sock %q: %w", sockPath, err)
-	}
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
-	stopCancel := context.AfterFunc(ctx, func() {
-		_ = conn.SetDeadline(time.Now())
-	})
-
-	target := net.JoinHostPort("127.0.0.1", strconv.FormatInt(int64(port), 10))
-	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", target, target); err != nil {
-		stopCancel()
-		_ = conn.Close()
-		return nil, fmt.Errorf("write CONNECT to ingress.sock: %w", err)
-	}
-
-	limited := &boundedIngressReader{r: conn, remaining: maxHeadBytes}
-	br := bufio.NewReader(limited)
-	resp, err := readFinalResponse(br, &http.Request{Method: http.MethodConnect})
-	if !stopCancel() {
-		_ = conn.Close()
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		return nil, err
-	}
-	if err != nil {
-		_ = conn.Close()
-		return nil, fmt.Errorf("read CONNECT response from ingress.sock: %w", err)
-	}
-	_ = conn.SetDeadline(time.Time{})
-	limited.remaining = -1
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		_ = conn.Close()
-		return nil, fmt.Errorf("ingress.sock rejected CONNECT with HTTP %d", resp.StatusCode)
-	}
-	if br.Buffered() > 0 {
-		return &bufferedConn{Conn: conn, r: br}, nil
-	}
-	return conn, nil
-}
-
-func readFinalResponse(br *bufio.Reader, req *http.Request) (*http.Response, error) {
-	for interim := range maxInterimResponses + 1 {
-		resp, err := http.ReadResponse(br, req)
-		if err != nil {
-			return nil, err
-		}
-		if resp.StatusCode < 100 || resp.StatusCode >= 200 {
-			return resp, nil
-		}
-		if interim == maxInterimResponses {
-			return nil, fmt.Errorf("ingress.sock sent more than %d interim responses", maxInterimResponses)
-		}
-	}
-	return nil, errors.New("unexpected interim response loop termination")
-}
-
-type boundedIngressReader struct {
-	r         io.Reader
-	remaining int
-}
-
-func (b *boundedIngressReader) Read(p []byte) (int, error) {
-	if b.remaining < 0 {
-		return b.r.Read(p)
-	}
-	if b.remaining == 0 {
-		return 0, errors.New("ingress.sock CONNECT response header exceeded maximum size")
-	}
-	if len(p) > b.remaining {
-		p = p[:b.remaining]
-	}
-	n, err := b.r.Read(p)
-	b.remaining -= n
-	return n, err
-}
-
-type bufferedConn struct {
-	net.Conn
-	r *bufio.Reader
-}
-
-func (c *bufferedConn) Read(p []byte) (int, error) {
-	return c.r.Read(p)
-}
-
-func (c *bufferedConn) CloseWrite() error {
-	if cw, ok := c.Conn.(closeWriter); ok {
-		return cw.CloseWrite()
-	}
-	return c.Close()
 }
 
 func (s *Server) writeError(conn net.Conn, status int, reason string) {

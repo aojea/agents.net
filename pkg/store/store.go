@@ -34,12 +34,10 @@ import (
 // SocketPaths holds the per-Pod host directories and Unix socket paths created
 // during DRA PrepareResourceClaims and bind-mounted by NRI CreateContainer.
 type SocketPaths struct {
-	PodRootDir        string `json:"podRootDir"`
-	EgressDir         string `json:"egressDir"`
-	EgressSocketPath  string `json:"egressSocketPath"`
-	IngressDir        string `json:"ingressDir,omitempty"`
-	IngressSocketPath string `json:"ingressSocketPath,omitempty"`
-	ResolvConfPath    string `json:"resolvConfPath,omitempty"`
+	PodRootDir       string `json:"podRootDir"`
+	EgressDir        string `json:"egressDir"`
+	EgressSocketPath string `json:"egressSocketPath"`
+	ResolvConfPath   string `json:"resolvConfPath,omitempty"`
 }
 
 // PodConfig holds the checkpointed plumbing state for one sandbox Pod on this node.
@@ -56,6 +54,7 @@ type PodConfig struct {
 	ShareID         string                     `json:"shareID,omitempty"`
 	SandboxID       string                     `json:"sandboxID,omitempty"`
 	NetNS           string                     `json:"netNS,omitempty"`
+	GuestIP         string                     `json:"guestIP,omitempty"`
 	Parameters      params.NetworkParameters   `json:"parameters"`
 	SocketPaths     SocketPaths                `json:"socketPaths"`
 	CABundle        catrust.MaterializedBundle `json:"caBundle,omitzero"`
@@ -205,6 +204,23 @@ func (s *PodConfigStore) UpdateSandbox(podUID types.UID, sandboxID, netNS string
 	return nil
 }
 
+// UpdateGuestIP records the sandbox guest IP used for L2 inbound delivery
+// (for example a gVisor or microVM Pod attached to kube-netstack over L2).
+func (s *PodConfigStore) UpdateGuestIP(podUID types.UID, guestIP string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, ok := s.byPod[podUID]
+	if !ok {
+		return nil
+	}
+	cfg.GuestIP = guestIP
+	if err := s.persistLocked(podUID, cfg); err != nil {
+		return err
+	}
+	s.byPod[podUID] = cfg
+	return nil
+}
+
 // UpdateIdentity refreshes the attested Pod metadata for podUID.
 func (s *PodConfigStore) UpdateIdentity(podUID types.UID, podName, podNamespace, sa string) error {
 	s.mu.Lock()
@@ -307,8 +323,8 @@ func clonePodConfig(cfg PodConfig) PodConfig {
 	if cfg.Parameters.CATrust != nil {
 		out.Parameters.CATrust = cfg.Parameters.CATrust.DeepCopy()
 	}
-	if cfg.Parameters.Proxy != nil {
-		out.Parameters.Proxy = cfg.Parameters.Proxy.DeepCopy()
+	if cfg.Parameters.DNS != nil {
+		out.Parameters.DNS = cfg.Parameters.DNS.DeepCopy()
 	}
 	out.Parameters.IngressPorts = slices.Clone(cfg.Parameters.IngressPorts)
 	if cfg.Parameters.MaxConnections != nil {

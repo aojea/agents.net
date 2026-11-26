@@ -17,6 +17,7 @@ package tunnel
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -268,31 +269,24 @@ func TestTunnelHTTP2MTLSForwardingDenyAndRevoke(t *testing.T) {
 		t.Fatalf("denied response must not emit legacy Boundary-Reason header: %q", denyResp)
 	}
 
-	// Verify AttachListener (used by socketat Pod-loopback in ExplicitProxy mode) shares the exact same tunnel pipeline.
-	loopLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen loopback: %v", err)
+	// Verify ServeConn (used by kube-netstack socketpair brokering) shares the same tunnel pipeline.
+	cliPipe, srvPipe := net.Pipe()
+	if err := mgr.ServeConn(podUID, srvPipe); err != nil {
+		t.Fatalf("ServeConn: %v", err)
 	}
-	if err := mgr.AttachListener(podUID, loopLn); err != nil {
-		t.Fatalf("AttachListener: %v", err)
-	}
-	tcpConn, err := net.DialTimeout("tcp", loopLn.Addr().String(), 2*time.Second)
-	if err != nil {
-		t.Fatalf("dial attached loopback listener: %v", err)
-	}
-	_ = tcpConn.SetDeadline(time.Now().Add(3 * time.Second))
-	_, _ = io.WriteString(tcpConn, "CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
-	tbr := bufio.NewReader(tcpConn)
+	_ = cliPipe.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = io.WriteString(cliPipe, "CONNECT api.github.com:443 HTTP/1.1\r\nHost: api.github.com:443\r\n\r\n")
+	tbr := bufio.NewReader(cliPipe)
 	tStatus, err := tbr.ReadString('\n')
 	if err != nil || !strings.HasPrefix(tStatus, "HTTP/1.1 200 ") {
-		t.Fatalf("loopback CONNECT status = %q err=%v, want 200", tStatus, err)
+		t.Fatalf("ServeConn CONNECT status = %q err=%v, want 200", tStatus, err)
 	}
 	_, _ = tbr.ReadString('\n')
-	_, _ = io.WriteString(tcpConn, "ping-loopback\n")
-	if line, err := tbr.ReadString('\n'); err != nil || line != "ping-loopback\n" {
-		t.Fatalf("loopback echo = %q err=%v, want ping-loopback", line, err)
+	_, _ = io.WriteString(cliPipe, "ping-serveconn\n")
+	if line, err := tbr.ReadString('\n'); err != nil || line != "ping-serveconn\n" {
+		t.Fatalf("ServeConn echo = %q err=%v, want ping-serveconn", line, err)
 	}
-	_ = tcpConn.Close()
+	_ = cliPipe.Close()
 
 	// 2. Allowed destination opens multiplexed HTTP/2 CONNECT tunnel over mTLS with attested headers.
 	c, err := net.DialTimeout("unix", paths.EgressSocketPath, 2*time.Second)
@@ -589,7 +583,7 @@ func TestTunnelExplicitHTTPProxyViaConnect(t *testing.T) {
 	defer mgr.Close()
 
 	podUID := types.UID("pod-http-proxy")
-	if _, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
+	paths, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
 		Identity: auth.WorkloadIdentity{
 			Namespace: "agents",
 			PodName:   "http-sb",
@@ -598,22 +592,21 @@ func TestTunnelExplicitHTTPProxyViaConnect(t *testing.T) {
 		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
 			URL: "unix://" + upSock,
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("EnsureListener: %v", err)
 	}
 
-	loopLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen loopback: %v", err)
-	}
-	if err := mgr.AttachListener(podUID, loopLn); err != nil {
-		t.Fatalf("AttachListener: %v", err)
-	}
-
-	proxyURL, _ := url.Parse("http://" + loopLn.Addr().String())
+	proxyURL, _ := url.Parse("http://egress.local")
 	client := &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
-		Timeout:   5 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", paths.EgressSocketPath)
+			},
+		},
+		Timeout: 5 * time.Second,
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, destSrv.URL+"/hello", nil)
 	if err != nil {
@@ -722,7 +715,7 @@ func TestTunnelHTTP2Multiplexing(t *testing.T) {
 	defer mgr.Close()
 
 	podUID := types.UID("pod-h2-mux")
-	if _, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
+	paths, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
 		Identity: auth.WorkloadIdentity{Namespace: "agents", PodName: "h2-sb", PodUID: podUID},
 		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
 			URL: "https://" + baseLn.Addr().String(),
@@ -737,22 +730,21 @@ func TestTunnelHTTP2Multiplexing(t *testing.T) {
 				MTLS: &apis.MTLSAuth{CertDir: certDir},
 			},
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("EnsureListener: %v", err)
 	}
 
-	loopLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen loopback: %v", err)
-	}
-	if err := mgr.AttachListener(podUID, loopLn); err != nil {
-		t.Fatalf("AttachListener: %v", err)
-	}
-
-	proxyURL, _ := url.Parse("http://" + loopLn.Addr().String())
+	proxyURL, _ := url.Parse("http://egress.local")
 	httpCli := &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
-		Timeout:   5 * time.Second,
+		Transport: &http.Transport{
+			Proxy: http.ProxyURL(proxyURL),
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", paths.EgressSocketPath)
+			},
+		},
+		Timeout: 5 * time.Second,
 	}
 
 	for _, tc := range []struct {
@@ -846,7 +838,7 @@ func TestTunnelHTTPSAutomaticALPNFallbackToHTTP1(t *testing.T) {
 	defer mgr.Close()
 
 	podUID := types.UID("pod-alpn-h1")
-	if _, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
+	paths, err := mgr.EnsureListener(ctx, podUID, ListenerConfig{
 		Identity: auth.WorkloadIdentity{Namespace: "agents", PodName: "alpn-sb", PodUID: podUID},
 		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
 			URL: "https://" + baseLn.Addr().String(),
@@ -861,22 +853,22 @@ func TestTunnelHTTPSAutomaticALPNFallbackToHTTP1(t *testing.T) {
 				MTLS: &apis.MTLSAuth{CertDir: certDir},
 			},
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("EnsureListener: %v", err)
 	}
 
-	loopLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen loopback: %v", err)
-	}
-	if err := mgr.AttachListener(podUID, loopLn); err != nil {
-		t.Fatalf("AttachListener: %v", err)
-	}
-
-	proxyURL, _ := url.Parse("http://" + loopLn.Addr().String())
+	proxyURL, _ := url.Parse("http://egress.local")
 	httpCli := &http.Client{
-		Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL), DisableKeepAlives: true},
-		Timeout:   5 * time.Second,
+		Transport: &http.Transport{
+			Proxy:             http.ProxyURL(proxyURL),
+			DisableKeepAlives: true,
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				var d net.Dialer
+				return d.DialContext(ctx, "unix", paths.EgressSocketPath)
+			},
+		},
+		Timeout: 5 * time.Second,
 	}
 
 	for _, path := range []string{"/first", "/second"} {
@@ -952,13 +944,10 @@ func TestTunnelSecurityHardeningAndConcurrency(t *testing.T) {
 		}
 	}
 
-	// 2. HasIngress creates egress/ingress stub dir for read-only /run/agents.net mount.
-	paths, err := mgr.EnsureListener(ctx, "pod-ing-stub", ListenerConfig{HasIngress: true})
+	// 2. Listener created cleanly for a valid Pod UID.
+	paths, err := mgr.EnsureListener(ctx, "pod-sec-check", ListenerConfig{})
 	if err != nil {
-		t.Fatalf("EnsureListener(HasIngress): %v", err)
-	}
-	if info, err := os.Stat(filepath.Join(paths.EgressDir, "ingress")); err != nil || !info.IsDir() {
-		t.Fatalf("expected egress/ingress stub dir, info=%v err=%v", info, err)
+		t.Fatalf("EnsureListener: %v", err)
 	}
 
 	// 3. Header injection via CONNECT bracketed CR or bare CR rejected with 400.
@@ -989,7 +978,7 @@ func TestTunnelSecurityHardeningAndConcurrency(t *testing.T) {
 		t.Fatalf("truncated capsule err = %v, want io.ErrUnexpectedEOF", err)
 	}
 
-	// 6. Concurrent EnsureListener / AttachListener / Rearm / Revoke / Remove race test.
+	// 6. Concurrent EnsureListener / ServeConn / Rearm / Revoke / Remove race test.
 	var wg sync.WaitGroup
 	for range 4 {
 		wg.Go(func() {
@@ -997,13 +986,11 @@ func TestTunnelSecurityHardeningAndConcurrency(t *testing.T) {
 		})
 	}
 	wg.Wait()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
+	c1, c2 := net.Pipe()
+	if err := mgr.ServeConn("pod-race", c2); err != nil {
+		t.Fatalf("ServeConn: %v", err)
 	}
-	if err := mgr.AttachListener("pod-race", ln); err != nil {
-		t.Fatalf("AttachListener: %v", err)
-	}
+	_ = c1.Close()
 	mgr.Revoke("pod-race")
 	mgr.Rearm("pod-race")
 	if err := mgr.Remove("pod-race"); err != nil {

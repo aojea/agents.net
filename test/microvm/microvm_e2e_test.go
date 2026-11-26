@@ -471,7 +471,6 @@ func TestMicroVMQEMUTAPZeroAgent(t *testing.T) {
 		PodUID: podUID,
 		NetNS:  "microvm-tap-virtual",
 		Parameters: params.NetworkParameters{
-			AdapterMode:  apis.AdapterModeHostTun,
 			IngressPorts: []apis.IngressPort{{Port: 8080, Protocol: apis.IngressProtocolTCP}},
 		},
 	}); err != nil {

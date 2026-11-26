@@ -34,8 +34,6 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 						"apiVersion": "dra.agents.net/v1alpha1",
 						"kind": "DriverConfig",
 						"confinementMode": "PodNetworkIsolated",
-						"adapterMode": "ExplicitProxy",
-						"proxy": {"port": 18080, "noProxy": [".internal.corp"]},
 						"policyEnforcementPoint": {
 							"url": "https://tenant-pep.team-a.svc:8443",
 							"tls": {"trustDomain": "cluster.local"},
@@ -57,7 +55,7 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 			DeviceConfiguration: resourceapi.DeviceConfiguration{
 				Opaque: &resourceapi.OpaqueDeviceConfiguration{
 					Driver:     "dra.other.io",
-					Parameters: runtime.RawExtension{Raw: []byte(`{"adapterMode": "Unknown"}`)},
+					Parameters: runtime.RawExtension{Raw: []byte(`{"unknownOption": "ignored"}`)},
 				},
 			},
 		},
@@ -69,7 +67,6 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 					Parameters: runtime.RawExtension{Raw: []byte(`{
 						"apiVersion": "dra.agents.net/v1alpha1",
 						"kind": "DriverConfig",
-						"proxy": {"noProxy": [".team-a.local"]},
 						"caTrust": {
 							"sources": [{"type": "ConfigMap", "configMapRef": {"name": "team-ca"}}]
 						},
@@ -86,15 +83,6 @@ func TestDecodeLayersClassAndClaimDriverConfig(t *testing.T) {
 	}
 	if got.ConfinementMode != apis.ConfinementModePodNetworkIsolated {
 		t.Fatalf("ConfinementMode = %q, want PodNetworkIsolated", got.ConfinementMode)
-	}
-	if got.AdapterMode != apis.AdapterModeExplicitProxy {
-		t.Fatalf("AdapterMode = %q, want ExplicitProxy from DeviceClass DriverConfig", got.AdapterMode)
-	}
-	if got.EffectiveProxyPort() != 18080 {
-		t.Fatalf("EffectiveProxyPort = %d, want 18080 from DeviceClass DriverConfig", got.EffectiveProxyPort())
-	}
-	if got.Proxy == nil || len(got.Proxy.NoProxy) != 2 || got.Proxy.NoProxy[0] != ".internal.corp" || got.Proxy.NoProxy[1] != ".team-a.local" {
-		t.Fatalf("unexpected Proxy config: %+v", got.Proxy)
 	}
 	if got.CATrust == nil || len(got.CATrust.Sources) != 2 {
 		t.Fatalf("expected merged 2 CA sources from class+claim, got %+v", got.CATrust)
@@ -128,7 +116,7 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndUnknownKeys(t *testing.T) {
 			DeviceConfiguration: resourceapi.DeviceConfiguration{
 				Opaque: &resourceapi.OpaqueDeviceConfiguration{
 					Driver:     apis.DriverName,
-					Parameters: runtime.RawExtension{Raw: []byte(`{"ingressPorts":[{"port":8080}],"proxy":{"port":19000}}`)},
+					Parameters: runtime.RawExtension{Raw: []byte(`{"ingressPorts":[{"port":8080}]}`)},
 				},
 			},
 		},
@@ -138,7 +126,7 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndUnknownKeys(t *testing.T) {
 			DeviceConfiguration: resourceapi.DeviceConfiguration{
 				Opaque: &resourceapi.OpaqueDeviceConfiguration{
 					Driver:     apis.DriverName,
-					Parameters: runtime.RawExtension{Raw: []byte(`{"confinementMode":"PodNetworkIsolated","proxy":{"port":15001},"custom":{"c":"1"}}`)},
+					Parameters: runtime.RawExtension{Raw: []byte(`{"confinementMode":"PodNetworkIsolated","custom":{"c":"1"}}`)},
 				},
 			},
 		},
@@ -156,9 +144,6 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndUnknownKeys(t *testing.T) {
 	got, err := DecodeForRequest(reversed, apis.DriverName, "agents-net")
 	if err != nil {
 		t.Fatalf("DecodeForRequest: %v", err)
-	}
-	if got.EffectiveProxyPort() != 19000 {
-		t.Fatalf("EffectiveProxyPort = %d, want 19000 (claim overlays class)", got.EffectiveProxyPort())
 	}
 	if len(got.IngressPorts) != 1 || got.IngressPorts[0].Port != 8080 {
 		t.Fatalf("unexpected ingressPorts: %+v", got.IngressPorts)
@@ -185,9 +170,6 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndUnknownKeys(t *testing.T) {
 	if optOut.EffectiveNICBlockMode() != apis.NICBlockModeDisabled {
 		t.Fatalf("EffectiveNICBlockMode() = %q, want Disabled", optOut.EffectiveNICBlockMode())
 	}
-	if optOut.EffectiveAdapterMode() != apis.AdapterModeHostTun {
-		t.Fatalf("default EffectiveAdapterMode() = %q, want HostTun", optOut.EffectiveAdapterMode())
-	}
 
 	rejectedClass := []struct {
 		name string
@@ -195,6 +177,7 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndUnknownKeys(t *testing.T) {
 	}{
 		{"invalid nicBlockMode", `{"nicBlockMode":"BogusMode"}`},
 		{"unknown JSON field", `{"unknownField":true}`},
+		{"removed adapterMode field", `{"adapterMode":"ExplicitProxy"}`},
 		{"plaintext http PEP URL", `{"policyEnforcementPoint":{"url":"http://pep:8080"}}`},
 		{"https PEP without mandatory mTLS auth", `{"policyEnforcementPoint":{"url":"https://pep:8443"}}`},
 		{"unsupported UDP ingressPort", `{"ingressPorts":[{"port":53,"protocol":"UDP"}]}`},
@@ -220,14 +203,12 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndUnknownKeys(t *testing.T) {
 	}
 
 	// 3. FromClaim MUST reject all cluster-admin fields (PEP hijack, confinement downgrade,
-	// adapterMode flip, spoofed custom attributes, hostPath CA, limits, and unknown fields).
+	// spoofed custom attributes, hostPath CA, limits, and unknown fields).
 	rejectedClaims := []struct {
 		name string
 		raw  string
 	}{
 		{"confinementMode downgrade", `{"confinementMode":"NetworkPolicyDenyAll"}`},
-		{"adapterMode HostTun override", `{"adapterMode":"HostTun"}`},
-		{"adapterMode TunSidecar escalation", `{"adapterMode":"TunSidecar"}`},
 		{"policyEnforcementPoint hijack", `{"policyEnforcementPoint":{"url":"https://attacker.example:8443","auth":{"type":"SPIFFE"}}}`},
 		{"policyEnforcementPoint unix SSRF", `{"policyEnforcementPoint":{"url":"unix:///var/run/nri/nri.sock"}}`},
 		{"custom attested attribute spoof", `{"custom":{"tenant":"admin"}}`},
@@ -236,7 +217,6 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndUnknownKeys(t *testing.T) {
 		{"idleTimeoutSeconds override", `{"idleTimeoutSeconds":99999}`},
 		{"nicBlockMode Disabled override", `{"nicBlockMode":"Disabled"}`},
 		{"podCertVolumeName override", `{"podCertVolumeName":"my-cert"}`},
-		{"bad noProxy chars", `{"proxy":{"noProxy":["ok.local","bad host"]}}`},
 		{"ingress endPort below port", `{"ingressPorts":[{"port":9005,"endPort":9000}]}`},
 		{"ingress endPort above 65535", `{"ingressPorts":[{"port":9000,"endPort":70000}]}`},
 		{"unknown JSON field", `{"typoField":"x"}`},

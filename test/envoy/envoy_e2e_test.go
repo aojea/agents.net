@@ -344,7 +344,6 @@ func startIngressBridge(t *testing.T, pki *pkiMaterial, sandboxAddr string) (*in
 		PodNamespace: "default",
 		NetNS:        "/proc/self/ns/net",
 		Parameters: params.NetworkParameters{
-			AdapterMode: apis.AdapterModeHostTun,
 			IngressPorts: []apis.IngressPort{
 				{Port: 8080, Protocol: "TCP"},
 			},
