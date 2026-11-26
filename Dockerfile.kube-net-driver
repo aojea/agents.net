@@ -25,10 +25,10 @@ COPY pkg/ ./pkg/
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w" \
-    -o /agents-net-ingress-gateway ./cmd/agents-net-ingress-gateway
+    -o /kube-net-driver ./cmd/kube-net-driver
 
-FROM gcr.io/distroless/static-debian13:nonroot
+FROM gcr.io/distroless/static-debian13:latest
 
-COPY --from=builder /agents-net-ingress-gateway /agents-net-ingress-gateway
+COPY --from=builder /kube-net-driver /kube-net-driver
 
-ENTRYPOINT ["/agents-net-ingress-gateway"]
+ENTRYPOINT ["/kube-net-driver"]

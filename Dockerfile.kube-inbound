@@ -25,10 +25,10 @@ COPY pkg/ ./pkg/
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w" \
-    -o /dra-agents-net ./cmd/dra-agents-net
+    -o /kube-inbound ./cmd/kube-inbound
 
-FROM gcr.io/distroless/static-debian13:latest
+FROM gcr.io/distroless/static-debian13:nonroot
 
-COPY --from=builder /dra-agents-net /dra-agents-net
+COPY --from=builder /kube-inbound /kube-inbound
 
-ENTRYPOINT ["/dra-agents-net"]
+ENTRYPOINT ["/kube-inbound"]

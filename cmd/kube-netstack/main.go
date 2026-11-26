@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command agents-net-stack runs the unprivileged host-side userspace network
-// stack container paired with dra-agents-net in the two-container DaemonSet.
+// Command kube-netstack runs the unprivileged host-side userspace network
+// stack container paired with kube-net-driver in the two-container DaemonSet.
 //
 // It listens on an AF_UNIX SOCK_SEQPACKET socket (shared over an emptyDir
-// volume), receives per-Pod TUN and dial-broker file descriptors via
+// volume), receives per-Pod TUN/TAP and dial-broker file descriptors via
 // SCM_RIGHTS, terminates Virtual DNS (198.18.0.0/15, 100::/64) and TCP/UDP in
-// userspace (gVisor netstack), and forwards egress flows back to dra-agents-net
+// userspace (gVisor netstack), and forwards egress flows back to kube-net-driver
 // over parent-brokered kernel socketpairs. It holds zero Linux capabilities,
 // zero Kubernetes credentials, zero mTLS private keys, and installs a seccomp
 // filter denying all non-AF_UNIX socket creation.
@@ -38,13 +38,13 @@ import (
 func main() {
 	var socketPath string
 	klog.InitFlags(nil)
-	flag.StringVar(&socketPath, "socket", hosttun.DefaultWorkerSocket, "AF_UNIX SOCK_SEQPACKET socket path shared with dra-agents-net")
+	flag.StringVar(&socketPath, "socket", hosttun.DefaultWorkerSocket, "AF_UNIX SOCK_SEQPACKET socket path shared with kube-net-driver")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	if err := hosttun.ServeSocket(ctx, socketPath); err != nil {
-		klog.Fatalf("agents-net-stack failed: %v", err)
+		klog.Fatalf("kube-netstack failed: %v", err)
 	}
 }

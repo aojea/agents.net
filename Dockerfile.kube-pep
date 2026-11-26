@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Builds the reference mTLS PEP (cmd/connect-proxy) for test/smoke.sh and
+# Builds the reference mTLS PEP (cmd/kube-pep) for test/smoke.sh and
 # agent-sandbox demos. Build with context=. (repo root).
 
 FROM --platform=$BUILDPLATFORM golang:1.26.5 AS builder
@@ -28,10 +28,10 @@ COPY pkg/ ./pkg/
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w" \
-    -o /connect-proxy ./cmd/connect-proxy
+    -o /kube-pep ./cmd/kube-pep
 
 FROM gcr.io/distroless/static-debian13:nonroot
 
-COPY --from=builder /connect-proxy /connect-proxy
+COPY --from=builder /kube-pep /kube-pep
 
-ENTRYPOINT ["/connect-proxy"]
+ENTRYPOINT ["/kube-pep"]

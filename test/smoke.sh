@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# End-to-end Kubernetes smoke test for dra-agents-net (driver: dra.agents.net)
-# using agents.net's own reference PEP boundary (cmd/connect-proxy).
+# End-to-end Kubernetes smoke test for kube-net-driver (driver: dra.agents.net)
+# using agents.net's reference PEP (cmd/kube-pep) and inbound gateway (cmd/kube-inbound).
 #
 # Verifies:
 #   1. Single-manifest installation via install.yaml (kube-system)
@@ -23,23 +23,23 @@
 #   4. Confinement & HostTun (default, zero sidecar, zero Pod caps):
 #      - Route flush + pure-netlink tc clsact DROP blocks eth0
 #      - Persistent tun0 inside Pod netns handled by separate unprivileged
-#        agents-net-stack container over emptyDir SCM_RIGHTS socket
+#        kube-netstack container over emptyDir SCM_RIGHTS socket
 #        (UID/GID 65534, zero Linux capabilities, NoNewPrivs=1, Seccomp BPF,
 #        zero K8s SA token or host mounts, automatic recovery on SIGKILL)
 #      - /etc/resolv.conf replaced via NRI pointing to 198.19.255.253 (198.18.0.0/15)
 #      - No HTTP_PROXY env vars, no egress.sock, and no /dev/net/tun in container
-#   5. Transparent egress via real cmd/connect-proxy (mTLS + HTTP/2 CONNECT):
+#   5. Transparent egress via real cmd/kube-pep (mTLS + HTTP/2 CONNECT + DoH):
 #      - Unmodified HTTPS client reaches allowed host with injected SSL_CERT_FILE
 #      - Unmodified UDP client reaches allowed UDP host over RFC 9298 connect-udp
-#      - Denied host and literal IP fail closed at connect-proxy
+#      - Denied host and literal IP fail closed at kube-pep
 #      - Unmapped synthetic IP (198.18.9.9) fails closed locally before hitting PEP
-#      - connect-proxy JSONL audit log records verified mTLS peer + allow/deny
+#      - kube-pep JSONL audit log records verified mTLS peer + allow/deny
 #   6. Option 3 Ingress discovery via ResourceClaim.status.devices[].data +
 #      external LoadBalancer attraction via cloud-provider-kind:
 #      - Typed dra.agents.net/v1alpha1 DeviceStatus publishes routable <nodeIP>:15080,
 #        protocol=http-connect, target=<podUID>, and pinned ports
 #      - AGENT_INGRESS_PORT is injected into the workload container
-#      - agents-net-ingress-gateway watches ResourceClaims behind a
+#      - kube-inbound watches ResourceClaims behind a
 #        type: LoadBalancer Service provisioned by cloud-provider-kind
 #      - Host curl to http://<LoadBalancer-IP> reaches Pod loopback :8080
 #        (both path and header routing) and rejects unpinned :9999 with 403
@@ -66,10 +66,10 @@ KIND_NODE_IMAGE="${KIND_NODE_IMAGE:-kindest/node:v1.36.1}"
 PYTHON_IMAGE="${PYTHON_IMAGE:-python:3.14-slim}"
 NS="${SMOKE_NAMESPACE:-agents-net-smoke}"
 
-DRIVER_IMAGE="kind.local/dra-agents-net:smoke"
-STACK_IMAGE="kind.local/agents-net-stack:smoke"
-GATEWAY_IMAGE="kind.local/agents-net-ingress-gateway:smoke"
-PEP_IMAGE="kind.local/agents-net-connect-proxy:smoke"
+DRIVER_IMAGE="kind.local/kube-net-driver:smoke"
+STACK_IMAGE="kind.local/kube-netstack:smoke"
+INBOUND_IMAGE="kind.local/kube-inbound:smoke"
+PEP_IMAGE="kind.local/kube-pep:smoke"
 
 TMPDIR="$(mktemp -d)"
 CREATED_CLUSTER="false"
@@ -90,16 +90,16 @@ cleanup() {
   local rc=$?
   if [ "${rc}" -ne 0 ]; then
     echo "=== Smoke test failed (rc=${rc}); dumping diagnostics ===" >&2
-    k -n kube-system logs -l app.kubernetes.io/name=dra-agents-net --all-containers --tail=60 >&2 || true
+    k -n kube-system logs -l app.kubernetes.io/name=kube-net-driver --all-containers --tail=60 >&2 || true
     k -n "${NS}" get pods,resourceclaims,svc -o wide >&2 || true
-    k -n "${NS}" logs deploy/connect-proxy --tail=40 >&2 || true
-    k -n "${NS}" logs deploy/agents-net-ingress-gateway --tail=40 >&2 || true
+    k -n "${NS}" logs deploy/kube-pep --tail=40 >&2 || true
+    k -n "${NS}" logs deploy/kube-inbound --tail=40 >&2 || true
     if [ -f "${TMPDIR}/cloud-provider-kind.log" ]; then
       tail -n 40 "${TMPDIR}/cloud-provider-kind.log" >&2 || true
     fi
   fi
   if [ "${CREATED_CLUSTER}" = "true" ]; then
-    k -n "${NS}" delete svc agents-net-ingress-gateway --ignore-not-found >/dev/null 2>&1 || true
+    k -n "${NS}" delete svc kube-inbound --ignore-not-found >/dev/null 2>&1 || true
     sleep 2
     if [ -n "${CPK_PID}" ]; then
       kill "${CPK_PID}" >/dev/null 2>&1 || true
@@ -109,10 +109,10 @@ cleanup() {
   else
     # Delete LoadBalancer Service first while cloud-provider-kind is still running so
     # it removes its Envoy LB container cleanly before we stop cloud-provider-kind.
-    k -n "${NS}" delete svc agents-net-ingress-gateway --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    k -n "${NS}" delete svc kube-inbound --ignore-not-found --wait=true >/dev/null 2>&1 || true
     k delete deviceclass dra.agents.net-smoke dra.agents.net-smoke-doh --ignore-not-found >/dev/null 2>&1 || true
-    k delete clusterrolebinding "${NS}-ingress-gateway" --ignore-not-found >/dev/null 2>&1 || true
-    k delete clusterrole "${NS}-ingress-gateway" --ignore-not-found >/dev/null 2>&1 || true
+    k delete clusterrolebinding "${NS}-kube-inbound" --ignore-not-found >/dev/null 2>&1 || true
+    k delete clusterrole "${NS}-kube-inbound" --ignore-not-found >/dev/null 2>&1 || true
     k -n kube-system delete secret smoke-driver-client-tls smoke-bridge-tls --ignore-not-found >/dev/null 2>&1 || true
     k -n kube-system delete configmap smoke-ca --ignore-not-found >/dev/null 2>&1 || true
     k delete namespace "${NS}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
@@ -127,11 +127,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
-echo "=== 1. Build dra-agents-net, agents-net-stack, agents-net-ingress-gateway, and cmd/connect-proxy images ==="
-docker build --load -t "${DRIVER_IMAGE}" -f "${REPO_ROOT}/Dockerfile" "${REPO_ROOT}"
-docker build --load -t "${STACK_IMAGE}" -f "${REPO_ROOT}/Dockerfile.stack" "${REPO_ROOT}"
-docker build --load -t "${GATEWAY_IMAGE}" -f "${REPO_ROOT}/Dockerfile.ingress-gateway" "${REPO_ROOT}"
-docker build --load -t "${PEP_IMAGE}" -f "${SCRIPT_DIR}/Dockerfile.connect-proxy" "${REPO_ROOT}"
+echo "=== 1. Build kube-net-driver, kube-netstack, kube-inbound, and kube-pep images ==="
+docker build --load -t "${DRIVER_IMAGE}" -f "${REPO_ROOT}/Dockerfile.kube-net-driver" "${REPO_ROOT}"
+docker build --load -t "${STACK_IMAGE}" -f "${REPO_ROOT}/Dockerfile.kube-netstack" "${REPO_ROOT}"
+docker build --load -t "${INBOUND_IMAGE}" -f "${REPO_ROOT}/Dockerfile.kube-inbound" "${REPO_ROOT}"
+docker build --load -t "${PEP_IMAGE}" -f "${REPO_ROOT}/Dockerfile.kube-pep" "${REPO_ROOT}"
 
 if [ "${USE_EXISTING_CLUSTER}" != "true" ]; then
   echo "=== 2. Create disposable kind cluster (${KIND_CLUSTER_NAME}, ${KIND_NODE_IMAGE}) with NRI enabled ==="
@@ -160,7 +160,7 @@ else
 fi
 
 echo "=== 3. Load images into kind cluster ==="
-kind load docker-image --name "${KIND_CLUSTER_NAME}" "${DRIVER_IMAGE}" "${STACK_IMAGE}" "${GATEWAY_IMAGE}" "${PEP_IMAGE}"
+kind load docker-image --name "${KIND_CLUSTER_NAME}" "${DRIVER_IMAGE}" "${STACK_IMAGE}" "${INBOUND_IMAGE}" "${PEP_IMAGE}"
 
 RUN_CPK="false"
 if [ "${USE_CLOUD_PROVIDER_KIND}" = "true" ] || { [ "${USE_CLOUD_PROVIDER_KIND}" = "auto" ] && command -v cloud-provider-kind >/dev/null 2>&1; }; then
@@ -200,17 +200,17 @@ EOF
 }
 
 NODE_IP_ADDR="$(k get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')"
-gen_cert "pep" "connect-proxy.${NS}.svc.cluster.local" \
-  "DNS:connect-proxy.${NS}.svc.cluster.local,DNS:connect-proxy.${NS}.svc,DNS:connect-proxy" \
+gen_cert "pep" "kube-pep.${NS}.svc.cluster.local" \
+  "DNS:kube-pep.${NS}.svc.cluster.local,DNS:kube-pep.${NS}.svc,DNS:kube-pep" \
   "serverAuth"
-gen_cert "client" "dra-agents-net-smoke-client" \
-  "DNS:dra-agents-net-smoke-client" \
+gen_cert "client" "kube-net-driver-smoke-client" \
+  "DNS:kube-net-driver-smoke-client" \
   "clientAuth"
-gen_cert "bridge" "dra-agents-net.kube-system.svc" \
-  "DNS:dra-agents-net.kube-system.svc,IP:${NODE_IP_ADDR}" \
+gen_cert "bridge" "kube-net-driver.kube-system.svc" \
+  "DNS:kube-net-driver.kube-system.svc,IP:${NODE_IP_ADDR}" \
   "serverAuth"
-gen_cert "gateway-client" "agents-net-ingress-gateway" \
-  "DNS:agents-net-ingress-gateway" \
+gen_cert "gateway-client" "kube-inbound" \
+  "DNS:kube-inbound" \
   "clientAuth"
 gen_cert "echo" "echo.${NS}.svc.cluster.local" \
   "DNS:echo.${NS}.svc.cluster.local,DNS:echo.${NS}.svc" \
@@ -223,19 +223,19 @@ k -n kube-system create configmap smoke-ca --from-file=ca.crt="${TMPDIR}/ca.crt"
 k -n kube-system create secret tls smoke-driver-client-tls --cert="${TMPDIR}/client.crt" --key="${TMPDIR}/client.key"
 k -n kube-system create secret tls smoke-bridge-tls --cert="${TMPDIR}/bridge.crt" --key="${TMPDIR}/bridge.key"
 
-sed -e "s|image: ghcr.io/aojea/agents.net/dra-agents-net:latest|image: ${DRIVER_IMAGE}|g" \
-    -e "s|image: ghcr.io/aojea/agents.net/agents-net-stack:latest|image: ${STACK_IMAGE}|g" \
+sed -e "s|image: ghcr.io/aojea/agents.net/kube-net-driver:latest|image: ${DRIVER_IMAGE}|g" \
+    -e "s|image: ghcr.io/aojea/agents.net/kube-netstack:latest|image: ${STACK_IMAGE}|g" \
   "${REPO_ROOT}/install.yaml" | k apply -f -
 
 # Mount node mTLS client cert (egress PEP) and mTLS bridge server cert/client CA (ingress)
-# directly onto the dra-agents-net container ONLY so agents-net-stack sees zero mTLS keys
-# and dra-agents-net needs ZERO Kubernetes Secret RBAC.
-k -n kube-system patch daemonset dra-agents-net --type=strategic --patch '
+# directly onto the kube-net-driver container ONLY so kube-netstack sees zero mTLS keys
+# and kube-net-driver needs ZERO Kubernetes Secret RBAC.
+k -n kube-system patch daemonset kube-net-driver --type=strategic --patch '
 spec:
   template:
     spec:
       containers:
-        - name: dra-agents-net
+        - name: kube-net-driver
           args:
             - --driver-name=dra.agents.net
             - --socket-root=/run/dra-agents-net/pods
@@ -247,8 +247,8 @@ spec:
             - --ingress-tls-cert=/etc/dra-agents-net/ingress/tls.crt
             - --ingress-tls-key=/etc/dra-agents-net/ingress/tls.key
             - --ingress-client-ca=/etc/dra-agents-net/ca/ca.crt
-            - --ingress-allowed-client-san=agents-net-ingress-gateway
-            - --ingress-server-name=dra-agents-net.kube-system.svc
+            - --ingress-allowed-client-san=kube-inbound
+            - --ingress-server-name=kube-net-driver.kube-system.svc
           volumeMounts:
             - name: smoke-client-tls
               mountPath: /etc/dra-agents-net/client
@@ -270,11 +270,11 @@ spec:
           configMap:
             name: smoke-ca
 '
-k -n kube-system rollout status daemonset/dra-agents-net --timeout=120s
+k -n kube-system rollout status daemonset/kube-net-driver --timeout=120s
 k get deviceclass dra.agents.net
 k get resourceslices --field-selector=spec.driver=dra.agents.net
 
-echo "=== 6. Deploy echo target & agents.net reference connect-proxy PEP in ${NS} ==="
+echo "=== 6. Deploy echo target & reference kube-pep in ${NS} ==="
 k delete namespace "${NS}" --ignore-not-found --wait=true >/dev/null 2>&1 || true
 k create namespace "${NS}"
 
@@ -408,11 +408,11 @@ cat <<EOF | k apply -f -
 apiVersion: v1
 kind: Service
 metadata:
-  name: connect-proxy
+  name: kube-pep
   namespace: ${NS}
 spec:
   selector:
-    app: connect-proxy
+    app: kube-pep
   ports:
     - name: https
       port: 8443
@@ -421,20 +421,20 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: connect-proxy
+  name: kube-pep
   namespace: ${NS}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: connect-proxy
+      app: kube-pep
   template:
     metadata:
       labels:
-        app: connect-proxy
+        app: kube-pep
     spec:
       containers:
-        - name: connect-proxy
+        - name: kube-pep
           image: ${PEP_IMAGE}
           imagePullPolicy: IfNotPresent
           env:
@@ -473,7 +473,7 @@ spec:
 EOF
 
 k -n "${NS}" rollout status deployment/echo --timeout=90s
-k -n "${NS}" rollout status deployment/connect-proxy --timeout=90s
+k -n "${NS}" rollout status deployment/kube-pep --timeout=90s
 
 echo "=== 7. Deploy smoke DeviceClass (admin PEP + mTLS) + ResourceClaimTemplate + isolated Pod ==="
 cat <<EOF | k apply -f -
@@ -494,9 +494,9 @@ spec:
           confinementMode: NetworkPolicyDenyAll
           nicBlockMode: DropAll
           policyEnforcementPoint:
-            url: https://connect-proxy.${NS}.svc.cluster.local:8443
+            url: https://kube-pep.${NS}.svc.cluster.local:8443
             tls:
-              serverName: connect-proxy.${NS}.svc.cluster.local
+              serverName: kube-pep.${NS}.svc.cluster.local
               caCertificateRefs:
                 - type: HostPath
                   hostPath: /etc/dra-agents-net/ca/ca.crt
@@ -668,16 +668,16 @@ print("PASS HostTun transparent UDP over RFC 9298 connect-udp echoed:", echoed.d
 PY
 
 if docker inspect "${KIND_CLUSTER_NAME}-control-plane" >/dev/null 2>&1; then
-  echo "=== 8b. Assert two-container agents-net-stack privilege separation, seccomp, zero-secret mounts & crash recovery ==="
+  echo "=== 8b. Assert two-container kube-netstack privilege separation, seccomp, zero-secret mounts & crash recovery ==="
   OLD_STACK_PID="$(docker exec "${KIND_CLUSTER_NAME}-control-plane" bash -euo pipefail -c '
     parent_pid=""
     stack_pid=""
     for p in /proc/[0-9]*; do
       pid="${p#/proc/}"
       cmd="$(tr "\0" " " < "${p}/cmdline" 2>/dev/null || true)"
-      if [[ "${cmd}" == "/agents-net-stack --socket="* ]]; then
+      if [[ "${cmd}" == "/kube-netstack --socket="* ]]; then
         stack_pid="${pid}"
-      elif [[ "${cmd}" == "/dra-agents-net "* ]]; then
+      elif [[ "${cmd}" == "/kube-net-driver "* ]]; then
         parent_pid="${pid}"
       fi
     done
@@ -703,27 +703,27 @@ if docker inspect "${KIND_CLUSTER_NAME}-control-plane" >/dev/null 2>&1; then
         fi
       done
     done
-    # Verify agents-net-stack runs in its own mount namespace with zero K8s SA token,
+    # Verify kube-netstack runs in its own mount namespace with zero K8s SA token,
     # zero host netns/NRI mounts, and zero mTLS private key mounts.
     if [ -e "/proc/${stack_pid}/root/var/run/secrets/kubernetes.io/serviceaccount" ]; then
-      echo "FAIL: agents-net-stack container unexpectedly has Kubernetes ServiceAccount token mounted" >&2
+      echo "FAIL: kube-netstack container unexpectedly has Kubernetes ServiceAccount token mounted" >&2
       exit 1
     fi
     if grep -qE " (/var/run/netns|/var/run/nri|/etc/dra-agents-net|/var/lib/kubelet) " "/proc/${stack_pid}/mountinfo"; then
-      echo "FAIL: agents-net-stack container unexpectedly mounted privileged host/secret paths" >&2
+      echo "FAIL: kube-netstack container unexpectedly mounted privileged host/secret paths" >&2
       exit 1
     fi
     # Verify parent holds zero open /dev/net/tun descriptors after SCM_RIGHTS handoff.
     if ls -l "/proc/${parent_pid}/fd" 2>/dev/null | grep -q "/dev/net/tun"; then
-      echo "FAIL: parent dra-agents-net still holds an open /dev/net/tun FD" >&2
+      echo "FAIL: parent kube-net-driver still holds an open /dev/net/tun FD" >&2
       exit 1
     fi
-    echo "PASS unprivileged agents-net-stack container PID=${stack_pid} (all threads uid=65534, Cap=0, NoNewPrivs=1, Seccomp=2, zero SA token/host mounts, zero tunFD in parent)" >&2
+    echo "PASS unprivileged kube-netstack container PID=${stack_pid} (all threads uid=65534, Cap=0, NoNewPrivs=1, Seccomp=2, zero SA token/host mounts, zero tunFD in parent)" >&2
     echo "${stack_pid}"
   ')"
 
-  # Kill the agents-net-stack container directly; verify kubelet restarts it and
-  # dra-agents-net automatically reconnects and recovers persistent tun0.
+  # Kill the kube-netstack container directly; verify kubelet restarts it and
+  # kube-net-driver automatically reconnects and recovers persistent tun0.
   docker exec "${KIND_CLUSTER_NAME}-control-plane" kill -9 "${OLD_STACK_PID}"
   NEW_STACK_PID=""
   for _ in $(seq 1 100); do
@@ -731,7 +731,7 @@ if docker inspect "${KIND_CLUSTER_NAME}-control-plane" >/dev/null 2>&1; then
       for p in /proc/[0-9]*; do
         pid="${p#/proc/}"
         cmd="$(tr "\0" " " < "${p}/cmdline" 2>/dev/null || true)"
-        if [[ "${cmd}" == "/agents-net-stack --socket="* ]]; then
+        if [[ "${cmd}" == "/kube-netstack --socket="* ]]; then
           echo "${pid}"
           exit 0
         fi
@@ -743,10 +743,10 @@ if docker inspect "${KIND_CLUSTER_NAME}-control-plane" >/dev/null 2>&1; then
     sleep 0.2
   done
   if [ -z "${NEW_STACK_PID}" ] || [ "${NEW_STACK_PID}" = "${OLD_STACK_PID}" ]; then
-    echo "FAIL: agents-net-stack container did not restart after SIGKILL (old=${OLD_STACK_PID} new=${NEW_STACK_PID})" >&2
+    echo "FAIL: kube-netstack container did not restart after SIGKILL (old=${OLD_STACK_PID} new=${NEW_STACK_PID})" >&2
     exit 1
   fi
-  echo "PASS agents-net-stack container restarted by kubelet after SIGKILL: ${OLD_STACK_PID} -> ${NEW_STACK_PID}"
+  echo "PASS kube-netstack container restarted by kubelet after SIGKILL: ${OLD_STACK_PID} -> ${NEW_STACK_PID}"
 
   k -n "${NS}" exec -i smoke-agent -- env NS="${NS}" python3 - <<'PY'
 import json, os, time, urllib.request
@@ -757,7 +757,7 @@ for _ in range(25):
         with urllib.request.urlopen(f"https://{echo_host}:8443/after-stack-kill", timeout=5) as resp:
             data = json.loads(resp.read().decode())
             assert resp.status == 200 and data["ok"] is True and data["path"] == "/after-stack-kill", data
-            print("PASS HostTun transparent HTTPS recovered after agents-net-stack SIGKILL:", data)
+            print("PASS HostTun transparent HTTPS recovered after kube-netstack SIGKILL:", data)
             last_err = None
             break
     except Exception as e:
@@ -789,9 +789,9 @@ spec:
           dns:
             mode: DoH
           policyEnforcementPoint:
-            url: https://connect-proxy.${NS}.svc.cluster.local:8443
+            url: https://kube-pep.${NS}.svc.cluster.local:8443
             tls:
-              serverName: connect-proxy.${NS}.svc.cluster.local
+              serverName: kube-pep.${NS}.svc.cluster.local
               caCertificateRefs:
                 - type: HostPath
                   hostPath: /etc/dra-agents-net/ca/ca.crt
@@ -889,7 +889,7 @@ while True:
 tls_sock.close()
 resp_text = b"".join(chunks).decode()
 assert "200 OK" in resp_text and '"/doh-short"' in resp_text, resp_text
-print("PASS DoH short name transparent HTTPS via connect-proxy succeeded")
+print("PASS DoH short name transparent HTTPS via kube-pep succeeded")
 
 # 3. FQDN with < 5 dots (echo.NS.svc.cluster.local has 4 dots < ndots:5) triggers search
 #    attempts that receive real NXDOMAIN before succeeding on the FQDN itself.
@@ -910,8 +910,8 @@ PY
 k -n "${NS}" delete pod smoke-agent-doh --wait=true >/dev/null
 k delete deviceclass dra.agents.net-smoke-doh --ignore-not-found >/dev/null
 
-echo "=== 9. Verify connect-proxy JSONL audit log recorded mTLS peer + h2 TCP & UDP allow + deny (and zero unmapped synthetic IPs) ==="
-PEP_LOGS="$(k -n "${NS}" logs deploy/connect-proxy)"
+echo "=== 9. Verify kube-pep JSONL audit log recorded mTLS peer + h2 TCP, UDP & DNS allow + deny (and zero unmapped synthetic IPs) ==="
+PEP_LOGS="$(k -n "${NS}" logs deploy/kube-pep)"
 echo "${PEP_LOGS}"
 python3 - "${PEP_LOGS}" <<'PY'
 import json, sys
@@ -920,9 +920,9 @@ for line in sys.argv[1].splitlines():
     line = line.strip()
     if line.startswith("{"):
         records.append(json.loads(line))
-tcp_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "tcp" and r.get("peer") == "dra-agents-net-smoke-client" and r.get("wire") == "h2"]
-udp_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "udp" and r.get("peer") == "dra-agents-net-smoke-client" and r.get("wire") == "h2"]
-dns_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "dns" and r.get("peer") == "dra-agents-net-smoke-client" and r.get("wire") == "h2"]
+tcp_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "tcp" and r.get("peer") == "kube-net-driver-smoke-client" and r.get("wire") == "h2"]
+udp_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "udp" and r.get("peer") == "kube-net-driver-smoke-client" and r.get("wire") == "h2"]
+dns_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "dns" and r.get("peer") == "kube-net-driver-smoke-client" and r.get("wire") == "h2"]
 dns_blocks = [r for r in records if r.get("decision") == "block" and r.get("transport") == "dns" and r.get("destination") == "doesnotexist.example" and r.get("reason") == "not-on-allowlist"]
 blocks = [r for r in records if r.get("decision") == "block" and r.get("destination") == "blocked.example:443" and r.get("reason") == "not-on-allowlist"]
 synthetic_leaks = [r for r in records if "198.18.9.9" in str(r.get("destination", ""))]
@@ -932,7 +932,7 @@ assert dns_allows, f"missing DNS DoH allow audit record with mTLS peer & h2: {re
 assert dns_blocks, f"missing DNS DoH block audit record for doesnotexist.example: {records}"
 assert blocks, f"missing block audit record for blocked.example:443: {records}"
 assert not synthetic_leaks, f"unmapped synthetic IP leaked to PEP: {synthetic_leaks}"
-print(f"PASS connect-proxy audit: {len(tcp_allows)} TCP allow(s), {len(udp_allows)} UDP allow(s), {len(dns_allows)} DNS allow(s), {len(dns_blocks)} DNS block(s) (mTLS peer + h2), {len(blocks)} TCP block(s), 0 synthetic IP leaks")
+print(f"PASS kube-pep audit: {len(tcp_allows)} TCP allow(s), {len(udp_allows)} UDP allow(s), {len(dns_allows)} DNS allow(s), {len(dns_blocks)} DNS block(s) (mTLS peer + h2), {len(blocks)} TCP block(s), 0 synthetic IP leaks")
 PY
 
 echo "=== 10. Assert Option 3 Ingress discovery via ResourceClaim.status.devices[].data ==="
@@ -959,7 +959,7 @@ assert ing is not None, f"missing ingress in DeviceStatus: {data}"
 assert ing["protocol"] == "http-connect", ing
 assert ing["target"] == pod_uid, ing
 assert ing["tls"] is True, ing
-assert ing.get("serverName") == "dra-agents-net.kube-system.svc", ing
+assert ing.get("serverName") == "kube-net-driver.kube-system.svc", ing
 assert ing["endpoint"] and not ing["endpoint"].startswith(":"), ing
 assert any(p["port"] == 8080 and p["protocol"] == "TCP" for p in ing["ports"]), ing
 assert any(p["port"] == 9000 and p.get("endPort") == 9002 and p["protocol"] == "TCP" for p in ing["ports"]), ing
@@ -968,7 +968,7 @@ PY
 )"
 echo "Discovered ingress bridge endpoint=${INGRESS_ENDPOINT} target=${POD_UID}"
 
-echo "=== 11. Deploy agents-net-ingress-gateway behind LoadBalancer (cloud-provider-kind) & verify external ingress ==="
+echo "=== 11. Deploy kube-inbound behind LoadBalancer (cloud-provider-kind) & verify external ingress ==="
 GW_SVC_TYPE="ClusterIP"
 if [ "${RUN_CPK}" = "true" ]; then
   GW_SVC_TYPE="LoadBalancer"
@@ -977,13 +977,13 @@ cat <<EOF | k apply -f -
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: agents-net-ingress-gateway
+  name: kube-inbound
   namespace: ${NS}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: ${NS}-ingress-gateway
+  name: ${NS}-kube-inbound
 rules:
   - apiGroups: ["resource.k8s.io"]
     resources: ["resourceclaims"]
@@ -992,35 +992,35 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: ${NS}-ingress-gateway
+  name: ${NS}-kube-inbound
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: ${NS}-ingress-gateway
+  name: ${NS}-kube-inbound
 subjects:
   - kind: ServiceAccount
-    name: agents-net-ingress-gateway
+    name: kube-inbound
     namespace: ${NS}
 ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: agents-net-ingress-gateway
+  name: kube-inbound
   namespace: ${NS}
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: agents-net-ingress-gateway
+      app: kube-inbound
   template:
     metadata:
       labels:
-        app: agents-net-ingress-gateway
+        app: kube-inbound
     spec:
-      serviceAccountName: agents-net-ingress-gateway
+      serviceAccountName: kube-inbound
       containers:
-        - name: gateway
-          image: ${GATEWAY_IMAGE}
+        - name: kube-inbound
+          image: ${INBOUND_IMAGE}
           imagePullPolicy: IfNotPresent
           args:
             - --listen-addr=:8080
@@ -1052,23 +1052,23 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: agents-net-ingress-gateway
+  name: kube-inbound
   namespace: ${NS}
 spec:
   type: ${GW_SVC_TYPE}
   selector:
-    app: agents-net-ingress-gateway
+    app: kube-inbound
   ports:
     - name: http
       port: 80
       targetPort: 8080
 EOF
-k -n "${NS}" rollout status deployment/agents-net-ingress-gateway --timeout=60s
+k -n "${NS}" rollout status deployment/kube-inbound --timeout=60s
 
 LB_IP=""
 if [ "${RUN_CPK}" = "true" ]; then
   for _ in $(seq 1 30); do
-    LB_IP="$(k -n "${NS}" get svc agents-net-ingress-gateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
+    LB_IP="$(k -n "${NS}" get svc kube-inbound -o jsonpath='{.status.loadBalancer.ingress[0].ip}')"
     if [ -n "${LB_IP}" ]; then
       break
     fi
@@ -1174,7 +1174,7 @@ tls_ctx.load_cert_chain("/tls/tls.crt", "/tls/tls.key")
 
 def connect_tunnel(target_port):
     raw_sock = socket.create_connection((host, port), timeout=5)
-    s = tls_ctx.wrap_socket(raw_sock, server_hostname="dra-agents-net.kube-system.svc")
+    s = tls_ctx.wrap_socket(raw_sock, server_hostname="kube-net-driver.kube-system.svc")
     req = f"CONNECT {pod_uid}:{target_port} HTTP/1.1\r\nHost: {pod_uid}:{target_port}\r\n\r\n"
     s.sendall(req.encode())
     buf = b""
@@ -1260,7 +1260,7 @@ else:
 tls_ctx = ssl.create_default_context(cafile="/ca/ca.crt")
 tls_ctx.load_cert_chain("/tls/tls.crt", "/tls/tls.key")
 raw_sock = socket.create_connection((host, int(port)), timeout=5)
-s = tls_ctx.wrap_socket(raw_sock, server_hostname="dra-agents-net.kube-system.svc")
+s = tls_ctx.wrap_socket(raw_sock, server_hostname="kube-net-driver.kube-system.svc")
 s.sendall(f"CONNECT {pod_uid}:8080 HTTP/1.1\r\nHost: {pod_uid}:8080\r\n\r\n".encode())
 resp = s.recv(4096).decode()
 s.close()

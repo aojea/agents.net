@@ -1,5 +1,7 @@
-IMAGE ?= ghcr.io/aojea/agents.net/dra-agents-net:latest
-STACK_IMAGE ?= ghcr.io/aojea/agents.net/agents-net-stack:latest
+DRIVER_IMAGE ?= ghcr.io/aojea/agents.net/kube-net-driver:latest
+STACK_IMAGE ?= ghcr.io/aojea/agents.net/kube-netstack:latest
+PEP_IMAGE ?= ghcr.io/aojea/agents.net/kube-pep:latest
+INBOUND_IMAGE ?= ghcr.io/aojea/agents.net/kube-inbound:latest
 
 .PHONY: build test vet fmt image smoke
 
@@ -16,8 +18,10 @@ fmt:
 	gofmt -s -w .
 
 image:
-	docker build -t $(IMAGE) .
-	docker build -t $(STACK_IMAGE) -f Dockerfile.stack .
+	docker build -t $(DRIVER_IMAGE) -f Dockerfile.kube-net-driver .
+	docker build -t $(STACK_IMAGE) -f Dockerfile.kube-netstack .
+	docker build -t $(PEP_IMAGE) -f Dockerfile.kube-pep .
+	docker build -t $(INBOUND_IMAGE) -f Dockerfile.kube-inbound .
 
 smoke:
 	./test/smoke.sh

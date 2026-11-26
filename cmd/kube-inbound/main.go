@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command agents-net-ingress-gateway is a stateless Kubernetes ingress gateway
-// for dra.agents.net. Place it behind a LoadBalancer Service, Kubernetes Ingress,
+// Command kube-inbound is a stateless Kubernetes inbound gateway for
+// dra.agents.net. Place it behind a LoadBalancer Service, Kubernetes Ingress,
 // or Gateway API HTTTPRoute to attract inbound traffic and deliver it over
 // mandatory mTLS HTTP CONNECT tunnels to isolated Pods discovered via
 // ResourceClaim.status.devices[].data.
@@ -126,7 +126,7 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		klog.InfoS("agents-net-ingress-gateway listening", "addr", listenAddr, "driver", driverName)
+		klog.InfoS("kube-inbound listening", "addr", listenAddr, "driver", driverName)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

@@ -21,12 +21,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: dra-agents-net
-            dockerfile: Dockerfile
-          - name: agents-net-stack
-            dockerfile: Dockerfile.stack
-          - name: agents-net-ingress-gateway
-            dockerfile: Dockerfile.ingress-gateway
+          - name: kube-net-driver
+            dockerfile: Dockerfile.kube-net-driver
+          - name: kube-netstack
+            dockerfile: Dockerfile.kube-netstack
+          - name: kube-pep
+            dockerfile: Dockerfile.kube-pep
+          - name: kube-inbound
+            dockerfile: Dockerfile.kube-inbound
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

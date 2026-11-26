@@ -12,10 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# All-in-one installation manifest for dra-agents-net (driver: dra.agents.net):
+# All-in-one installation manifest for kube-net-driver (DRA driver: dra.agents.net):
 #   - ServiceAccount, ClusterRole, and ClusterRoleBinding (kube-system)
 #   - GA Kubernetes DRA DeviceClass "dra.agents.net" (DRAConsumableCapacity)
-#   - Node DaemonSet (DRA kubelet plugin + containerd NRI plugin)
+#   - Two-container Node DaemonSet (kube-net-driver + unprivileged kube-netstack)
 #
 # Install:
 #   kubectl apply -f https://raw.githubusercontent.com/aojea/agents.net/main/install.yaml
@@ -23,13 +23,13 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: dra-agents-net
+  name: kube-net-driver
   namespace: kube-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: dra-agents-net
+  name: kube-net-driver
 rules:
   - apiGroups: ["resource.k8s.io"]
     resources: ["resourceslices"]
@@ -63,17 +63,17 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: dra-agents-net
+  name: kube-net-driver
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: dra-agents-net
+  name: kube-net-driver
 subjects:
   - kind: ServiceAccount
-    name: dra-agents-net
+    name: kube-net-driver
     namespace: kube-system
 ---
-# Kubernetes DRA DeviceClass for dra-agents-net (driver: dra.agents.net).
+# Kubernetes DRA DeviceClass for kube-net-driver (driver: dra.agents.net).
 # Pairs with DRAConsumableCapacity (Beta, enabled by default since Kubernetes 1.36):
 # each node publishes a single shared "agents-net" device whose requestPolicy defaults
 # to consuming 1 sandbox unit per ResourceClaim.
@@ -104,20 +104,20 @@ spec:
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
-  name: dra-agents-net
+  name: kube-net-driver
   namespace: kube-system
   labels:
-    app.kubernetes.io/name: dra-agents-net
+    app.kubernetes.io/name: kube-net-driver
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: dra-agents-net
+      app.kubernetes.io/name: kube-net-driver
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: dra-agents-net
+        app.kubernetes.io/name: kube-net-driver
     spec:
-      serviceAccountName: dra-agents-net
+      serviceAccountName: kube-net-driver
       automountServiceAccountToken: false
       hostNetwork: true
       hostPID: true
@@ -127,8 +127,8 @@ spec:
       tolerations:
         - operator: Exists
       containers:
-        - name: dra-agents-net
-          image: ghcr.io/aojea/agents.net/dra-agents-net:latest
+        - name: kube-net-driver
+          image: ghcr.io/aojea/agents.net/kube-net-driver:latest
           args:
             - --driver-name=dra.agents.net
             - --socket-root=/run/dra-agents-net/pods
@@ -142,7 +142,7 @@ spec:
             # - --ingress-tls-cert=/etc/dra-agents-net/ingress/tls.crt
             # - --ingress-tls-key=/etc/dra-agents-net/ingress/tls.key
             # - --ingress-client-ca=/etc/dra-agents-net/ingress/ca.crt
-            # - --ingress-allowed-client-san=agents-net-ingress-gateway
+            # - --ingress-allowed-client-san=kube-inbound
           env:
             - name: NODE_NAME
               valueFrom:
@@ -197,8 +197,8 @@ spec:
               mountPath: /run/dra-agents-net
             - name: hosttun-run
               mountPath: /run/hosttun
-        - name: agents-net-stack
-          image: ghcr.io/aojea/agents.net/agents-net-stack:latest
+        - name: kube-netstack
+          image: ghcr.io/aojea/agents.net/kube-netstack:latest
           args:
             - --socket=/run/hosttun/worker.sock
           resources:

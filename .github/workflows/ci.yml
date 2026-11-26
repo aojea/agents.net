@@ -40,7 +40,7 @@ jobs:
         run: go test -race -count=1 ./...
 
   kind-smoke:
-    name: Kubernetes kind smoke test (connect-proxy PEP + cloud-provider-kind LoadBalancer ingress)
+    name: Kubernetes kind smoke test (kube-pep + cloud-provider-kind kube-inbound)
     needs: go-test
     runs-on: ubuntu-latest
     steps:

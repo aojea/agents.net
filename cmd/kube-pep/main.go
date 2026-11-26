@@ -1,19 +1,20 @@
-// Command connect-proxy is the reference boundary: CONNECT for TCP and
-// connect-udp (RFC 9298) for UDP, applying a deny-by-default policy
-// descriptor (conformance/schema/policy.schema.json) on destination names, addresses,
+// Command kube-pep is the reference Policy Enforcement Point (PEP): CONNECT
+// for TCP, connect-udp (RFC 9298) for UDP, and DoH (RFC 8484) for DNS,
+// applying a deny-by-default policy descriptor on destination names, addresses,
 // ports, and transports, with one JSON audit record per decision.
 // Hostnames are resolved by the boundary and only public or explicitly
 // listed resolved addresses are dialed, so an allowed name cannot reach
 // loopback, private, link-local, or metadata addresses. Failures carry an
 // RFC 9209 Proxy-Status field with the reason token.
 // -h2 switches from HTTP/1.1 (one connection per flow) to a single
-// multiplexed cleartext HTTP/2 session (prior knowledge, HBONE-shaped):
-// TCP flows are CONNECT streams, UDP sessions extended CONNECT streams.
+// multiplexed HTTP/2 session (HBONE-shaped): TCP flows are CONNECT streams,
+// UDP sessions are extended CONNECT streams, and DoH queries are POST /dns-query
+// streams on the same session.
 //
-// It pairs with cmd/tun2connect for the full demo, and is curl-testable
+// It pairs with kube-net-driver and kube-tun2connect, and is curl-testable
 // alone (curl uses CONNECT through an HTTP proxy):
 //
-//	connect-proxy -listen tcp://127.0.0.1:8080 -policy policy.json
+//	kube-pep -listen tcp://127.0.0.1:8080 -policy policy.json
 //	curl --proxy http://127.0.0.1:8080 https://example.com
 package main
 

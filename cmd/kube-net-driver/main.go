@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Command dra-agents-net runs the per-node agents.net Kubernetes Network Driver
-// (KND) DaemonSet, following the Kubernetes Network Driver Model (Ojea, IEEE LCN
-// 2025, DOI: 10.1109/LCN65610.2025.11146291 / arXiv:2506.23628): standard GA DRA
-// slow-path preparation + NRI fast-path runtime hooks + UDS/socketat listeners +
-// mandatory mTLS upstream CONNECT / RFC 9298 connect-udp forwarding.
+// Command kube-net-driver runs the per-node agents.net Kubernetes Network Driver
+// (KND) DaemonSet (DRA driver: dra.agents.net), following the Kubernetes Network
+// Driver Model (Ojea, IEEE LCN 2025, DOI: 10.1109/LCN65610.2025.11146291 /
+// arXiv:2506.23628): standard GA DRA slow-path preparation + NRI fast-path
+// runtime hooks + UDS/socketat listeners + mandatory mTLS upstream CONNECT /
+// RFC 9298 connect-udp / RFC 8484 DoH forwarding.
 package main
 
 import (

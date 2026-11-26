@@ -25,11 +25,11 @@ COPY pkg/ ./pkg/
 
 RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w" \
-    -o /agents-net-stack ./cmd/agents-net-stack
+    -o /kube-netstack ./cmd/kube-netstack
 
 FROM gcr.io/distroless/static-debian13:nonroot
 
-COPY --from=builder /agents-net-stack /agents-net-stack
+COPY --from=builder /kube-netstack /kube-netstack
 
 USER 65534:65534
-ENTRYPOINT ["/agents-net-stack"]
+ENTRYPOINT ["/kube-netstack"]

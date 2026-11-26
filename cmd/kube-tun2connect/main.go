@@ -1,11 +1,11 @@
-// Command tun2connect runs the guest side of the boundary: it opens a
+// Command kube-tun2connect runs the guest side of the boundary: it opens a
 // TUN device, terminates TCP/IP in userspace, answers DNS with synthetic
 // addresses, and carries supported flows to the boundary as HTTP CONNECT
 // (TCP) or connect-udp (UDP), using hostnames or literal IP destinations.
 //
-// Demo (as root, with connect-proxy running on the other end):
+// Demo (as root, with kube-pep running on the other end):
 //
-//	tun2connect -device tun2c0 -proxy unix:///tmp/boundary.sock -udp
+//	kube-tun2connect -device tun2c0 -proxy unix:///tmp/boundary.sock -udp
 package main
 
 import (
