@@ -97,9 +97,7 @@ spec:
           kind: DriverConfig
           confinementMode: PodNetworkIsolated
           nicBlockMode: DropAll
-          adapterMode: ExplicitProxy
-          proxy:
-            port: 15001
+          adapterMode: HostTun
           maxConnections: 1024
           idleTimeoutSeconds: 300
 ---

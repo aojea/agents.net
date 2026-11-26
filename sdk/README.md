@@ -36,7 +36,7 @@ behind a `tun` device inside the sandbox. The launcher creates the device
 packet the agent sends arrives in the userspace stack. That stack answers DNS
 queries on port 53 itself. Instead of resolving a name over the network, it
 hands back a synthetic address from a private pool (such as IPv4
-`100.64.0.0/10` and IPv6 `100::/64`) and remembers which name the address
+`198.18.0.0/15` and IPv6 `100::/64`) and remembers which name the address
 stands for. When the agent later connects to that address, the adapter looks
 the name up again and puts the original hostname in the CONNECT request. A
 destination with no synthetic mapping is sent as an IP literal. Both kinds of
@@ -101,7 +101,7 @@ network namespace. Give `run` no command (`tun2connect run [flags]
 <boundary-socket>`) and it sets up the device the same way, then serves until
 SIGINT or SIGTERM. A sidecar with its own root filesystem writes its own
 `/etc/resolv.conf`, not the agent's, so point the agent's resolver at
-`100.127.255.253` (any pool address works). If the sidecar terminates, the
+`198.19.255.253` (any pool address works). If the sidecar terminates, the
 agent keeps running but loses its only network path, so it fails closed.
 
 In a microVM (Firecracker, Cloud-Hypervisor), the networking daemon

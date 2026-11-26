@@ -5,11 +5,13 @@ on:
     branches: [ main ]
     paths:
       - 'kubernetes/**'
+      - 'sdk/**'
       - '.github/workflows/kubernetes.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'kubernetes/**'
+      - 'sdk/**'
       - '.github/workflows/kubernetes.yml'
 
 env:

@@ -51,18 +51,34 @@ import (
 )
 
 type fakeNetNS struct {
-	verifiedPaths []string
-	flushedPaths  []string
-	blockedPaths  []string
-	listenedAddrs []string
-	verifyErr     error
-	flushErr      error
-	blockErr      error
-	hasRoutes     bool
-	hasRoutesErr  error
-	nicsUnblocked bool
-	nicsCheckErr  error
-	listenErr     error
+	verifiedPaths      []string
+	flushedPaths       []string
+	blockedPaths       []string
+	listenedAddrs      []string
+	hostTunPaths       []string
+	hostTunPreserveNIC []bool
+	hostTunCleaned     []string
+	hostTunClosed      int
+	verifyErr          error
+	flushErr           error
+	blockErr           error
+	hasRoutes          bool
+	hasRoutesErr       error
+	nicsUnblocked      bool
+	nicsCheckErr       error
+	listenErr          error
+	hostTunErr         error
+}
+
+type fakeCloser struct {
+	onClose func()
+}
+
+func (f fakeCloser) Close() error {
+	if f.onClose != nil {
+		f.onClose()
+	}
+	return nil
 }
 
 func (f *fakeNetNS) VerifyLoopbackOnly(path string, _ bool) error {
@@ -95,6 +111,20 @@ func (f *fakeNetNS) ListenAt(path, network, address string) (net.Listener, error
 	}
 	// Bind an ephemeral host loopback listener in offline unit tests.
 	return net.Listen(network, "127.0.0.1:0")
+}
+
+func (f *fakeNetNS) StartHostTun(path, _ string, _ int, preserveNICReturn bool) (io.Closer, error) {
+	f.hostTunPaths = append(f.hostTunPaths, path)
+	f.hostTunPreserveNIC = append(f.hostTunPreserveNIC, preserveNICReturn)
+	if f.hostTunErr != nil {
+		return nil, f.hostTunErr
+	}
+	return fakeCloser{onClose: func() { f.hostTunClosed++ }}, nil
+}
+
+func (f *fakeNetNS) CleanupHostTun(path string) error {
+	f.hostTunCleaned = append(f.hostTunCleaned, path)
+	return nil
 }
 
 func shortTempDir(t *testing.T) string {
@@ -824,5 +854,140 @@ func TestPodSandboxRecreationStaleGCAndIdempotentPrepare(t *testing.T) {
 	cfgAfter, ok := st.Get(podUID)
 	if !ok || cfgAfter.NetNS != "/var/run/netns/sb2" || cfgAfter.SandboxID != "sb-id-2" || cfgAfter.ServiceAccount != "my-sa" {
 		t.Fatalf("idempotent PrepareResourceClaims wiped live state: %+v", cfgAfter)
+	}
+}
+
+func TestHostTunDefaultZeroSidecarLifecycle(t *testing.T) {
+	ctx := t.Context()
+	tmp := shortTempDir(t)
+	st, _ := store.New(nil)
+	tm, err := tunnel.NewManager(filepath.Join(tmp, "s"), nil, tunnel.WithAuditWriter(io.Discard))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer tm.Close()
+
+	netns := &fakeNetNS{}
+	drv, err := New(Config{NodeName: "worker-1", Store: st, Tunnel: tm, NetNS: netns})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	drv.nriConnected.Store(true)
+
+	// Empty AdapterMode must default to HostTun.
+	podUID := types.UID("pod-hosttun-1")
+	claimUID := types.UID("claim-hosttun-1")
+	claim := makeTestClaim(podUID, claimUID, params.NetworkParameters{
+		ConfinementMode: apis.ConfinementModeNetworkPolicyDenyAll,
+		IngressPorts:    []apis.IngressPort{{Port: 8080}},
+	})
+	prepRes, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim})
+	if err != nil || prepRes[claimUID].Err != nil {
+		t.Fatalf("PrepareResourceClaims: err=%v res=%+v", err, prepRes[claimUID])
+	}
+	cfg, ok := st.Get(podUID)
+	if !ok {
+		t.Fatal("missing PodConfig in store")
+	}
+	if cfg.Parameters.EffectiveAdapterMode() != apis.AdapterModeHostTun {
+		t.Fatalf("EffectiveAdapterMode = %q, want HostTun", cfg.Parameters.EffectiveAdapterMode())
+	}
+	if cfg.SocketPaths.ResolvConfPath == "" {
+		t.Fatal("expected ResolvConfPath written for HostTun")
+	}
+	resolvBytes, err := os.ReadFile(cfg.SocketPaths.ResolvConfPath)
+	if err != nil {
+		t.Fatalf("read HostTun resolv.conf: %v", err)
+	}
+	if got := string(resolvBytes); got != "nameserver 198.19.255.253\n" {
+		t.Fatalf("resolv.conf = %q, want %q", got, "nameserver 198.19.255.253\n")
+	}
+
+	pod := &nriapi.PodSandbox{
+		Id:        "sb-hosttun-1",
+		Uid:       string(podUID),
+		Name:      "agent",
+		Namespace: "agents",
+		Linux:     &nriapi.LinuxPodSandbox{Namespaces: []*nriapi.LinuxNamespace{{Type: "network", Path: "/var/run/netns/ht1"}}},
+	}
+	if err := drv.RunPodSandbox(ctx, pod); err != nil {
+		t.Fatalf("RunPodSandbox: %v", err)
+	}
+	if len(netns.hostTunPaths) != 1 || netns.hostTunPaths[0] != "/var/run/netns/ht1" || netns.hostTunPreserveNIC[0] {
+		t.Fatalf("unexpected HostTun start: paths=%v preserveNIC=%v", netns.hostTunPaths, netns.hostTunPreserveNIC)
+	}
+	if len(netns.listenedAddrs) != 0 {
+		t.Fatalf("HostTun must not bind ExplicitProxy loopback port, got %v", netns.listenedAddrs)
+	}
+
+	// CreateContainer replaces /etc/resolv.conf without mounting egress.sock or injecting HTTP_PROXY or /dev/net/tun.
+	adj, _, err := drv.CreateContainer(ctx, pod, &nriapi.Container{Name: "agent"})
+	if err != nil || adj == nil {
+		t.Fatalf("CreateContainer: adj=%+v err=%v", adj, err)
+	}
+	if adj.Linux != nil && len(adj.Linux.Devices) > 0 {
+		t.Fatalf("HostTun must not expose /dev/net/tun to container: %+v", adj.Linux.Devices)
+	}
+	var sawRemoveResolv, sawAddResolv bool
+	for _, m := range adj.Mounts {
+		if m.Destination == containerEgressMountDir {
+			t.Fatalf("HostTun must not mount egress.sock into container: %+v", adj.Mounts)
+		}
+		if strings.HasSuffix(m.Destination, containerResolvConfPath) && m.Source == "" {
+			sawRemoveResolv = true
+		}
+		if m.Destination == containerResolvConfPath && m.Source == cfg.SocketPaths.ResolvConfPath {
+			sawAddResolv = true
+		}
+	}
+	if !sawRemoveResolv || !sawAddResolv {
+		t.Fatalf("expected RemoveMount + AddMount for /etc/resolv.conf, got %+v", adj.Mounts)
+	}
+	envs := envMap(adj.Env)
+	if envs["HTTP_PROXY"] != "" || envs["HTTPS_PROXY"] != "" {
+		t.Fatalf("HostTun must not inject HTTP_PROXY/HTTPS_PROXY: %+v", envs)
+	}
+	if envs["AGENT_INGRESS_PORT"] != "8080" {
+		t.Fatalf("AGENT_INGRESS_PORT = %q, want 8080", envs["AGENT_INGRESS_PORT"])
+	}
+
+	// nicBlockMode=Disabled under NetworkPolicyDenyAll enables preserveNICReturn.
+	podUID2 := types.UID("pod-hosttun-disabled")
+	claimUID2 := types.UID("claim-hosttun-disabled")
+	claim2 := makeTestClaim(podUID2, claimUID2, params.NetworkParameters{
+		ConfinementMode: apis.ConfinementModeNetworkPolicyDenyAll,
+		NICBlockMode:    apis.NICBlockModeDisabled,
+		AdapterMode:     apis.AdapterModeHostTun,
+	})
+	if res, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim2}); err != nil || res[claimUID2].Err != nil {
+		t.Fatalf("PrepareResourceClaims 2: err=%v res=%+v", err, res)
+	}
+	pod2 := &nriapi.PodSandbox{
+		Id: "sb-hosttun-2", Uid: string(podUID2), Name: "agent2", Namespace: "agents",
+		Linux: &nriapi.LinuxPodSandbox{Namespaces: []*nriapi.LinuxNamespace{{Type: "network", Path: "/var/run/netns/ht2"}}},
+	}
+	if err := drv.RunPodSandbox(ctx, pod2); err != nil {
+		t.Fatalf("RunPodSandbox 2: %v", err)
+	}
+	if len(netns.hostTunPreserveNIC) != 2 || !netns.hostTunPreserveNIC[1] {
+		t.Fatalf("expected preserveNICReturn=true for nicBlockMode=Disabled, got %v", netns.hostTunPreserveNIC)
+	}
+
+	// StopPodSandbox closes handle without deleting persistent tun0; RemovePodSandbox cleans up tun0.
+	if err := drv.StopPodSandbox(ctx, pod); err != nil {
+		t.Fatalf("StopPodSandbox: %v", err)
+	}
+	if netns.hostTunClosed != 1 || len(netns.hostTunCleaned) != 0 {
+		t.Fatalf("after StopPodSandbox: closed=%d cleaned=%v, want 1 / []", netns.hostTunClosed, netns.hostTunCleaned)
+	}
+	// Re-start and test RemovePodSandbox cleanup.
+	if err := drv.RunPodSandbox(ctx, pod); err != nil {
+		t.Fatalf("RunPodSandbox restart: %v", err)
+	}
+	if err := drv.RemovePodSandbox(ctx, pod); err != nil {
+		t.Fatalf("RemovePodSandbox: %v", err)
+	}
+	if netns.hostTunClosed != 2 || len(netns.hostTunCleaned) != 1 || netns.hostTunCleaned[0] != "/var/run/netns/ht1" {
+		t.Fatalf("after RemovePodSandbox: closed=%d cleaned=%v", netns.hostTunClosed, netns.hostTunCleaned)
 	}
 }

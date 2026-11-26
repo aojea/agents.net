@@ -12,18 +12,27 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
-// Synthetic pools. v4 is CGNAT space: link-local would be leak-proof at
-// the first router (RFC 3927) but SSRF guards in HTTP clients commonly
-// block 169.254/16, which would break legitimate egress. v6 is the
-// discard-only prefix (RFC 6666): a flow that ever escapes through a
-// stray interface is blackholed by the first conforming router instead
-// of reaching a routable ULA network. The top /24 (v4) and /120 (v6) of
-// each pool are never handed out: adapters place their own interface and
-// resolver addresses there.
+// Synthetic address pool constants shared across adapters (in-guest tun2connect,
+// host-side dra-agents-net HostTun, etc.).
+//
+// IPv4 uses RFC 2544 benchmarking space (198.18.0.0/15) rather than RFC 6598
+// CGNAT (100.64.0.0/10) so synthetic DNS answers do not collide with real cloud,
+// VPC, EKS, or Tailscale addresses. IPv6 uses the RFC 6666 discard-only prefix
+// (100::/64), which is non-routable and disjoint from all real IPv6 space. The
+// top /24 (v4) and /120 (v6) of each pool are never handed out: adapters place
+// their own interface and resolver addresses there.
+const (
+	DefaultGuestAddr4   = "198.19.255.254"
+	DefaultPool4Bits    = 15
+	DefaultResolverAddr = "198.19.255.253"
+	DefaultGuestAddr6   = "100::ffff:ffff:ffff:fffe"
+	DefaultPool6Bits    = 64
+)
+
 var (
-	v4Pool     = netip.MustParsePrefix("100.64.0.0/10")
+	v4Pool     = netip.MustParsePrefix("198.18.0.0/15")
 	v6Pool     = netip.MustParsePrefix("100::/64")
-	v4Reserved = netip.MustParsePrefix("100.127.255.0/24")
+	v4Reserved = netip.MustParsePrefix("198.19.255.0/24")
 	v6Reserved = netip.MustParsePrefix("100::ffff:ffff:ffff:ff00/120")
 )
 
@@ -47,10 +56,10 @@ var ErrPoolExhausted = errors.New("tun2connect: synthetic address pool exhausted
 //
 // Addresses are never reused within one VirtualDNS lifetime. When a name
 // is forgotten under the memory bound, its address stays unassigned: a
-// guest dialing a cached copy gets a reverse miss, the destination is
-// forwarded as a literal in the synthetic range, and the boundary denies
-// it. A stale cache therefore fails closed instead of reaching the name
-// that would otherwise have inherited the address.
+// guest dialing a cached copy gets a reverse miss inside the synthetic
+// pool, and Forwarder fails closed locally without contacting the boundary.
+// A stale cache therefore fails closed instead of reaching another name or
+// leaking a synthetic IP as a literal destination.
 type VirtualDNS struct {
 	// TTL is sent in whole seconds. Set it before the first query.
 	TTL time.Duration
@@ -147,6 +156,14 @@ func (d *VirtualDNS) Reverse(addr netip.Addr) (string, bool) {
 	}
 	f.order.MoveToFront(element)
 	return b.name, true
+}
+
+// InSyntheticPool reports whether addr lies inside the synthetic IPv4 or IPv6
+// DNS pool. Callers must fail closed when Reverse misses for an address in
+// these ranges rather than forwarding it as a literal IP destination.
+func (d *VirtualDNS) InSyntheticPool(addr netip.Addr) bool {
+	a := addr.Unmap()
+	return d.v4.pool.Contains(a) || d.v6.pool.Contains(a)
 }
 
 // HandleQuery answers one guest DNS query from the synthetic pools.

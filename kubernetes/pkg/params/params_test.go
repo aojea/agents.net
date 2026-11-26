@@ -185,6 +185,9 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndUnknownKeys(t *testing.T) {
 	if optOut.EffectiveNICBlockMode() != apis.NICBlockModeDisabled {
 		t.Fatalf("EffectiveNICBlockMode() = %q, want Disabled", optOut.EffectiveNICBlockMode())
 	}
+	if optOut.EffectiveAdapterMode() != apis.AdapterModeHostTun {
+		t.Fatalf("default EffectiveAdapterMode() = %q, want HostTun", optOut.EffectiveAdapterMode())
+	}
 
 	rejectedClass := []struct {
 		name string
@@ -223,6 +226,7 @@ func TestDecodeRejectsPrivilegedClaimFieldsAndUnknownKeys(t *testing.T) {
 		raw  string
 	}{
 		{"confinementMode downgrade", `{"confinementMode":"NetworkPolicyDenyAll"}`},
+		{"adapterMode HostTun override", `{"adapterMode":"HostTun"}`},
 		{"adapterMode TunSidecar escalation", `{"adapterMode":"TunSidecar"}`},
 		{"policyEnforcementPoint hijack", `{"policyEnforcementPoint":{"url":"https://attacker.example:8443","auth":{"type":"SPIFFE"}}}`},
 		{"policyEnforcementPoint unix SSRF", `{"policyEnforcementPoint":{"url":"unix:///var/run/nri/nri.sock"}}`},

@@ -33,6 +33,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -63,6 +64,7 @@ import (
 	"github.com/aojea/agents.net/kubernetes/pkg/socketat"
 	"github.com/aojea/agents.net/kubernetes/pkg/store"
 	"github.com/aojea/agents.net/kubernetes/pkg/tunnel"
+	"github.com/aojea/agents.net/sdk/pkg/tun2connect"
 )
 
 func createNamedPodNetNS(t *testing.T, prefix string) (nsPath string, nsHandle netns.NsHandle) {
@@ -1235,5 +1237,426 @@ func testIntegrationSynchronizeReportsMissingPlumbing(t *testing.T) {
 	}
 	if delta := testutil.ToFloat64(metrics.PodsMissingPlumbingTotal) - before; delta != 0 {
 		t.Fatalf("healthy pod after flush+tc incremented PodsMissingPlumbingTotal by %v, want 0", delta)
+	}
+}
+
+func TestIntegrationHostTunCrossNetNS(t *testing.T) {
+	testutils.Run(t, testIntegrationHostTunCrossNetNS, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func testIntegrationHostTunCrossNetNS(t *testing.T) {
+	ctx := t.Context()
+	bringUpHostLoopback(t)
+	podNSPath, _ := createNamedPodNetNS(t, "hosttun")
+
+	destHTTP := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "hosttun-dest:"+r.URL.Path)
+	}))
+	defer destHTTP.Close()
+	destHTTPAddr := strings.TrimPrefix(destHTTP.URL, "http://")
+	_, destHTTPPort, _ := net.SplitHostPort(destHTTPAddr)
+
+	udpEcho, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen host udp echo: %v", err)
+	}
+	defer func() { _ = udpEcho.Close() }()
+	_, udpEchoPort, _ := net.SplitHostPort(udpEcho.LocalAddr().String())
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, addr, rerr := udpEcho.ReadFrom(buf)
+			if rerr != nil {
+				return
+			}
+			_, _ = udpEcho.WriteTo(append([]byte("udp-echo:"), buf[:n]...), addr)
+		}
+	}()
+
+	pki := newIntegrationPKI(t)
+	srvPair := pki.issue(t, "127.0.0.1", true)
+	cliCertPEM, cliKeyPEM, _ := pki.issuePEM(t, "dra-hosttun-client", false)
+	certDir := t.TempDir()
+	caPath := filepath.Join(certDir, "ca.crt")
+	if err := os.WriteFile(caPath, pki.caPEM, 0o600); err != nil {
+		t.Fatalf("write CA: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, "tls.crt"), cliCertPEM, 0o600); err != nil {
+		t.Fatalf("write client cert: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(certDir, "tls.key"), cliKeyPEM, 0o600); err != nil {
+		t.Fatalf("write client key: %v", err)
+	}
+
+	var (
+		seenMu   sync.Mutex
+		seenHost []string
+	)
+	rawUpLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen upstream: %v", err)
+	}
+	tlsUpLn := tls.NewListener(rawUpLn, &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{srvPair},
+		ClientCAs:    pki.caPool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		NextProtos:   []string{"h2", "http/1.1"},
+	})
+	protos := new(http.Protocols)
+	protos.SetHTTP1(true)
+	protos.SetHTTP2(true)
+	upSrv := &http.Server{
+		Protocols: protos,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodConnect {
+				seenMu.Lock()
+				seenHost = append(seenHost, r.Host)
+				seenMu.Unlock()
+				if strings.HasPrefix(r.Host, "blocked.") {
+					w.Header().Set("Proxy-Status", `test-pep; error=http_request_denied; reason=not-on-allowlist`)
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				dialTarget := r.Host
+				if strings.HasPrefix(r.Host, "api.allowed.test:") {
+					dialTarget = destHTTPAddr
+				}
+				dst, dialErr := net.DialTimeout("tcp4", dialTarget, 2*time.Second)
+				if dialErr != nil {
+					w.WriteHeader(http.StatusBadGateway)
+					return
+				}
+				defer func() { _ = dst.Close() }()
+				w.WriteHeader(http.StatusOK)
+				rc := http.NewResponseController(w)
+				_ = rc.Flush()
+				var wg sync.WaitGroup
+				wg.Go(func() {
+					_, _ = io.Copy(dst, r.Body)
+					if tc, ok := dst.(*net.TCPConn); ok {
+						_ = tc.CloseWrite()
+					}
+				})
+				buf := make([]byte, 4096)
+				for {
+					n, rerr := dst.Read(buf)
+					if n > 0 {
+						if _, werr := w.Write(buf[:n]); werr != nil {
+							break
+						}
+						_ = rc.Flush()
+					}
+					if rerr != nil {
+						break
+					}
+				}
+				_ = dst.Close()
+				wg.Wait()
+				return
+			}
+			if r.Method == http.MethodGet && strings.EqualFold(r.Header.Get("Upgrade"), "connect-udp") {
+				rest := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/.well-known/masque/udp/"), "/")
+				host, port, _ := strings.Cut(rest, "/")
+				seenMu.Lock()
+				seenHost = append(seenHost, "udp:"+host+":"+port)
+				seenMu.Unlock()
+				dialTarget := net.JoinHostPort(host, port)
+				if host == "udp.allowed.test" {
+					dialTarget = udpEcho.LocalAddr().String()
+				}
+				udpConn, dialErr := net.DialTimeout("udp4", dialTarget, 2*time.Second)
+				if dialErr != nil {
+					w.WriteHeader(http.StatusBadGateway)
+					return
+				}
+				defer func() { _ = udpConn.Close() }()
+				conn, brw, hijErr := http.NewResponseController(w).Hijack()
+				if hijErr != nil {
+					return
+				}
+				defer func() { _ = conn.Close() }()
+				_, _ = io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n")
+				cs := tunnel.NewCapsuleStream(brw.Reader, conn)
+				go func() {
+					buf := make([]byte, 4096)
+					for {
+						n, rerr := udpConn.Read(buf)
+						if n > 0 {
+							if cs.WriteDatagram(buf[:n]) != nil {
+								return
+							}
+						}
+						if rerr != nil {
+							return
+						}
+					}
+				}()
+				for {
+					dg, rerr := cs.ReadDatagram()
+					if rerr != nil {
+						return
+					}
+					if _, werr := udpConn.Write(dg); werr != nil {
+						return
+					}
+				}
+			}
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}),
+	}
+	go func() { _ = upSrv.Serve(tlsUpLn) }()
+	defer func() { _ = upSrv.Close() }()
+
+	st, err := store.New(nil)
+	if err != nil {
+		t.Fatalf("store.New: %v", err)
+	}
+	tm, err := tunnel.NewManager(t.TempDir(), auth.NewResolver(auth.ResolverConfig{}), tunnel.WithAuditWriter(io.Discard))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer tm.Close()
+	drv, err := New(Config{
+		DriverName: apis.DriverName,
+		NodeName:   "test-node",
+		Store:      st,
+		Tunnel:     tm,
+	})
+	if err != nil {
+		t.Fatalf("driver.New: %v", err)
+	}
+	drv.nriConnected.Store(true)
+	defer drv.stopAllHostTuns(true)
+
+	const podUID = types.UID("pod-hosttun-int-1")
+	rawParams, err := json.Marshal(params.NetworkParameters{
+		ConfinementMode: apis.ConfinementModePodNetworkIsolated,
+		// AdapterMode intentionally omitted to verify HostTun is the default.
+		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
+			URL: "https://" + rawUpLn.Addr().String(),
+			TLS: &apis.PEPTLS{
+				ServerName: "127.0.0.1",
+				CACertificateRefs: []apis.CASource{
+					{Type: apis.CASourceTypeHostPath, HostPath: caPath},
+				},
+			},
+			Auth: &apis.PEPAuth{
+				Type: apis.PEPAuthTypeMTLS,
+				MTLS: &apis.MTLSAuth{CertDir: certDir},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal params: %v", err)
+	}
+	claim := &resourceapi.ResourceClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "claim-ht", Namespace: "agents", UID: "claim-ht-uid"},
+		Status: resourceapi.ResourceClaimStatus{
+			ReservedFor: []resourceapi.ResourceClaimConsumerReference{{Resource: "pods", Name: "sb-ht", UID: podUID}},
+			Allocation: &resourceapi.AllocationResult{
+				Devices: resourceapi.DeviceAllocationResult{
+					Results: []resourceapi.DeviceRequestAllocationResult{
+						{Request: apis.PodClaimName, Driver: apis.DriverName, Pool: "test-node", Device: DefaultDeviceName},
+					},
+					Config: []resourceapi.DeviceAllocationConfiguration{
+						{
+							Source: resourceapi.AllocationConfigSourceClass,
+							DeviceConfiguration: resourceapi.DeviceConfiguration{
+								Opaque: &resourceapi.OpaqueDeviceConfiguration{
+									Driver:     apis.DriverName,
+									Parameters: k8sruntime.RawExtension{Raw: rawParams},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	prepRes, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim})
+	if err != nil || prepRes[claim.UID].Err != nil {
+		t.Fatalf("PrepareResourceClaims: err=%v res=%+v", err, prepRes[claim.UID])
+	}
+	pod := &nriapi.PodSandbox{
+		Id: "sb-ht-1", Uid: string(podUID), Name: "sb-ht", Namespace: "agents",
+		Linux: &nriapi.LinuxPodSandbox{Namespaces: []*nriapi.LinuxNamespace{{Type: "network", Path: podNSPath}}},
+	}
+	if err := drv.RunPodSandbox(ctx, pod); err != nil {
+		t.Fatalf("RunPodSandbox: %v", err)
+	}
+
+	syntheticPool := netip.MustParsePrefix("198.18.0.0/15")
+	resolver := &net.Resolver{
+		PreferGo: true,
+		Dial: func(_ context.Context, _, _ string) (net.Conn, error) {
+			return socketat.DialAtPath(podNSPath, "udp4", tun2connect.DefaultResolverAddr+":53", 3*time.Second)
+		},
+	}
+
+	// 1. VirtualDNS returns synthetic IP in 198.18.0.0/15 and transparent HTTP succeeds with zero proxy env.
+	ips, err := resolver.LookupNetIP(ctx, "ip4", "api.allowed.test")
+	if err != nil || len(ips) != 1 || !syntheticPool.Contains(ips[0]) {
+		t.Fatalf("LookupNetIP(api.allowed.test) = (%v, %v), want IP in 198.18.0.0/15", ips, err)
+	}
+	conn, err := socketat.DialAtPath(podNSPath, "tcp4", net.JoinHostPort(ips[0].String(), destHTTPPort), 5*time.Second)
+	if err != nil {
+		t.Fatalf("transparent TCP dial to api.allowed.test: %v", err)
+	}
+	_, _ = io.WriteString(conn, "GET /hosttun-ok HTTP/1.1\r\nHost: api.allowed.test\r\nConnection: close\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(conn), nil)
+	if err != nil {
+		_ = conn.Close()
+		t.Fatalf("read HTTP response: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	_ = conn.Close()
+	if string(body) != "hosttun-dest:/hosttun-ok" {
+		t.Fatalf("HTTP body = %q, want hosttun-dest:/hosttun-ok", body)
+	}
+
+	// 2. Transparent UDP over connect-udp succeeds with an ordinary UDP socket.
+	udpIPs, err := resolver.LookupNetIP(ctx, "ip4", "udp.allowed.test")
+	if err != nil || len(udpIPs) != 1 {
+		t.Fatalf("LookupNetIP(udp.allowed.test) = (%v, %v)", udpIPs, err)
+	}
+	uconn, err := socketat.DialAtPath(podNSPath, "udp4", net.JoinHostPort(udpIPs[0].String(), udpEchoPort), 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial transparent UDP: %v", err)
+	}
+	_ = uconn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := uconn.Write([]byte("hello-hosttun")); err != nil {
+		_ = uconn.Close()
+		t.Fatalf("write UDP: %v", err)
+	}
+	ubuf := make([]byte, 128)
+	n, err := uconn.Read(ubuf)
+	_ = uconn.Close()
+	if err != nil || string(ubuf[:n]) != "udp-echo:hello-hosttun" {
+		t.Fatalf("UDP echo = (%q, %v), want udp-echo:hello-hosttun", ubuf[:n], err)
+	}
+
+	// 3. Denied host fails closed.
+	blkIPs, err := resolver.LookupNetIP(ctx, "ip4", "blocked.example")
+	if err != nil || len(blkIPs) != 1 {
+		t.Fatalf("LookupNetIP(blocked.example) = (%v, %v)", blkIPs, err)
+	}
+	if c, err := socketat.DialAtPath(podNSPath, "tcp4", net.JoinHostPort(blkIPs[0].String(), "443"), 3*time.Second); err == nil {
+		_ = c.Close()
+		t.Fatal("blocked.example dial unexpectedly succeeded")
+	}
+
+	// 4. Unmapped synthetic IP in 198.18.0.0/15 fails closed locally without reaching PEP.
+	if c, err := socketat.DialAtPath(podNSPath, "tcp4", "198.18.9.9:443", 3*time.Second); err == nil {
+		_ = c.Close()
+		t.Fatal("unmapped synthetic IP 198.18.9.9 unexpectedly succeeded")
+	}
+
+	seenMu.Lock()
+	for _, h := range seenHost {
+		if strings.Contains(h, "198.18.9.9") {
+			seenMu.Unlock()
+			t.Fatalf("unmapped synthetic IP leaked to PEP: %v", seenHost)
+		}
+	}
+	seenMu.Unlock()
+
+	// 5. Verify persistent tun0 survives DaemonSet shutdown (stopAllHostTuns(false))
+	// and re-attaches cleanly on NRI Synchronize so new connections succeed without recreating the Pod.
+	drv.stopAllHostTuns(false)
+	cfgAfterStop, _ := st.Get(podUID)
+	if _, err := drv.Synchronize(ctx, []*nriapi.PodSandbox{pod}, []*nriapi.Container{
+		{
+			Id:           "c-ht-1",
+			PodSandboxId: pod.Id,
+			Name:         "agent",
+			State:        nriapi.ContainerState_CONTAINER_RUNNING,
+			Mounts:       []*nriapi.Mount{{Destination: containerResolvConfPath, Source: cfgAfterStop.SocketPaths.ResolvConfPath}},
+		},
+	}); err != nil {
+		t.Fatalf("Synchronize re-attach persistent tun0: %v", err)
+	}
+	reattachIPs, err := resolver.LookupNetIP(ctx, "ip4", "api.allowed.test")
+	if err != nil || len(reattachIPs) != 1 {
+		t.Fatalf("LookupNetIP after Synchronize re-attach = (%v, %v)", reattachIPs, err)
+	}
+	reattachConn, err := socketat.DialAtPath(podNSPath, "tcp4", net.JoinHostPort(reattachIPs[0].String(), destHTTPPort), 5*time.Second)
+	if err != nil {
+		t.Fatalf("TCP dial after Synchronize re-attach: %v", err)
+	}
+	_ = reattachConn.Close()
+	if err := drv.StopPodSandbox(ctx, pod); err != nil {
+		t.Fatalf("StopPodSandbox: %v", err)
+	}
+	if err := drv.RemovePodSandbox(ctx, pod); err != nil {
+		t.Fatalf("RemovePodSandbox: %v", err)
+	}
+
+	// 6. Verify preserveNICReturn installs source-IP policy routing when nicBlockMode=Disabled.
+	disabledNSPath, disabledNS := createNamedPodNetNS(t, "hosttun-disabled")
+	veth := &netlink.Veth{
+		LinkAttrs:     netlink.LinkAttrs{Name: "hostret0"},
+		PeerName:      "eth0",
+		PeerNamespace: netlink.NsFd(int(disabledNS)),
+	}
+	if err := netlink.LinkAdd(veth); err != nil {
+		t.Fatalf("add veth pair: %v", err)
+	}
+	podHandle, err := netlink.NewHandleAt(disabledNS)
+	if err != nil {
+		t.Fatalf("pod netlink handle: %v", err)
+	}
+	defer podHandle.Close()
+	eth0, err := podHandle.LinkByName("eth0")
+	if err != nil {
+		t.Fatalf("lookup eth0: %v", err)
+	}
+	ethAddr, _ := netlink.ParseAddr("10.244.0.42/24")
+	if err := podHandle.AddrAdd(eth0, ethAddr); err != nil {
+		t.Fatalf("add eth0 addr: %v", err)
+	}
+	if err := podHandle.LinkSetUp(eth0); err != nil {
+		t.Fatalf("bring eth0 up: %v", err)
+	}
+	if err := podHandle.RouteAdd(&netlink.Route{
+		LinkIndex: eth0.Attrs().Index,
+		Gw:        net.ParseIP("10.244.0.1"),
+	}); err != nil {
+		t.Fatalf("add eth0 default route: %v", err)
+	}
+
+	cfg, _ := st.Get(podUID)
+	mgr := NewLinuxNetNSManager()
+	htCloser, err := mgr.StartHostTun(disabledNSPath, cfg.SocketPaths.EgressSocketPath, 64, true)
+	if err != nil {
+		t.Fatalf("StartHostTun preserveNICReturn: %v", err)
+	}
+	defer func() {
+		_ = htCloser.Close()
+		_ = mgr.CleanupHostTun(disabledNSPath)
+	}()
+
+	// Verify table 100 holds eth0's default route and IP rule routes from 10.244.0.42/32 -> table 100.
+	retRoutes, err := podHandle.RouteListFiltered(netlink.FAMILY_V4, &netlink.Route{Table: hostTunReturnTable}, netlink.RT_FILTER_TABLE)
+	if err != nil {
+		t.Fatalf("list table %d routes: %v", hostTunReturnTable, err)
+	}
+	hasEthDefault := false
+	for _, r := range retRoutes {
+		if r.LinkIndex == eth0.Attrs().Index && isDefaultRoute(r.Dst) && r.Gw.Equal(net.ParseIP("10.244.0.1")) {
+			hasEthDefault = true
+		}
+	}
+	if !hasEthDefault {
+		t.Fatalf("expected eth0 default route via 10.244.0.1 in table %d, got %+v", hostTunReturnTable, retRoutes)
+	}
+	rules, err := podHandle.RuleList(netlink.FAMILY_V4)
+	if err != nil {
+		t.Fatalf("list v4 rules: %v", err)
+	}
+	wantSrc := &net.IPNet{IP: net.ParseIP("10.244.0.42").To4(), Mask: net.CIDRMask(32, 32)}
+	if !hasPolicyRule(rules, wantSrc, hostTunReturnTable, hostTunReturnRulePriority) {
+		t.Fatalf("missing source-IP return-path rule for 10.244.0.42/32 -> table %d: %+v", hostTunReturnTable, rules)
 	}
 }
