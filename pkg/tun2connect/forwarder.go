@@ -22,8 +22,16 @@ var (
 type Forwarder struct {
 	Dialer         Dialer
 	DNS            *VirtualDNS
+	DNSHandler     DNSHandler
 	DialTimeout    time.Duration
 	UDPIdleTimeout time.Duration
+}
+
+func (f *Forwarder) dnsHandler() DNSHandler {
+	if f.DNSHandler != nil {
+		return f.DNSHandler
+	}
+	return f.DNS
 }
 
 func (f *Forwarder) dialContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -130,7 +138,7 @@ func (f *Forwarder) ServeDNS(ctx context.Context, conn net.Conn) {
 		if err != nil {
 			return
 		}
-		response, err := f.DNS.HandleQuery(buf[:count])
+		response, err := f.dnsHandler().HandleQueryContext(ctx, buf[:count])
 		if err != nil {
 			continue
 		}

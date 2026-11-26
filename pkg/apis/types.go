@@ -120,6 +120,51 @@ const (
 	AdapterModeExplicitProxy AdapterMode = "ExplicitProxy"
 )
 
+// DNSMode selects how HostTun resolves guest DNS queries.
+type DNSMode string
+
+const (
+	// DNSModeSynthetic (default) answers queries locally with synthetic IPs
+	// (198.18.0.0/15, 100::/64) and strips search/ndots from /etc/resolv.conf.
+	DNSModeSynthetic DNSMode = "Synthetic"
+
+	// DNSModeDoH forwards guest DNS queries via RFC 8484 DNS-over-HTTPS through
+	// the unified Traffic PEP (or an optional separate DNS PEP), returning real
+	// NXDOMAIN/REFUSED so resolv.conf search lists and retries work natively
+	// while rewriting positive answers into synthetic IPs.
+	DNSModeDoH DNSMode = "DoH"
+)
+
+// DNSConfig configures HostTun Virtual DNS resolution and resolv.conf search behavior.
+// Restricted strictly to DeviceClass (FromClass).
+type DNSConfig struct {
+	Mode DNSMode `json:"mode,omitempty"`
+	// EnforcementPoint optionally specifies a dedicated DNS PEP speaking RFC 8484
+	// DoH (POST /dns-query). When omitted under DNSModeDoH, queries reuse the
+	// Pod's primary PolicyEnforcementPoint over the same mTLS HTTP/2 session.
+	EnforcementPoint *PolicyEnforcementPointConfig `json:"enforcementPoint,omitempty"`
+	// ClusterDomain sets the Kubernetes cluster DNS suffix used in /etc/resolv.conf
+	// search lists under DNSModeDoH (default: "cluster.local").
+	ClusterDomain string `json:"clusterDomain,omitempty"`
+	// PreserveSearchDomains controls whether /etc/resolv.conf includes Kubernetes
+	// search domains and options ndots:5 under DNSModeDoH (default: true).
+	PreserveSearchDomains *bool `json:"preserveSearchDomains,omitempty"`
+}
+
+// DeepCopy returns a deep copy of d.
+func (d *DNSConfig) DeepCopy() *DNSConfig {
+	if d == nil {
+		return nil
+	}
+	out := *d
+	out.EnforcementPoint = d.EnforcementPoint.DeepCopy()
+	if d.PreserveSearchDomains != nil {
+		v := *d.PreserveSearchDomains
+		out.PreserveSearchDomains = &v
+	}
+	return &out
+}
+
 // PEPAuthType selects the mandatory mTLS authentication mechanism to the PEP.
 type PEPAuthType string
 

@@ -49,6 +49,12 @@ const (
 	// OpRemove detaches a sandbox and closes its TUN and dial-broker descriptors.
 	OpRemove = "remove"
 
+	// DNSModeSynthetic answers guest DNS queries locally with synthetic IPs.
+	DNSModeSynthetic = "synthetic"
+	// DNSModeDoH forwards guest DNS queries via RFC 8484 DoH over the Pod's
+	// brokered egress channel while rewriting positive answers to synthetic IPs.
+	DNSModeDoH = "doh"
+
 	// DefaultWorkerUID and DefaultWorkerGID drop unprivileged workers to nobody:nogroup
 	// whenever that ID is mapped in the current user namespace.
 	DefaultWorkerUID = 65534
@@ -95,6 +101,7 @@ type ControlRequest struct {
 	MTU            int    `json:"mtu,omitempty"`
 	MaxConnections int    `json:"max_connections,omitempty"`
 	EnableUDP      bool   `json:"enable_udp,omitempty"`
+	DNSMode        string `json:"dns_mode,omitempty"`
 }
 
 // ControlResponse is the worker's JSON reply datagram for one ControlRequest.
@@ -131,6 +138,7 @@ type AttachConfig struct {
 	MTU            int
 	MaxConnections int
 	EnableUDP      bool
+	DNSMode        string
 
 	// ServeEgress admits a parent-side kernel socketpair directly into the Pod's
 	// tunnel listener so the worker needs zero filesystem access.

@@ -377,10 +377,16 @@ func (w *builtinWorker) addPod(req ControlRequest, tunFD, brokerFD int) error {
 	client := &tun2connect.BoundaryClient{
 		DialBoundary: broker.dial,
 	}
+	vdns := tun2connect.NewVirtualDNS()
+	var dnsHandler tun2connect.DNSHandler = vdns
+	if req.DNSMode == DNSModeDoH {
+		dnsHandler = tun2connect.NewDoHVirtualDNS(vdns, client.QueryDoH)
+	}
 	eng, err := tun2connect.New(tun2connect.Config{
 		Device:         dev,
 		Dialer:         client,
-		DNS:            tun2connect.NewVirtualDNS(),
+		DNS:            vdns,
+		DNSHandler:     dnsHandler,
 		EnableUDP:      req.EnableUDP,
 		MaxConnections: req.MaxConnections,
 	})

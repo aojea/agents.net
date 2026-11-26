@@ -138,6 +138,7 @@ func (m *Manager) Attach(cfg AttachConfig) (io.Closer, error) {
 		MTU:            cfg.MTU,
 		MaxConnections: cfg.MaxConnections,
 		EnableUDP:      cfg.EnableUDP,
+		DNSMode:        cfg.DNSMode,
 	}
 	sendErr := wp.call(req, tunFD, int(brokerWorker.Fd()))
 	_ = brokerWorker.Close()
@@ -464,6 +465,7 @@ func (m *Manager) recoverPod(ap *attachedPod, crashed *workerProcess) error {
 		MTU:            ap.cfg.MTU,
 		MaxConnections: ap.cfg.MaxConnections,
 		EnableUDP:      ap.cfg.EnableUDP,
+		DNSMode:        ap.cfg.DNSMode,
 	}
 	sendErr := newWP.call(req, tunFD, int(brokerWorker.Fd()))
 	_ = brokerWorker.Close()

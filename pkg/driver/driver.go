@@ -63,6 +63,7 @@ import (
 	"github.com/aojea/agents.net/pkg/apis"
 	"github.com/aojea/agents.net/pkg/auth"
 	"github.com/aojea/agents.net/pkg/catrust"
+	"github.com/aojea/agents.net/pkg/hosttun"
 	"github.com/aojea/agents.net/pkg/metrics"
 	"github.com/aojea/agents.net/pkg/params"
 	"github.com/aojea/agents.net/pkg/proxyenv"
@@ -122,6 +123,7 @@ type HostTunRequest struct {
 	ServeEgress       func(net.Conn) error
 	MaxConnections    int
 	PreserveNICReturn bool
+	DNSMode           string
 }
 
 // NetNSManager abstracts Pod network namespace inspection, route flushing,
@@ -589,10 +591,28 @@ func usesTunAdapter(mode apis.AdapterMode) bool {
 	return mode == apis.AdapterModeHostTun || mode == apis.AdapterModeTunSidecar
 }
 
-func writeHostTunResolvConf(podRootDir string) (string, error) {
+func hostTunDNSMode(mode apis.DNSMode) string {
+	if mode == apis.DNSModeDoH {
+		return hosttun.DNSModeDoH
+	}
+	return hosttun.DNSModeSynthetic
+}
+
+func writeHostTunResolvConf(podRootDir, podNamespace string, netParams params.NetworkParameters) (string, error) {
 	path := filepath.Join(podRootDir, "resolv.conf")
-	content := fmt.Sprintf("nameserver %s\n", tun2connect.DefaultResolverAddr)
-	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+	var b strings.Builder
+	fmt.Fprintf(&b, "nameserver %s\n", tun2connect.DefaultResolverAddr)
+	if netParams.EffectiveDNSMode() == apis.DNSModeDoH && netParams.EffectivePreserveSearchDomains() {
+		clusterDomain := netParams.EffectiveClusterDomain()
+		var searches []string
+		if podNamespace != "" {
+			searches = append(searches, fmt.Sprintf("%s.svc.%s", podNamespace, clusterDomain))
+		}
+		searches = append(searches, fmt.Sprintf("svc.%s", clusterDomain), clusterDomain)
+		fmt.Fprintf(&b, "search %s\n", strings.Join(searches, " "))
+		b.WriteString("options ndots:5\n")
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
 		return "", fmt.Errorf("write HostTun resolv.conf %q: %w", path, err)
 	}
 	return path, nil
@@ -605,7 +625,7 @@ func (d *Driver) hasHostTun(podUID types.UID) bool {
 	return ok
 }
 
-func (d *Driver) startHostTun(podUID types.UID, netnsPath, egressSocketPath string, maxConns int, preserveNICReturn bool) error {
+func (d *Driver) startHostTun(podUID types.UID, netnsPath, egressSocketPath string, maxConns int, preserveNICReturn bool, dnsMode apis.DNSMode) error {
 	// Detach any prior host TUN instance for this Pod before re-opening tun0.
 	d.stopHostTun(podUID, false)
 	closer, err := d.netns.StartHostTun(HostTunRequest{
@@ -617,6 +637,7 @@ func (d *Driver) startHostTun(podUID types.UID, netnsPath, egressSocketPath stri
 		},
 		MaxConnections:    maxConns,
 		PreserveNICReturn: preserveNICReturn,
+		DNSMode:           hostTunDNSMode(dnsMode),
 	})
 	if err != nil {
 		return err
@@ -968,10 +989,16 @@ func (d *Driver) prepareResourceClaim(ctx context.Context, claim *resourceapi.Re
 		}
 	}
 
+	var dnsEP *apis.PolicyEnforcementPointConfig
+	if netParams.DNS != nil {
+		dnsEP = netParams.DNS.EnforcementPoint
+	}
 	identity := d.buildWorkloadIdentity(podUID, existing.SandboxID, reserved.Name, claim.Namespace, serviceAccount, netParams.Custom)
 	paths, err := d.tunnel.EnsureListener(ctx, podUID, tunnel.ListenerConfig{
 		Identity:               identity,
 		PolicyEnforcementPoint: netParams.PolicyEnforcementPoint,
+		DNSMode:                netParams.EffectiveDNSMode(),
+		DNSEnforcementPoint:    dnsEP,
 		PodCertVolumeName:      netParams.PodCertVolumeName,
 		HasIngress:             len(netParams.IngressPorts) > 0,
 		MaxConnections:         int(*netParams.MaxConnections),
@@ -982,7 +1009,7 @@ func (d *Driver) prepareResourceClaim(ctx context.Context, claim *resourceapi.Re
 	}
 
 	if netParams.EffectiveAdapterMode() == apis.AdapterModeHostTun {
-		resolvPath, err := writeHostTunResolvConf(paths.PodRootDir)
+		resolvPath, err := writeHostTunResolvConf(paths.PodRootDir, claim.Namespace, netParams)
 		if err != nil {
 			if !existed {
 				_ = d.tunnel.Remove(podUID)
@@ -1163,9 +1190,15 @@ func (d *Driver) Synchronize(ctx context.Context, pods []*nriapi.PodSandbox, con
 			cfg.ServiceAccount,
 			cfg.Parameters.Custom,
 		)
+		var dnsEP *apis.PolicyEnforcementPointConfig
+		if cfg.Parameters.DNS != nil {
+			dnsEP = cfg.Parameters.DNS.EnforcementPoint
+		}
 		if _, err := d.tunnel.EnsureListener(ctx, uid, tunnel.ListenerConfig{
 			Identity:               identity,
 			PolicyEnforcementPoint: cfg.Parameters.PolicyEnforcementPoint,
+			DNSMode:                cfg.Parameters.EffectiveDNSMode(),
+			DNSEnforcementPoint:    dnsEP,
 			PodCertVolumeName:      cfg.Parameters.PodCertVolumeName,
 			HasIngress:             len(cfg.Parameters.IngressPorts) > 0,
 			MaxConnections:         maxConns,
@@ -1180,7 +1213,7 @@ func (d *Driver) Synchronize(ctx context.Context, pods []*nriapi.PodSandbox, con
 			if ns != "" && !d.hasHostTun(uid) {
 				preserveNICReturn := cfg.Parameters.ConfinementMode == apis.ConfinementModeNetworkPolicyDenyAll &&
 					cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDisabled
-				if err := d.startHostTun(uid, ns, cfg.SocketPaths.EgressSocketPath, maxConns, preserveNICReturn); err != nil {
+				if err := d.startHostTun(uid, ns, cfg.SocketPaths.EgressSocketPath, maxConns, preserveNICReturn, cfg.Parameters.EffectiveDNSMode()); err != nil {
 					klog.ErrorS(err, "failed to restore HostTun adapter during Synchronize", "podUID", uid)
 				}
 			}
@@ -1410,7 +1443,7 @@ func (d *Driver) RunPodSandbox(_ context.Context, pod *nriapi.PodSandbox) error 
 		}
 		preserveNICReturn := mode == apis.ConfinementModeNetworkPolicyDenyAll &&
 			cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDisabled
-		if err := d.startHostTun(podUID, ns, cfg.SocketPaths.EgressSocketPath, maxConns, preserveNICReturn); err != nil {
+		if err := d.startHostTun(podUID, ns, cfg.SocketPaths.EgressSocketPath, maxConns, preserveNICReturn, cfg.Parameters.EffectiveDNSMode()); err != nil {
 			status = metrics.StatusFailed
 			return fmt.Errorf("start HostTun in pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
 		}

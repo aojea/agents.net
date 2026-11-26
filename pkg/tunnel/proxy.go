@@ -16,6 +16,7 @@ package tunnel
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -39,6 +40,9 @@ const (
 	maxHeadBytes        = 64 * 1024
 	maxInterimResponses = 8
 	udpTargetPrefix     = "/.well-known/masque/udp/"
+	dohPath             = "/dns-query"
+	dohMediaType        = "application/dns-message"
+	maxDoHBodyBytes     = 64 * 1024
 )
 
 type headError struct {
@@ -56,7 +60,10 @@ type requestHead struct {
 	upgrade       string
 	connection    string
 	capsuleProt   string
+	contentType   string
+	contentLength int
 	isUDP         bool
+	isDoH         bool
 	isHTTPProxy   bool
 	originReqHead string
 }
@@ -104,7 +111,7 @@ func readHead(br *bufio.Reader) (*requestHead, error) {
 		lower string
 		val   string
 	}
-	var hostHeader, upgrade, connection, capsuleProt string
+	var hostHeader, upgrade, connection, capsuleProt, contentType, contentLengthStr string
 	var parsedHeaders []rawHeader
 	hostCount := 0
 	for {
@@ -138,6 +145,10 @@ func readHead(br *bufio.Reader) (*requestHead, error) {
 			}
 		case "capsule-protocol":
 			capsuleProt = val
+		case "content-type":
+			contentType = val
+		case "content-length":
+			contentLengthStr = val
 		}
 		parsedHeaders = append(parsedHeaders, rawHeader{key: k, lower: lowerK, val: val})
 	}
@@ -212,7 +223,23 @@ func readHead(br *bufio.Reader) (*requestHead, error) {
 		}
 		return nil, &headError{status: 405, reason: "method-not-allowed"}
 
-	case http.MethodHead, http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions:
+	case http.MethodPost:
+		if target == dohPath && isDoHMediaType(contentType) {
+			n, err := strconv.Atoi(contentLengthStr)
+			if err != nil || n <= 0 || n > maxDoHBodyBytes {
+				return nil, &headError{status: 400, reason: "malformed-doh-length"}
+			}
+			h.contentType = contentType
+			h.contentLength = n
+			h.isDoH = true
+			return h, nil
+		}
+		if strings.HasPrefix(strings.ToLower(target), "http://") {
+			return parseAbsoluteHTTPProxyHead(h, target, forwardHeaders.String())
+		}
+		return nil, &headError{status: 405, reason: "method-not-allowed"}
+
+	case http.MethodHead, http.MethodPut, http.MethodDelete, http.MethodPatch, http.MethodOptions:
 		if strings.HasPrefix(strings.ToLower(target), "http://") {
 			return parseAbsoluteHTTPProxyHead(h, target, forwardHeaders.String())
 		}
@@ -393,6 +420,11 @@ func headerHasToken(headerVal, token string) bool {
 		}
 	}
 	return false
+}
+
+func isDoHMediaType(contentType string) bool {
+	mediaType, _, _ := strings.Cut(contentType, ";")
+	return strings.EqualFold(strings.TrimSpace(mediaType), dohMediaType)
 }
 
 func sanitizeHeaderOutput(s string) string {
@@ -773,6 +805,108 @@ func (u *upstreamDialer) dialH1Connect(ctx context.Context, authority string, hd
 		w:     conn,
 		close: func() { _ = conn.Close() },
 	}, nil
+}
+
+// doDoH forwards one RFC 8484 DNS-over-HTTPS POST /dns-query request to the
+// configured upstream PEP (reusing the multiplexed HTTP/2 mTLS transport when
+// talking to https://, falling back to HTTP/1.1 for unix:// or non-h2 PEPs).
+func (u *upstreamDialer) doDoH(ctx context.Context, query []byte, id auth.WorkloadIdentity) ([]byte, error) {
+	hdrs := u.buildAuthHeaders(id)
+	hdrs.Set("Content-Type", dohMediaType)
+	hdrs.Set("Accept", dohMediaType)
+
+	if u.target.scheme == "https" && !u.useH1.Load() {
+		body, err := u.doH2DoH(ctx, query, hdrs)
+		if err == nil || !errors.Is(err, errALPNFallbackHTTP1) {
+			return body, err
+		}
+	}
+	return u.doH1DoH(ctx, query, hdrs)
+}
+
+func (u *upstreamDialer) doH2DoH(ctx context.Context, query []byte, hdrs http.Header) ([]byte, error) {
+	tr, err := u.getH2Transport()
+	if err != nil {
+		return nil, err
+	}
+	req := (&http.Request{
+		Method:        http.MethodPost,
+		URL:           &url.URL{Scheme: "https", Host: u.target.address, Path: dohPath},
+		Host:          u.target.host,
+		Header:        hdrs,
+		ContentLength: int64(len(query)),
+		Body:          io.NopCloser(bytes.NewReader(query)),
+	}).WithContext(ctx)
+
+	resp, err := tr.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, &upstreamDeniedError{
+			status:      resp.StatusCode,
+			proxyStatus: resp.Header.Get("Proxy-Status"),
+			reason:      "upstream-denied",
+		}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDoHBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxDoHBodyBytes {
+		return nil, fmt.Errorf("upstream DoH response exceeded %d bytes", maxDoHBodyBytes)
+	}
+	return body, nil
+}
+
+func (u *upstreamDialer) doH1DoH(ctx context.Context, query []byte, hdrs http.Header) ([]byte, error) {
+	conn, err := u.dialRawUpstreamConn(ctx, []string{"http/1.1"})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = conn.Close() }()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	stopCancel := context.AfterFunc(ctx, func() {
+		_ = conn.SetDeadline(time.Now())
+	})
+	defer stopCancel()
+
+	var reqBuf bytes.Buffer
+	fmt.Fprintf(&reqBuf, "POST %s HTTP/1.1\r\nHost: %s\r\nContent-Length: %d\r\nConnection: close\r\n", dohPath, u.target.host, len(query))
+	var hsb strings.Builder
+	writeHTTPHeaders(&hsb, hdrs)
+	reqBuf.WriteString(hsb.String())
+	reqBuf.WriteString("\r\n")
+	reqBuf.Write(query)
+
+	if _, err := conn.Write(reqBuf.Bytes()); err != nil {
+		return nil, err
+	}
+	br := bufio.NewReader(conn)
+	resp, err := readFinalH1Response(br, &http.Request{Method: http.MethodPost})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return nil, &upstreamDeniedError{
+			status:      resp.StatusCode,
+			proxyStatus: resp.Header.Get("Proxy-Status"),
+			reason:      "upstream-denied",
+		}
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDoHBodyBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxDoHBodyBytes {
+		return nil, fmt.Errorf("upstream DoH response exceeded %d bytes", maxDoHBodyBytes)
+	}
+	return body, nil
 }
 
 // readFinalH1Response skips non-101 1xx interim responses (RFC 9110 Section 15.2).

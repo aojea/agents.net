@@ -41,13 +41,19 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/net/http/httpguts"
 	"golang.org/x/net/http2"
 
 	"github.com/aojea/agents.net/pkg/tun2connect"
 )
 
-const dialTimeout = 15 * time.Second
+const (
+	dialTimeout     = 15 * time.Second
+	dohPath         = "/dns-query"
+	dohMediaType    = "application/dns-message"
+	maxDoHBodyBytes = 64 * 1024
+)
 
 // atomicDuration is a timeout that tests change while handlers from an
 // earlier test may still be running.
@@ -564,9 +570,183 @@ func serve(conn net.Conn) {
 		handleConnect(conn, br, h, s)
 	case h.method == http.MethodGet && isUpgrade(h):
 		handleConnectUDP(conn, br, h, s)
+	case h.method == http.MethodPost && isDoHRequest(h.target, h.header.Get("Content-Type")):
+		handleDoHH1(conn, br, h, s)
 	default:
 		refuse(h1Responder{conn}, "h1", "", "", s, http.StatusMethodNotAllowed, "connect-only")
 	}
+}
+
+func isDoHRequest(target, contentType string) bool {
+	if target != dohPath {
+		return false
+	}
+	mediaType, _, _ := strings.Cut(contentType, ";")
+	return strings.EqualFold(strings.TrimSpace(mediaType), dohMediaType)
+}
+
+func handleDoHH1(conn net.Conn, br *bufio.Reader, h *head, s session) {
+	p := current.Load()
+	if p == nil {
+		audit(auditRecord{Wire: "h1", Transport: "dns", Destination: dohPath, Peer: s.peer, Connection: s.id, Decision: "fail", Reason: "policy-unavailable"})
+		h1Responder{conn}.deny(http.StatusServiceUnavailable, "policy-unavailable")
+		return
+	}
+	if !p.doh {
+		refuse(h1Responder{conn}, "h1", "dns", dohPath, s, http.StatusMethodNotAllowed, "doh-disabled")
+		return
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(h.header.Get("Content-Length")))
+	if err != nil || n <= 0 || n > maxDoHBodyBytes {
+		malformed(h1Responder{conn}, "h1", "dns", dohPath, s, "malformed-doh-length")
+		return
+	}
+	conn.SetReadDeadline(time.Now().Add(headTimeout.Load()))
+	query := make([]byte, n)
+	if _, err := io.ReadFull(br, query); err != nil {
+		return
+	}
+	conn.SetReadDeadline(time.Time{})
+
+	reply, status, reason := resolveDoHQuery(context.Background(), p, "h1", query, s)
+	if status != http.StatusOK {
+		h1Responder{conn}.deny(status, reason)
+		return
+	}
+	conn.SetWriteDeadline(time.Now().Add(headTimeout.Load()))
+	fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", dohMediaType, len(reply))
+	_, _ = conn.Write(reply)
+}
+
+func handleDoHH2(w http.ResponseWriter, r *http.Request, s session) {
+	p := current.Load()
+	if p == nil {
+		audit(auditRecord{Wire: "h2", Transport: "dns", Destination: dohPath, Peer: s.peer, Connection: s.id, Decision: "fail", Reason: "policy-unavailable"})
+		h2Responder{w}.deny(http.StatusServiceUnavailable, "policy-unavailable")
+		return
+	}
+	if !p.doh {
+		refuse(h2Responder{w}, "h2", "dns", dohPath, s, http.StatusMethodNotAllowed, "doh-disabled")
+		return
+	}
+	query, err := io.ReadAll(io.LimitReader(r.Body, maxDoHBodyBytes+1))
+	if err != nil || len(query) == 0 || len(query) > maxDoHBodyBytes {
+		malformed(h2Responder{w}, "h2", "dns", dohPath, s, "malformed-doh-body")
+		return
+	}
+	reply, status, reason := resolveDoHQuery(r.Context(), p, "h2", query, s)
+	if status != http.StatusOK {
+		h2Responder{w}.deny(status, reason)
+		return
+	}
+	w.Header().Set("Content-Type", dohMediaType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(reply)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(reply)
+}
+
+// resolveDoHQuery enforces the boundary policy on one RFC 1035 wire DNS query.
+// Disallowed names receive NXDOMAIN without querying upstream DNS so search
+// lists advance cleanly while preventing DNS exfiltration.
+func resolveDoHQuery(ctx context.Context, p *policy, wire string, query []byte, s session) ([]byte, int, string) {
+	var qp dnsmessage.Parser
+	qhdr, err := qp.Start(query)
+	if err != nil {
+		audit(auditRecord{Wire: wire, Transport: "dns", Destination: dohPath, Peer: s.peer, Connection: s.id, Decision: "block", Reason: "malformed-dns-query"})
+		return nil, http.StatusBadRequest, "malformed-dns-query"
+	}
+	q, err := qp.Question()
+	if err != nil {
+		audit(auditRecord{Wire: wire, Transport: "dns", Destination: dohPath, Peer: s.peer, Connection: s.id, Decision: "block", Reason: "malformed-dns-query"})
+		return nil, http.StatusBadRequest, "malformed-dns-query"
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, dialTimeout)
+	defer cancel()
+
+	v := p.authorizeDNS(ctx, q.Name.String())
+	rec := auditRecord{Wire: wire, Transport: "dns", Destination: v.name, Peer: s.peer, Connection: s.id, Rule: v.rule}
+
+	var rcode dnsmessage.RCode
+	var addrs []netip.Addr
+	switch {
+	case v.reason != "":
+		rec.Decision, rec.Reason = "block", v.reason
+		audit(rec)
+		// Return NXDOMAIN for not-on-allowlist so stub resolvers advance
+		// resolv.conf search paths without leaking disallowed queries upstream.
+		if v.reason == "not-on-allowlist" {
+			rcode = dnsmessage.RCodeNameError
+		} else {
+			rcode = dnsmessage.RCodeRefused
+		}
+	case v.notFound:
+		rec.Decision, rec.Reason = "allow", "nxdomain"
+		audit(rec)
+		rcode = dnsmessage.RCodeNameError
+	case v.err != nil:
+		rec.Decision, rec.Reason = "fail", "resolve-failed"
+		audit(rec)
+		rcode = dnsmessage.RCodeServerFailure
+	default:
+		rec.Decision = "allow"
+		if len(v.addresses) > 0 {
+			rec.Address = v.addresses[0].String()
+		}
+		audit(rec)
+		rcode = dnsmessage.RCodeSuccess
+		addrs = v.addresses
+	}
+
+	reply, err := buildDoHWireResponse(qhdr, q, rcode, addrs)
+	if err != nil {
+		return nil, http.StatusInternalServerError, "encode-dns-failed"
+	}
+	return reply, http.StatusOK, ""
+}
+
+func buildDoHWireResponse(qhdr dnsmessage.Header, q dnsmessage.Question, rcode dnsmessage.RCode, addrs []netip.Addr) ([]byte, error) {
+	b := dnsmessage.NewBuilder(make([]byte, 0, 512), dnsmessage.Header{
+		ID:                 qhdr.ID,
+		Response:           true,
+		OpCode:             qhdr.OpCode,
+		RecursionDesired:   qhdr.RecursionDesired,
+		RecursionAvailable: true,
+		RCode:              rcode,
+	})
+	b.EnableCompression()
+	if err := b.StartQuestions(); err != nil {
+		return nil, err
+	}
+	if err := b.Question(q); err != nil {
+		return nil, err
+	}
+	if rcode == dnsmessage.RCodeSuccess && q.Class == dnsmessage.ClassINET && (q.Type == dnsmessage.TypeA || q.Type == dnsmessage.TypeAAAA) {
+		var matched []netip.Addr
+		for _, a := range addrs {
+			if (q.Type == dnsmessage.TypeA && a.Is4()) || (q.Type == dnsmessage.TypeAAAA && a.Is6()) {
+				matched = append(matched, a)
+			}
+		}
+		if len(matched) > 0 {
+			if err := b.StartAnswers(); err != nil {
+				return nil, err
+			}
+			rh := dnsmessage.ResourceHeader{Name: q.Name, Type: q.Type, Class: q.Class, TTL: 30}
+			for _, a := range matched {
+				if q.Type == dnsmessage.TypeA {
+					if err := b.AResource(rh, dnsmessage.AResource{A: a.As4()}); err != nil {
+						return nil, err
+					}
+				} else {
+					if err := b.AAAAResource(rh, dnsmessage.AAAAResource{AAAA: a.As16()}); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+	}
+	return b.Finish()
 }
 
 // flushWriter flushes each write so tunneled bytes are not buffered
@@ -622,6 +802,10 @@ func sessionPeer(conn net.Conn) (string, error) {
 // s carries the session's mTLS identity (audit-only) and connection id.
 func serveH2(s session) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && isDoHRequest(r.URL.Path, r.Header.Get("Content-Type")) {
+			handleDoHH2(w, r, s)
+			return
+		}
 		if r.Method != http.MethodConnect {
 			refuse(h2Responder{w}, "h2", "", "", s, http.StatusMethodNotAllowed, "connect-only")
 			return

@@ -2,6 +2,7 @@ package tun2connect
 
 import (
 	"container/list"
+	"context"
 	"errors"
 	"math"
 	"net/netip"
@@ -11,6 +12,13 @@ import (
 
 	"golang.org/x/net/dns/dnsmessage"
 )
+
+// DNSHandler resolves a raw wire-format DNS query (RFC 1035) into a wire-format
+// DNS response. Implementations pair with VirtualDNS to keep synthetic address
+// mapping (198.18.0.0/15, 100::/64) and reverse lookup consistent.
+type DNSHandler interface {
+	HandleQueryContext(ctx context.Context, query []byte) ([]byte, error)
+}
 
 // Synthetic address pool constants shared across adapters (in-guest tun2connect,
 // host-side dra-agents-net HostTun, etc.).
@@ -164,6 +172,12 @@ func (d *VirtualDNS) Reverse(addr netip.Addr) (string, bool) {
 func (d *VirtualDNS) InSyntheticPool(addr netip.Addr) bool {
 	a := addr.Unmap()
 	return d.v4.pool.Contains(a) || d.v6.pool.Contains(a)
+}
+
+// HandleQueryContext implements DNSHandler by delegating to local synthetic
+// resolution (HandleQuery).
+func (d *VirtualDNS) HandleQueryContext(_ context.Context, query []byte) ([]byte, error) {
+	return d.HandleQuery(query)
 }
 
 // HandleQuery answers one guest DNS query from the synthetic pools.

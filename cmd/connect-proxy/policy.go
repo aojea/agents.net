@@ -27,6 +27,7 @@ type descriptor struct {
 	Features          struct {
 		UDP bool `json:"udp"`
 		H2  bool `json:"h2"`
+		DoH bool `json:"doh"`
 	} `json:"features"`
 }
 
@@ -148,7 +149,7 @@ type suffixRule struct {
 // policy is a loaded descriptor bound to one listener.
 type policy struct {
 	version, sandbox, generation string
-	udp                          bool
+	udp, doh                     bool
 	names                        map[string][]*rule
 	suffixes                     []suffixRule
 	wildcard                     []*rule
@@ -207,7 +208,7 @@ func loadDescriptor(data []byte, generation string) (*policy, error) {
 	if d.Default != "deny" {
 		return nil, fmt.Errorf("policy descriptor: default must be \"deny\", got %q", d.Default)
 	}
-	p := &policy{version: d.Version, sandbox: d.Sandbox, generation: generation, udp: d.Features.UDP, names: map[string][]*rule{}}
+	p := &policy{version: d.Version, sandbox: d.Sandbox, generation: generation, udp: d.Features.UDP, doh: d.Features.DoH, names: map[string][]*rule{}}
 	for i, dr := range d.Rules {
 		if err := p.addRule(dr); err != nil {
 			return nil, fmt.Errorf("policy descriptor: rule %d: %w", i, err)
@@ -563,6 +564,85 @@ func (p *policy) authorize(ctx context.Context, host, port, network string) verd
 func listed(addresses []netip.Addr, address netip.Addr) bool {
 	for _, a := range addresses {
 		if a == address {
+			return true
+		}
+	}
+	return false
+}
+
+// dnsVerdict is the outcome of authorizing and resolving one DNS query name.
+type dnsVerdict struct {
+	name      string
+	addresses []netip.Addr
+	rule      string
+	reason    string // "" when allowed
+	notFound  bool   // true when upstream DNS reported NXDOMAIN
+	err       error
+}
+
+// authorizeDNS checks whether any policy rule allows hostname and resolves its
+// permitted addresses without leaking unauthorized names to upstream DNS.
+func (p *policy) authorizeDNS(ctx context.Context, host string) dnsVerdict {
+	name, ok := normalizeName(host)
+	if !ok {
+		return dnsVerdict{name: host, reason: "malformed-target"}
+	}
+	v := dnsVerdict{name: name}
+	candidates := append([]*rule(nil), p.names[name]...)
+	for _, s := range p.suffixes {
+		if !strings.HasSuffix(name, "."+s.suffix) {
+			continue
+		}
+		if s.depth > 0 && strings.Count(name[:len(name)-len(s.suffix)-1], ".")+1 > s.depth {
+			continue
+		}
+		candidates = append(candidates, s.rule)
+	}
+	candidates = append(candidates, p.wildcard...)
+	if len(candidates) == 0 {
+		v.reason = "not-on-allowlist"
+		return v
+	}
+	selected := candidates[0]
+	v.rule = selected.id
+
+	resolved := selected.resolve
+	if resolved == nil {
+		var err error
+		if resolved, err = lookupNetIP(ctx, "ip", name); err != nil {
+			var dnsErr *net.DNSError
+			if errors.As(err, &dnsErr) && dnsErr.IsNotFound {
+				v.notFound = true
+				return v
+			}
+			v.err = err
+			return v
+		}
+	}
+	for _, address := range resolved {
+		address = address.Unmap()
+		if address.Zone() != "" {
+			continue
+		}
+		if listed(selected.resolve, address) || p.anyLiteralOrException(address) || publicAddress(address) {
+			v.addresses = append(v.addresses, address)
+		}
+	}
+	if len(v.addresses) == 0 {
+		v.reason = "resolved-address-denied"
+		return v
+	}
+	return v
+}
+
+func (p *policy) anyLiteralOrException(address netip.Addr) bool {
+	for _, r := range p.literals {
+		if r.prefix.Contains(address) {
+			return true
+		}
+	}
+	for _, r := range p.exceptions {
+		if r.prefix.Contains(address) {
 			return true
 		}
 	}

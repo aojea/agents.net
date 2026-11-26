@@ -34,6 +34,10 @@ type Config struct {
 	Dialer Dialer
 	// DNS supplies synthetic answers and the dial-time reverse lookup.
 	DNS *VirtualDNS
+	// DNSHandler optionally overrides how guest DNS queries are answered
+	// (for example, DoHVirtualDNS forwarding to a Tier 2 DoH PEP while still
+	// rewriting positive answers into DNS). When nil, DNS handles queries locally.
+	DNSHandler DNSHandler
 	// EnableUDP tunnels UDP sessions via connect-udp. Off by default:
 	// UDP to port 53 is always answered locally by DNS either way, and
 	// everything else is silently dropped.
@@ -85,6 +89,7 @@ func New(cfg Config) (*Engine, error) {
 	e := &Engine{cfg: cfg, stack: s, forwarder: &Forwarder{
 		Dialer:         cfg.Dialer,
 		DNS:            cfg.DNS,
+		DNSHandler:     cfg.DNSHandler,
 		DialTimeout:    cfg.DialTimeout,
 		UDPIdleTimeout: cfg.UDPIdleTimeout,
 	}}

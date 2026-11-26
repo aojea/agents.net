@@ -110,7 +110,7 @@ cleanup() {
     # Delete LoadBalancer Service first while cloud-provider-kind is still running so
     # it removes its Envoy LB container cleanly before we stop cloud-provider-kind.
     k -n "${NS}" delete svc agents-net-ingress-gateway --ignore-not-found --wait=true >/dev/null 2>&1 || true
-    k delete deviceclass dra.agents.net-smoke --ignore-not-found >/dev/null 2>&1 || true
+    k delete deviceclass dra.agents.net-smoke dra.agents.net-smoke-doh --ignore-not-found >/dev/null 2>&1 || true
     k delete clusterrolebinding "${NS}-ingress-gateway" --ignore-not-found >/dev/null 2>&1 || true
     k delete clusterrole "${NS}-ingress-gateway" --ignore-not-found >/dev/null 2>&1 || true
     k -n kube-system delete secret smoke-driver-client-tls smoke-bridge-tls --ignore-not-found >/dev/null 2>&1 || true
@@ -377,7 +377,8 @@ cat > "${TMPDIR}/policy.json" <<EOF
   "default": "deny",
   "features": {
     "h2": true,
-    "udp": true
+    "udp": true,
+    "doh": true
   },
   "rules": [
     {
@@ -767,6 +768,148 @@ if last_err is not None:
 PY
 fi
 
+echo "=== 8c. Assert HostTun DoH DNS mode (resolv.conf search/ndots:5, short K8s Service name, and real NXDOMAIN) ==="
+cat <<EOF | k apply -f -
+apiVersion: resource.k8s.io/v1
+kind: DeviceClass
+metadata:
+  name: dra.agents.net-smoke-doh
+spec:
+  selectors:
+    - cel:
+        expression: device.driver == "dra.agents.net"
+  config:
+    - opaque:
+        driver: dra.agents.net
+        parameters:
+          apiVersion: dra.agents.net/v1alpha1
+          kind: DriverConfig
+          confinementMode: NetworkPolicyDenyAll
+          nicBlockMode: DropAll
+          dns:
+            mode: DoH
+          policyEnforcementPoint:
+            url: https://connect-proxy.${NS}.svc.cluster.local:8443
+            tls:
+              serverName: connect-proxy.${NS}.svc.cluster.local
+              caCertificateRefs:
+                - type: HostPath
+                  hostPath: /etc/dra-agents-net/ca/ca.crt
+            auth:
+              type: MTLS
+              mtls:
+                certDir: /etc/dra-agents-net/client
+---
+apiVersion: resource.k8s.io/v1
+kind: ResourceClaimTemplate
+metadata:
+  name: smoke-agents-net-doh
+  namespace: ${NS}
+spec:
+  spec:
+    devices:
+      requests:
+        - name: agents-net
+          exactly:
+            deviceClassName: dra.agents.net-smoke-doh
+            allocationMode: ExactCount
+            count: 1
+      config:
+        - requests: ["agents-net"]
+          opaque:
+            driver: dra.agents.net
+            parameters:
+              apiVersion: dra.agents.net/v1alpha1
+              kind: DriverConfig
+              caTrust:
+                mode: InjectEnv
+                bundleMode: AppendSystemRoots
+                sources:
+                  - type: ConfigMap
+                    configMapRef:
+                      name: smoke-ca
+                      key: ca.crt
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: smoke-agent-doh
+  namespace: ${NS}
+spec:
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 1
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+  resourceClaims:
+    - name: agents-net
+      resourceClaimTemplateName: smoke-agents-net-doh
+  containers:
+    - name: agent
+      image: ${PYTHON_IMAGE}
+      imagePullPolicy: IfNotPresent
+      command: ["python3", "-c", "import time; time.sleep(300)"]
+      resources:
+        claims:
+          - name: agents-net
+      securityContext:
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+EOF
+k -n "${NS}" wait --for=condition=Ready pod/smoke-agent-doh --timeout=90s
+k -n "${NS}" exec -i smoke-agent-doh -- env NS="${NS}" python3 - <<'PY'
+import ipaddress, json, os, socket, ssl, urllib.request
+
+ns = os.environ["NS"]
+with open("/etc/resolv.conf") as f:
+    resolv = f.read()
+assert "nameserver 198.19.255.253\n" in resolv, resolv
+assert f"search {ns}.svc.cluster.local svc.cluster.local cluster.local\n" in resolv, resolv
+assert "options ndots:5\n" in resolv, resolv
+print("PASS DoH /etc/resolv.conf preserves Kubernetes search list + ndots:5")
+
+# 1. Bare short Kubernetes Service name "echo" resolves via search expansion + DoH into 198.18.0.0/15.
+short_ip = socket.gethostbyname("echo")
+assert ipaddress.ip_address(short_ip) in ipaddress.ip_network("198.18.0.0/15"), f"short name resolved to non-synthetic IP: {short_ip}"
+print(f"PASS DoH short K8s Service name 'echo' resolved via search list -> {short_ip} (198.18.0.0/15)")
+
+# 2. Connecting via short name's synthetic IP reaches echo.NS.svc.cluster.local transparently.
+ctx = ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
+raw = socket.create_connection((short_ip, 8443), timeout=10)
+tls_sock = ctx.wrap_socket(raw, server_hostname=f"echo.{ns}.svc.cluster.local")
+tls_sock.sendall(f"GET /doh-short HTTP/1.1\r\nHost: echo.{ns}.svc.cluster.local\r\nConnection: close\r\n\r\n".encode())
+chunks = []
+while True:
+    c = tls_sock.recv(4096)
+    if not c:
+        break
+    chunks.append(c)
+tls_sock.close()
+resp_text = b"".join(chunks).decode()
+assert "200 OK" in resp_text and '"/doh-short"' in resp_text, resp_text
+print("PASS DoH short name transparent HTTPS via connect-proxy succeeded")
+
+# 3. FQDN with < 5 dots (echo.NS.svc.cluster.local has 4 dots < ndots:5) triggers search
+#    attempts that receive real NXDOMAIN before succeeding on the FQDN itself.
+fqdn = f"echo.{ns}.svc.cluster.local"
+with urllib.request.urlopen(f"https://{fqdn}:8443/doh-fqdn", timeout=10) as resp:
+    data = json.loads(resp.read().decode())
+    assert resp.status == 200 and data["ok"] is True and data["path"] == "/doh-fqdn", data
+    print("PASS DoH FQDN traversed search NXDOMAIN cleanly:", data)
+
+# 4. Non-existent / disallowed domain fails at DNS resolution time (NXDOMAIN -> socket.gaierror)
+#    rather than returning a synthetic IP.
+try:
+    ip = socket.gethostbyname("doesnotexist.example")
+    raise SystemExit(f"FAIL: doesnotexist.example unexpectedly resolved to {ip}")
+except socket.gaierror as e:
+    print("PASS DoH returned real NXDOMAIN for doesnotexist.example:", e)
+PY
+k -n "${NS}" delete pod smoke-agent-doh --wait=true >/dev/null
+k delete deviceclass dra.agents.net-smoke-doh --ignore-not-found >/dev/null
+
 echo "=== 9. Verify connect-proxy JSONL audit log recorded mTLS peer + h2 TCP & UDP allow + deny (and zero unmapped synthetic IPs) ==="
 PEP_LOGS="$(k -n "${NS}" logs deploy/connect-proxy)"
 echo "${PEP_LOGS}"
@@ -779,13 +922,17 @@ for line in sys.argv[1].splitlines():
         records.append(json.loads(line))
 tcp_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "tcp" and r.get("peer") == "dra-agents-net-smoke-client" and r.get("wire") == "h2"]
 udp_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "udp" and r.get("peer") == "dra-agents-net-smoke-client" and r.get("wire") == "h2"]
+dns_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "dns" and r.get("peer") == "dra-agents-net-smoke-client" and r.get("wire") == "h2"]
+dns_blocks = [r for r in records if r.get("decision") == "block" and r.get("transport") == "dns" and r.get("destination") == "doesnotexist.example" and r.get("reason") == "not-on-allowlist"]
 blocks = [r for r in records if r.get("decision") == "block" and r.get("destination") == "blocked.example:443" and r.get("reason") == "not-on-allowlist"]
 synthetic_leaks = [r for r in records if "198.18.9.9" in str(r.get("destination", ""))]
 assert tcp_allows, f"missing TCP allow audit record with mTLS peer & h2: {records}"
 assert udp_allows, f"missing UDP allow audit record with mTLS peer & h2: {records}"
+assert dns_allows, f"missing DNS DoH allow audit record with mTLS peer & h2: {records}"
+assert dns_blocks, f"missing DNS DoH block audit record for doesnotexist.example: {records}"
 assert blocks, f"missing block audit record for blocked.example:443: {records}"
 assert not synthetic_leaks, f"unmapped synthetic IP leaked to PEP: {synthetic_leaks}"
-print(f"PASS connect-proxy audit: {len(tcp_allows)} TCP allow(s), {len(udp_allows)} UDP allow(s) (mTLS peer + h2), {len(blocks)} block(s), 0 synthetic IP leaks")
+print(f"PASS connect-proxy audit: {len(tcp_allows)} TCP allow(s), {len(udp_allows)} UDP allow(s), {len(dns_allows)} DNS allow(s), {len(dns_blocks)} DNS block(s) (mTLS peer + h2), {len(blocks)} TCP block(s), 0 synthetic IP leaks")
 PY
 
 echo "=== 10. Assert Option 3 Ingress discovery via ResourceClaim.status.devices[].data ==="

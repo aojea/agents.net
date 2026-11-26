@@ -79,6 +79,8 @@ type AuditRecord struct {
 type ListenerConfig struct {
 	Identity               auth.WorkloadIdentity
 	PolicyEnforcementPoint *apis.PolicyEnforcementPointConfig
+	DNSMode                apis.DNSMode
+	DNSEnforcementPoint    *apis.PolicyEnforcementPointConfig
 	PodCertVolumeName      string
 	HasIngress             bool
 	MaxConnections         int
@@ -246,11 +248,48 @@ func (m *Manager) EnsureListener(ctx context.Context, podUID types.UID, cfg List
 		authMode = clientCfg.AuthMode
 	}
 
-	egressDir := filepath.Join(podRoot, "egress")
-	if err := os.MkdirAll(egressDir, 0o711); err != nil {
+	var dnsDialer *upstreamDialer
+	dnsAuthMode := authMode
+	if cfg.DNSMode == apis.DNSModeDoH {
+		if cfg.DNSEnforcementPoint != nil && cfg.DNSEnforcementPoint.URL != "" {
+			dnsClientCfg, err := m.authRes.Resolve(ctx, auth.ResolveRequest{
+				PolicyEnforcementPoint: cfg.DNSEnforcementPoint,
+				PodNamespace:           cfg.Identity.Namespace,
+				PodUID:                 podUID,
+				PodCertVolumeName:      cfg.PodCertVolumeName,
+			})
+			if err != nil {
+				if dialer != nil {
+					_ = dialer.Close()
+				}
+				return store.SocketPaths{}, fmt.Errorf("resolve DNS PEP auth for pod %s: %w", podUID, err)
+			}
+			dd, err := newUpstreamDialer(cfg.DNSEnforcementPoint, dnsClientCfg, m.dialTimeout, m.dialNet)
+			if err != nil {
+				_ = dnsClientCfg.Close()
+				if dialer != nil {
+					_ = dialer.Close()
+				}
+				return store.SocketPaths{}, fmt.Errorf("configure DNS PEP dialer for pod %s: %w", podUID, err)
+			}
+			dnsDialer = dd
+			dnsAuthMode = dnsClientCfg.AuthMode
+		} else {
+			dnsDialer = dialer
+		}
+	}
+	closeDialers := func() {
+		if dnsDialer != nil && dnsDialer != dialer {
+			_ = dnsDialer.Close()
+		}
 		if dialer != nil {
 			_ = dialer.Close()
 		}
+	}
+
+	egressDir := filepath.Join(podRoot, "egress")
+	if err := os.MkdirAll(egressDir, 0o711); err != nil {
+		closeDialers()
 		return store.SocketPaths{}, fmt.Errorf("mkdir egress dir %q: %w", egressDir, err)
 	}
 	paths := store.SocketPaths{
@@ -261,25 +300,19 @@ func (m *Manager) EnsureListener(ctx context.Context, podUID types.UID, cfg List
 	if cfg.HasIngress {
 		ingressDir := filepath.Join(podRoot, "ingress")
 		if err := os.MkdirAll(ingressDir, 0o777); err != nil {
-			if dialer != nil {
-				_ = dialer.Close()
-			}
+			closeDialers()
 			return store.SocketPaths{}, fmt.Errorf("mkdir ingress dir %q: %w", ingressDir, err)
 		}
 		// Explicitly chmod past process umask so non-root tun2connect can bind ingress.sock.
 		if err := os.Chmod(ingressDir, 0o777); err != nil {
-			if dialer != nil {
-				_ = dialer.Close()
-			}
+			closeDialers()
 			return store.SocketPaths{}, fmt.Errorf("chmod ingress dir %q: %w", ingressDir, err)
 		}
 		// Pre-create empty mountpoint stub inside egressDir so bind-mounting /run/agents.net
 		// read-only followed by /run/agents.net/ingress read-write succeeds without EROFS.
 		ingressStub := filepath.Join(egressDir, "ingress")
 		if err := os.MkdirAll(ingressStub, 0o755); err != nil {
-			if dialer != nil {
-				_ = dialer.Close()
-			}
+			closeDialers()
 			return store.SocketPaths{}, fmt.Errorf("mkdir ingress mountpoint stub %q: %w", ingressStub, err)
 		}
 		paths.IngressDir = ingressDir
@@ -289,16 +322,12 @@ func (m *Manager) EnsureListener(ctx context.Context, podUID types.UID, cfg List
 	_ = os.Remove(paths.EgressSocketPath)
 	ln, err := net.Listen("unix", paths.EgressSocketPath)
 	if err != nil {
-		if dialer != nil {
-			_ = dialer.Close()
-		}
+		closeDialers()
 		return store.SocketPaths{}, fmt.Errorf("listen %q: %w", paths.EgressSocketPath, err)
 	}
 	if err := os.Chmod(paths.EgressSocketPath, 0o666); err != nil {
 		_ = ln.Close()
-		if dialer != nil {
-			_ = dialer.Close()
-		}
+		closeDialers()
 		return store.SocketPaths{}, fmt.Errorf("chmod %q: %w", paths.EgressSocketPath, err)
 	}
 
@@ -310,6 +339,9 @@ func (m *Manager) EnsureListener(ctx context.Context, podUID types.UID, cfg List
 		ln:           ln,
 		dialer:       dialer,
 		authMode:     authMode,
+		dnsMode:      cfg.DNSMode,
+		dnsDialer:    dnsDialer,
+		dnsAuthMode:  dnsAuthMode,
 		maxConns:     cfg.MaxConnections,
 		idleTimeout:  time.Duration(cfg.IdleTimeoutSeconds) * time.Second,
 		revokeCtx:    revokeCtx,
@@ -505,6 +537,9 @@ type sandboxListener struct {
 	ln          net.Listener
 	dialer      *upstreamDialer
 	authMode    string
+	dnsMode     apis.DNSMode
+	dnsDialer   *upstreamDialer
+	dnsAuthMode string
 	maxConns    int
 	idleTimeout time.Duration
 
@@ -620,6 +655,9 @@ func (l *sandboxListener) stop() {
 			_ = eln.Close()
 		}
 		l.wg.Wait()
+		if l.dnsDialer != nil && l.dnsDialer != l.dialer {
+			_ = l.dnsDialer.Close()
+		}
 		if l.dialer != nil {
 			_ = l.dialer.Close()
 		}
@@ -730,6 +768,11 @@ func (l *sandboxListener) serveConn(conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Time{})
 	limiter.remaining = -1
 
+	if h.isDoH {
+		l.serveDoH(conn, br, h, connID, start)
+		return
+	}
+
 	transport := "tcp"
 	if h.isUDP {
 		transport = "udp"
@@ -837,6 +880,110 @@ func (l *sandboxListener) serveConn(conn net.Conn) {
 		Reason:         "allowed",
 		BytesOut:       outN,
 		BytesIn:        inN,
+		DurationMS:     time.Since(start).Milliseconds(),
+	})
+}
+
+func (l *sandboxListener) serveDoH(conn net.Conn, br *bufio.Reader, h *requestHead, connID string, start time.Time) {
+	if l.dnsMode != apis.DNSModeDoH {
+		metrics.TunnelsTotal.WithLabelValues("dns", l.authMode, "deny", "doh_disabled").Inc()
+		l.emitAudit(AuditRecord{
+			Connection: connID,
+			Transport:  "dns",
+			Target:     dohPath,
+			Decision:   "deny",
+			Reason:     "doh-disabled",
+		})
+		writeH1Deny(conn, l.manager.headTimeout, http.StatusMethodNotAllowed, "doh-disabled")
+		return
+	}
+	if l.dnsDialer == nil {
+		metrics.TunnelsTotal.WithLabelValues("dns", l.dnsAuthMode, "deny", "upstream_unavailable").Inc()
+		l.emitAudit(AuditRecord{
+			Connection: connID,
+			Transport:  "dns",
+			Target:     dohPath,
+			Decision:   "deny",
+			Reason:     "upstream-unconfigured",
+		})
+		writeH1Deny(conn, l.manager.headTimeout, http.StatusServiceUnavailable, "upstream-unconfigured")
+		return
+	}
+
+	_ = conn.SetReadDeadline(time.Now().Add(l.manager.headTimeout))
+	query := make([]byte, h.contentLength)
+	if _, err := io.ReadFull(br, query); err != nil {
+		return
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+
+	id, _, revokeCtx := l.snapshotIdentityAndContext()
+	dialCtx, cancel := context.WithTimeout(revokeCtx, l.manager.dialTimeout)
+	defer cancel()
+
+	dialStart := time.Now()
+	reply, err := l.dnsDialer.doDoH(dialCtx, query, id)
+	metrics.TunnelDialDurationSeconds.WithLabelValues(l.dnsDialer.negotiatedProtocol(false), l.dnsAuthMode).Observe(time.Since(dialStart).Seconds())
+	if err != nil {
+		if denied, ok := errors.AsType[*upstreamDeniedError](err); ok {
+			clientStatus := denied.status
+			if clientStatus < 400 || clientStatus > 599 {
+				clientStatus = http.StatusBadGateway
+			}
+			metrics.TunnelsTotal.WithLabelValues("dns", l.dnsAuthMode, "deny", "upstream_denied").Inc()
+			l.emitAudit(AuditRecord{
+				Connection:     connID,
+				Transport:      "dns",
+				Target:         dohPath,
+				Decision:       "deny",
+				UpstreamStatus: denied.status,
+				Reason:         denied.reason,
+				DurationMS:     time.Since(start).Milliseconds(),
+			})
+			if denied.proxyStatus != "" {
+				writeH1RawDeny(conn, l.manager.headTimeout, clientStatus, denied.proxyStatus)
+			} else {
+				writeH1Deny(conn, l.manager.headTimeout, clientStatus, denied.reason)
+			}
+			return
+		}
+		klog.ErrorS(err, "upstream DoH query failed",
+			"podUID", l.podUID,
+			"sandbox", id.Namespace+"/"+id.PodName,
+			"upstream", l.dnsDialer.target.address,
+			"authMode", l.dnsAuthMode,
+		)
+		metrics.TunnelsTotal.WithLabelValues("dns", l.dnsAuthMode, "error", "upstream_unavailable").Inc()
+		l.emitAudit(AuditRecord{
+			Connection: connID,
+			Transport:  "dns",
+			Target:     dohPath,
+			Decision:   "error",
+			Reason:     "upstream-connect-failed",
+			DurationMS: time.Since(start).Milliseconds(),
+		})
+		writeH1Deny(conn, l.manager.headTimeout, http.StatusBadGateway, "upstream-connect-failed")
+		return
+	}
+
+	_ = conn.SetWriteDeadline(time.Now().Add(l.manager.headTimeout))
+	head := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n", dohMediaType, len(reply))
+	if _, err := io.WriteString(conn, head); err != nil {
+		return
+	}
+	if _, err := conn.Write(reply); err != nil {
+		return
+	}
+	metrics.TunnelsTotal.WithLabelValues("dns", l.dnsAuthMode, "allow", "allowed").Inc()
+	l.emitAudit(AuditRecord{
+		Connection:     connID,
+		Transport:      "dns",
+		Target:         dohPath,
+		Decision:       "allow",
+		UpstreamStatus: http.StatusOK,
+		Reason:         "allowed",
+		BytesOut:       int64(len(query)),
+		BytesIn:        int64(len(reply)),
 		DurationMS:     time.Since(start).Milliseconds(),
 	})
 }

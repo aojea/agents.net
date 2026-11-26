@@ -410,6 +410,7 @@ func (m *linuxNetNSManager) StartHostTun(req HostTunRequest) (io.Closer, error) 
 		MTU:              hostTunMTU,
 		MaxConnections:   req.MaxConnections,
 		EnableUDP:        true,
+		DNSMode:          req.DNSMode,
 		ServeEgress:      req.ServeEgress,
 		EgressSocketPath: req.EgressSocketPath,
 		ReopenTun: func() (int, error) {

@@ -57,6 +57,7 @@ type NetworkParameters struct {
 	NICBlockMode           apis.NICBlockMode                  `json:"nicBlockMode,omitempty"`
 	AdapterMode            apis.AdapterMode                   `json:"adapterMode,omitempty"`
 	PolicyEnforcementPoint *apis.PolicyEnforcementPointConfig `json:"policyEnforcementPoint,omitempty"`
+	DNS                    *apis.DNSConfig                    `json:"dns,omitempty"`
 	CATrust                *apis.CATrustConfig                `json:"caTrust,omitempty"`
 	Proxy                  *apis.ExplicitProxyConfig          `json:"proxy,omitempty"`
 	IngressPorts           []apis.IngressPort                 `json:"ingressPorts,omitempty"`
@@ -90,6 +91,31 @@ func (p NetworkParameters) EffectiveProxyPort() int32 {
 		return *p.Proxy.Port
 	}
 	return apis.DefaultProxyPort
+}
+
+// EffectiveDNSMode returns the configured HostTun DNS mode or the default (Synthetic).
+func (p NetworkParameters) EffectiveDNSMode() apis.DNSMode {
+	if p.DNS != nil && p.DNS.Mode != "" {
+		return p.DNS.Mode
+	}
+	return apis.DNSModeSynthetic
+}
+
+// EffectiveClusterDomain returns the Kubernetes cluster DNS suffix (default "cluster.local").
+func (p NetworkParameters) EffectiveClusterDomain() string {
+	if p.DNS != nil && strings.TrimSpace(p.DNS.ClusterDomain) != "" {
+		return strings.TrimSuffix(strings.TrimSpace(p.DNS.ClusterDomain), ".")
+	}
+	return "cluster.local"
+}
+
+// EffectivePreserveSearchDomains reports whether /etc/resolv.conf under DNSModeDoH
+// should include Kubernetes search domains and options ndots:5 (default true).
+func (p NetworkParameters) EffectivePreserveSearchDomains() bool {
+	if p.DNS != nil && p.DNS.PreserveSearchDomains != nil {
+		return *p.DNS.PreserveSearchDomains
+	}
+	return true
 }
 
 // Defaults returns a NetworkParameters initialized with safe defaults.
@@ -201,6 +227,9 @@ func validateClaimLayer(layer *NetworkParameters) error {
 	if layer.PolicyEnforcementPoint != nil {
 		return fmt.Errorf("policyEnforcementPoint is restricted to DeviceClass configuration")
 	}
+	if layer.DNS != nil {
+		return fmt.Errorf("dns is restricted to DeviceClass configuration")
+	}
 	if layer.PodCertVolumeName != "" {
 		return fmt.Errorf("podCertVolumeName is restricted to DeviceClass configuration")
 	}
@@ -240,6 +269,21 @@ func (p NetworkParameters) Validate() error {
 	if p.PolicyEnforcementPoint != nil {
 		if err := validatePEP(p.PolicyEnforcementPoint); err != nil {
 			return err
+		}
+	}
+	if p.DNS != nil {
+		switch p.DNS.Mode {
+		case "", apis.DNSModeSynthetic, apis.DNSModeDoH:
+		default:
+			return fmt.Errorf("invalid dns.mode %q", p.DNS.Mode)
+		}
+		if p.DNS.EnforcementPoint != nil {
+			if err := validatePEP(p.DNS.EnforcementPoint); err != nil {
+				return fmt.Errorf("dns.enforcementPoint: %w", err)
+			}
+		}
+		if p.DNS.ClusterDomain != "" && strings.ContainsAny(p.DNS.ClusterDomain, " \t\r\n") {
+			return fmt.Errorf("invalid dns.clusterDomain %q: contains whitespace", p.DNS.ClusterDomain)
 		}
 	}
 	if p.MaxConnections != nil && (*p.MaxConnections < 1 || *p.MaxConnections > MaxAllowedConnections) {
@@ -356,6 +400,9 @@ func Merge(dst, src *NetworkParameters) {
 	if src.PolicyEnforcementPoint != nil {
 		dst.PolicyEnforcementPoint = mergePEP(dst.PolicyEnforcementPoint, src.PolicyEnforcementPoint)
 	}
+	if src.DNS != nil {
+		dst.DNS = mergeDNS(dst.DNS, src.DNS)
+	}
 	if src.CATrust != nil {
 		dst.CATrust = mergeCATrust(dst.CATrust, src.CATrust)
 	}
@@ -411,6 +458,27 @@ func mergeProxy(base, overlay *apis.ExplicitProxyConfig) *apis.ExplicitProxyConf
 	}
 	if len(overlay.NoProxy) > 0 {
 		out.NoProxy = append(out.NoProxy, overlay.NoProxy...)
+	}
+	return out
+}
+
+func mergeDNS(base, overlay *apis.DNSConfig) *apis.DNSConfig {
+	if base == nil {
+		return overlay.DeepCopy()
+	}
+	out := base.DeepCopy()
+	if overlay.Mode != "" {
+		out.Mode = overlay.Mode
+	}
+	if overlay.EnforcementPoint != nil {
+		out.EnforcementPoint = mergePEP(out.EnforcementPoint, overlay.EnforcementPoint)
+	}
+	if overlay.ClusterDomain != "" {
+		out.ClusterDomain = overlay.ClusterDomain
+	}
+	if overlay.PreserveSearchDomains != nil {
+		v := *overlay.PreserveSearchDomains
+		out.PreserveSearchDomains = &v
 	}
 	return out
 }

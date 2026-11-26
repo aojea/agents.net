@@ -2,8 +2,10 @@ package tun2connect
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -124,6 +126,54 @@ func (c *BoundaryClient) DialUDP(ctx context.Context, name string, port uint16) 
 		return nil, refusal(resp)
 	}
 	return &capsuleConn{CapsuleStream: NewCapsuleStream(&bufConn{Conn: conn, br: br}), conn: conn}, nil
+}
+
+const (
+	dohPath      = "/dns-query"
+	dohMediaType = "application/dns-message"
+	maxDoHBytes  = 64 * 1024
+)
+
+// QueryDoH forwards one raw RFC 1035 DNS query to the boundary via RFC 8484
+// DNS-over-HTTPS (POST /dns-query) over DialBoundary and returns the raw wire
+// DNS response.
+func (c *BoundaryClient) QueryDoH(ctx context.Context, query []byte) ([]byte, error) {
+	if len(query) == 0 || len(query) > maxDoHBytes {
+		return nil, fmt.Errorf("tun2connect: invalid DoH query size %d", len(query))
+	}
+	req := &http.Request{
+		Method:        http.MethodPost,
+		URL:           &url.URL{Path: dohPath},
+		Host:          c.authority(),
+		Proto:         "HTTP/1.1",
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		ContentLength: int64(len(query)),
+		Body:          io.NopCloser(bytes.NewReader(query)),
+		Header:        make(http.Header),
+	}
+	req.Header.Set("Content-Type", dohMediaType)
+	req.Header.Set("Accept", dohMediaType)
+	req.Header.Set("Connection", "close")
+
+	conn, _, resp, err := c.roundTrip(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, refusal(resp)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDoHBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxDoHBytes {
+		return nil, fmt.Errorf("tun2connect: DoH response exceeds %d bytes", maxDoHBytes)
+	}
+	return body, nil
 }
 
 func udpProxyURL(authority, host string, port uint16) *url.URL {
