@@ -415,6 +415,12 @@ func TestIngressMTLSAuthentication(t *testing.T) {
 	}
 }
 
+func TestNilServerAllowAndRevokeNoPanic(t *testing.T) {
+	var srv *Server
+	srv.Revoke("pod-uid-nil")
+	srv.Allow("pod-uid-nil")
+}
+
 func rawConnect(t *testing.T, addr, req string) string {
 	t.Helper()
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)

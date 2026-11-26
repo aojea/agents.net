@@ -39,6 +39,7 @@ type SocketPaths struct {
 	EgressSocketPath  string `json:"egressSocketPath"`
 	IngressDir        string `json:"ingressDir,omitempty"`
 	IngressSocketPath string `json:"ingressSocketPath,omitempty"`
+	ResolvConfPath    string `json:"resolvConfPath,omitempty"`
 }
 
 // PodConfig holds the checkpointed plumbing state for one sandbox Pod on this node.

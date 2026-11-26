@@ -103,7 +103,14 @@ func New(cfg Config) (*Engine, error) {
 	if err := s.SetTransportProtocolOption(tcp.ProtocolNumber, &sack); err != nil {
 		return nil, fmt.Errorf("tun2connect: enable SACK: %s", err)
 	}
-	if err := s.CreateNIC(nicID, cfg.Device); err != nil {
+	// Register transport handlers and keep the NIC disabled until all NIC
+	// options and routes are installed so fdbased's reader goroutine cannot
+	// race with stack initialization.
+	s.SetTransportProtocolHandler(tcp.ProtocolNumber,
+		tcp.NewForwarder(s, 0, maxInFlight, e.handleTCP).HandlePacket)
+	s.SetTransportProtocolHandler(udp.ProtocolNumber,
+		udp.NewForwarder(s, e.handleUDP).HandlePacket)
+	if err := s.CreateNICWithOptions(nicID, cfg.Device, stack.NICOptions{Disabled: true}); err != nil {
 		return nil, fmt.Errorf("tun2connect: create NIC: %s", err)
 	}
 	for _, address := range cfg.Addresses {
@@ -132,11 +139,9 @@ func New(cfg Config) (*Engine, error) {
 		{Destination: header.IPv4EmptySubnet, NIC: nicID},
 		{Destination: header.IPv6EmptySubnet, NIC: nicID},
 	})
-
-	s.SetTransportProtocolHandler(tcp.ProtocolNumber,
-		tcp.NewForwarder(s, 0, maxInFlight, e.handleTCP).HandlePacket)
-	s.SetTransportProtocolHandler(udp.ProtocolNumber,
-		udp.NewForwarder(s, e.handleUDP).HandlePacket)
+	if err := s.EnableNIC(nicID); err != nil {
+		return nil, fmt.Errorf("tun2connect: enable NIC: %s", err)
+	}
 	initialized = true
 	return e, nil
 }

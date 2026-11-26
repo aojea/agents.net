@@ -3,6 +3,7 @@ package tun2connect
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -273,6 +274,47 @@ func TestEngineUDPIPLiteralUsesBoundary(t *testing.T) {
 	defer network.dialer.mu.Unlock()
 	if len(network.dialer.dials) != 1 || network.dialer.dials[0] != "udp/203.0.113.10:3478" {
 		t.Fatalf("boundary saw %v", network.dialer.dials)
+	}
+}
+
+func TestEngineUnmappedSyntheticAddressFailsClosed(t *testing.T) {
+	network := newTestNet(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Unallocated synthetic IPv4 address must fail closed locally without dialing the boundary.
+	conn, err := gonet.DialContextTCP(ctx, network.guest,
+		fullAddr(netip.MustParseAddr("198.18.9.9"), 443), ipv4.ProtocolNumber)
+	if err == nil {
+		conn.Close()
+		t.Fatal("unmapped synthetic IPv4 dial succeeded")
+	}
+
+	// Unallocated synthetic IPv4 UDP must also never reach the boundary.
+	udpDest := fullAddr(netip.MustParseAddr("198.18.9.9"), 3478)
+	udpConn, err := gonet.DialUDP(network.guest, nil, &udpDest, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpConn.Close()
+	udpConn.SetDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := udpConn.Write([]byte("probe")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 32)
+	if _, err := udpConn.Read(buf); err == nil {
+		t.Fatal("unmapped synthetic UDP dial unexpectedly echoed")
+	}
+
+	// Forwarder directly rejects unmapped synthetic IPv6 addresses too.
+	if _, err := network.eng.forwarder.DialTCP(ctx, netip.MustParseAddrPort("[100::9]:443")); !errors.Is(err, ErrUnknownSyntheticAddress) {
+		t.Fatalf("DialTCP([100::9]:443) = %v, want ErrUnknownSyntheticAddress", err)
+	}
+
+	network.dialer.mu.Lock()
+	defer network.dialer.mu.Unlock()
+	if len(network.dialer.dials) != 0 {
+		t.Fatalf("unmapped synthetic addresses must fail closed locally, but boundary saw %v", network.dialer.dials)
 	}
 }
 

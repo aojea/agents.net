@@ -33,17 +33,17 @@ import (
 
 // Guest addresses sit at the TOP of the synthetic pools, inside the /24
 // and /120 that VirtualDNS reserves and never hands out, so they cannot
-// collide with an invented answer. The /10 and /64 prefix lengths make
+// collide with an invented answer. The /15 and /64 prefix lengths make
 // the kernel install the connected routes that cover every synthetic
 // address, and the resolver needs no route of its own -- any pool address
 // works, because the engine answers port 53 locally wherever the query is
 // sent. The device is also made the default route; see configureTUN for why.
 const (
-	guestAddr4     = "100.127.255.254"
-	pool4PrefixLen = 10
-	resolverAddr   = "100.127.255.253"
-	guestAddr6     = "100::ffff:ffff:ffff:fffe"
-	pool6PrefixLen = 64
+	guestAddr4     = tun2connect.DefaultGuestAddr4
+	pool4PrefixLen = tun2connect.DefaultPool4Bits
+	resolverAddr   = tun2connect.DefaultResolverAddr
+	guestAddr6     = tun2connect.DefaultGuestAddr6
+	pool6PrefixLen = tun2connect.DefaultPool6Bits
 )
 
 func runUsage(fs *flag.FlagSet) func() {

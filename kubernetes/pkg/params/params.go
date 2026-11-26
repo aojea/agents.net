@@ -68,12 +68,12 @@ type NetworkParameters struct {
 	Custom map[string]string `json:"custom,omitempty"`
 }
 
-// EffectiveAdapterMode returns the configured AdapterMode or the default (ExplicitProxy).
+// EffectiveAdapterMode returns the configured AdapterMode or the default (HostTun).
 func (p NetworkParameters) EffectiveAdapterMode() apis.AdapterMode {
 	if p.AdapterMode != "" {
 		return p.AdapterMode
 	}
-	return apis.AdapterModeExplicitProxy
+	return apis.AdapterModeHostTun
 }
 
 // EffectiveNICBlockMode returns the configured NICBlockMode or the default (DropAll).
@@ -97,7 +97,7 @@ func Defaults() NetworkParameters {
 	return NetworkParameters{
 		ConfinementMode:    apis.ConfinementModePodNetworkIsolated,
 		NICBlockMode:       apis.NICBlockModeDropAll,
-		AdapterMode:        apis.AdapterModeExplicitProxy,
+		AdapterMode:        apis.AdapterModeHostTun,
 		MaxConnections:     new(DefaultMaxConnections),
 		IdleTimeoutSeconds: new(DefaultIdleTimeoutSeconds),
 	}
@@ -233,7 +233,7 @@ func (p NetworkParameters) Validate() error {
 		return fmt.Errorf("invalid nicBlockMode %q", p.NICBlockMode)
 	}
 	switch p.AdapterMode {
-	case "", apis.AdapterModeExplicitProxy, apis.AdapterModeTunSidecar:
+	case "", apis.AdapterModeHostTun, apis.AdapterModeExplicitProxy, apis.AdapterModeTunSidecar:
 	default:
 		return fmt.Errorf("invalid adapterMode %q", p.AdapterMode)
 	}

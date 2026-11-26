@@ -312,7 +312,7 @@ func testClientNamespace(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if os.Getenv("NETNS_PROXY_ROLE") == "offline" {
-		conn, err := net.DialTimeout("tcp", "100.64.0.1:8080", time.Second)
+		conn, err := net.DialTimeout("tcp", "198.18.0.1:8080", time.Second)
 		if err == nil {
 			conn.Close()
 			t.Fatal("connection succeeded after proxy shutdown")

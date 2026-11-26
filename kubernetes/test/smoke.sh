@@ -20,10 +20,16 @@
 #   1. Single-manifest installation via kubernetes/install.yaml (kube-system)
 #   2. DRA DRAConsumableCapacity ResourceSlice publication & /healthz readiness
 #   3. Standard Pod + ResourceClaimTemplate attachment (zero custom workload CRDs)
-#   4. Confinement: route flush + pure-netlink tc clsact DROP blocks direct TCP
-#   5. Egress via real sdk/cmd/connect-proxy (mTLS + HTTP/2 CONNECT + policy.md):
-#      - Allowed HTTPS host succeeds with injected SSL_CERT_FILE + HTTPS_PROXY
-#      - Denied host fails with 403 Forbidden
+#   4. Confinement & HostTun (default, zero sidecar, zero Pod caps):
+#      - Route flush + pure-netlink tc clsact DROP blocks eth0
+#      - Persistent tun0 inside Pod netns handled by host userspace tun2connect
+#      - /etc/resolv.conf replaced via NRI pointing to 198.19.255.253 (198.18.0.0/15)
+#      - No HTTP_PROXY env vars, no egress.sock, and no /dev/net/tun in container
+#   5. Transparent egress via real sdk/cmd/connect-proxy (mTLS + HTTP/2 CONNECT + policy.md):
+#      - Unmodified HTTPS client reaches allowed host with injected SSL_CERT_FILE
+#      - Unmodified UDP client reaches allowed UDP host over RFC 9298 connect-udp
+#      - Denied host and literal IP fail closed at connect-proxy
+#      - Unmapped synthetic IP (198.18.9.9) fails closed locally before hitting PEP
 #      - connect-proxy JSONL audit log records verified mTLS peer + allow/deny
 #   6. Option 3 Ingress discovery via ResourceClaim.status.devices[].data +
 #      external LoadBalancer attraction via cloud-provider-kind:
@@ -119,8 +125,8 @@ cleanup() {
 trap cleanup EXIT
 
 echo "=== 1. Build dra-agents-net, agents-net-ingress-gateway, and sdk/cmd/connect-proxy images ==="
-docker build --load -t "${DRIVER_IMAGE}" -f "${KUBE_DIR}/Dockerfile" "${KUBE_DIR}"
-docker build --load -t "${GATEWAY_IMAGE}" -f "${KUBE_DIR}/Dockerfile.ingress-gateway" "${KUBE_DIR}"
+docker build --load -t "${DRIVER_IMAGE}" -f "${KUBE_DIR}/Dockerfile" "${REPO_ROOT}"
+docker build --load -t "${GATEWAY_IMAGE}" -f "${KUBE_DIR}/Dockerfile.ingress-gateway" "${REPO_ROOT}"
 docker build --load -t "${PEP_IMAGE}" -f "${SCRIPT_DIR}/Dockerfile.connect-proxy" "${REPO_ROOT}/sdk"
 
 if [ "${USE_EXISTING_CLUSTER}" != "true" ]; then
@@ -479,9 +485,6 @@ spec:
           kind: DriverConfig
           confinementMode: NetworkPolicyDenyAll
           nicBlockMode: DropAll
-          adapterMode: ExplicitProxy
-          proxy:
-            port: 15001
           policyEnforcementPoint:
             url: https://connect-proxy.${NS}.svc.cluster.local:8443
             tls:
@@ -587,93 +590,76 @@ POD_UID="$(k -n "${NS}" get pod smoke-agent -o jsonpath='{.metadata.uid}')"
 CLAIM_NAME="$(k -n "${NS}" get resourceclaim -o jsonpath='{.items[0].metadata.name}')"
 echo "smoke-agent PodUID=${POD_UID} ResourceClaim=${CLAIM_NAME}"
 
-echo "=== 8. Assert egress confinement, connect-proxy mTLS/H2 TCP + UDP, Proxy-Status, and env vars ==="
+echo "=== 8. Assert HostTun default confinement, transparent TCP/UDP egress, VirtualDNS fail-closed, and zero sidecar ==="
 k -n "${NS}" exec -i smoke-agent -- env ECHO_IP="${ECHO_IP}" NS="${NS}" python3 - <<'PY'
-import json, os, socket, urllib.error, urllib.request
+import ipaddress, json, os, socket, urllib.error, urllib.request
 
-# 1. Verify AGENT_INGRESS_PORT, AGENT_CA_CERT, SSL_CERT_FILE, and HTTPS_PROXY injected by NRI CreateContainer
+# 1. Verify HostTun defaults: AGENT_INGRESS_PORT and CA env vars injected; NO proxy env vars, NO egress.sock, NO /dev/net/tun.
 assert os.environ.get("AGENT_INGRESS_PORT") == "8080", f"AGENT_INGRESS_PORT={os.environ.get('AGENT_INGRESS_PORT')!r}"
-assert os.environ.get("HTTPS_PROXY") == "http://127.0.0.1:15001", f"HTTPS_PROXY={os.environ.get('HTTPS_PROXY')!r}"
 assert os.environ.get("AGENT_CA_CERT") == "/var/run/agent-ca.pem", f"AGENT_CA_CERT={os.environ.get('AGENT_CA_CERT')!r}"
 assert os.environ.get("SSL_CERT_FILE") == "/var/run/agent-ca.pem", f"SSL_CERT_FILE={os.environ.get('SSL_CERT_FILE')!r}"
+assert not os.environ.get("HTTP_PROXY") and not os.environ.get("HTTPS_PROXY"), "HostTun must not inject HTTP_PROXY/HTTPS_PROXY"
+assert not os.path.exists("/run/agents.net/egress.sock"), "HostTun must not mount egress.sock into container"
+assert not os.path.exists("/dev/net/tun"), "HostTun must not expose /dev/net/tun into container"
 
-# 2. Verify non-loopback routes were flushed
+# 2. Verify NRI replaced /etc/resolv.conf with the HostTun virtual DNS resolver (no search/ndots:5 trap).
+with open("/etc/resolv.conf") as f:
+    resolv = f.read()
+assert resolv == "nameserver 198.19.255.253\n", f"unexpected /etc/resolv.conf: {resolv!r}"
+print("PASS HostTun /etc/resolv.conf replaced cleanly:", resolv.strip())
+
+# 3. Verify all non-loopback routes belong exclusively to tun0 (eth0 routes flushed).
 with open("/proc/net/route") as f:
-    routes = [ln.strip() for ln in f.readlines()[1:] if ln.strip()]
-assert len(routes) == 0, f"expected empty /proc/net/route, got: {routes}"
+    ifaces = {ln.split()[0] for ln in f.readlines()[1:] if ln.strip()}
+assert ifaces == {"tun0"}, f"expected routes only on tun0, got: {ifaces}"
+print("PASS non-loopback routes owned exclusively by tun0")
 
-# 3. Direct TCP bypass to echo ClusterIP must fail
-try:
-    socket.create_connection((os.environ["ECHO_IP"], 8443), timeout=2).close()
-    raise SystemExit("FAIL: direct TCP to echo ClusterIP succeeded")
-except OSError as e:
-    print("PASS direct TCP blocked:", e)
+# 4. Verify DNS resolves into RFC 2544 synthetic pool 198.18.0.0/15 (not CGNAT 100.64.0.0/10).
+echo_host = f"echo.{os.environ['NS']}.svc.cluster.local"
+resolved_ip = socket.gethostbyname(echo_host)
+assert ipaddress.ip_address(resolved_ip) in ipaddress.ip_network("198.18.0.0/15"), f"unexpected synthetic IP: {resolved_ip}"
+print(f"PASS VirtualDNS resolved {echo_host} -> {resolved_ip} (198.18.0.0/15)")
 
-# 4. Allowed HTTPS via connect-proxy (mTLS + HTTP/2 CONNECT + injected CA)
-url = f"https://echo.{os.environ['NS']}.svc.cluster.local:8443/smoke-ok"
+# 5. Unmodified HTTPS client (zero proxy env vars) succeeds transparently through connect-proxy PEP.
+url = f"https://{echo_host}:8443/smoke-ok"
 with urllib.request.urlopen(url, timeout=10) as resp:
     data = json.loads(resp.read().decode())
     assert resp.status == 200 and data["ok"] is True and data["path"] == "/smoke-ok", data
-    print("PASS connect-proxy allowed HTTPS:", data)
+    print("PASS HostTun transparent HTTPS via connect-proxy:", data)
 
-# 5. Denied host via connect-proxy policy must return 403 + RFC 9209 Proxy-Status (no legacy Boundary-Reason)
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(10)
-s.connect("/run/agents.net/egress.sock")
-s.sendall(b"CONNECT blocked.example:443 HTTP/1.1\r\nHost: blocked.example:443\r\n\r\n")
-deny_head = s.recv(4096).decode()
-s.close()
-assert deny_head.startswith("HTTP/1.1 403 "), f"expected 403 Forbidden, got: {deny_head!r}"
-assert "Proxy-Status:" in deny_head and "not-on-allowlist" in deny_head, f"missing Proxy-Status reason: {deny_head!r}"
-assert "Boundary-Reason:" not in deny_head, f"unexpected legacy Boundary-Reason header: {deny_head!r}"
-print("PASS connect-proxy denied blocked.example with Proxy-Status:", deny_head.splitlines()[0])
+# 6. Denied host fails closed transparently at connect-proxy.
+try:
+    urllib.request.urlopen("https://blocked.example:443/", timeout=5)
+    raise SystemExit("FAIL: blocked.example unexpectedly succeeded")
+except (urllib.error.URLError, OSError) as e:
+    print("PASS HostTun denied blocked.example:", e)
 
-# 6. Malformed CONNECT Host mismatch returns 400 + RFC 9209 Proxy-Status
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(5)
-s.connect("/run/agents.net/egress.sock")
-s.sendall(b"CONNECT a.example:443 HTTP/1.1\r\nHost: b.example:443\r\n\r\n")
-bad_head = s.recv(4096).decode()
-s.close()
-assert bad_head.startswith("HTTP/1.1 400 ") and "error=http_request_error; reason=authority-mismatch" in bad_head, f"unexpected 400: {bad_head!r}"
-print("PASS malformed CONNECT rejected with RFC 9209 Proxy-Status:", bad_head.splitlines()[0])
+# 7. Literal IP dial to echo ClusterIP fails closed (connect-proxy policy allows hostname only, not IP literal).
+try:
+    socket.create_connection((os.environ["ECHO_IP"], 8443), timeout=5).close()
+    raise SystemExit("FAIL: literal IP to echo ClusterIP succeeded")
+except OSError as e:
+    print("PASS HostTun denied literal IP to echo ClusterIP:", e)
 
-# 7. RFC 9298 connect-udp over HTTP/2 extended CONNECT (:protocol: connect-udp) to connect-proxy -h2
-udp_host = f"echo.{os.environ['NS']}.svc.cluster.local"
-s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-s.settimeout(10)
-s.connect("/run/agents.net/egress.sock")
-s.sendall((
-    f"GET /.well-known/masque/udp/{udp_host}/8444/ HTTP/1.1\r\n"
-    f"Host: egress.local\r\n"
-    f"Connection: Upgrade\r\n"
-    f"Upgrade: connect-udp\r\n"
-    f"Capsule-Protocol: ?1\r\n\r\n"
-).encode())
-buf = b""
-while b"\r\n\r\n" not in buf:
-    chunk = s.recv(4096)
-    if not chunk:
-        break
-    buf += chunk
-head, rest = buf.split(b"\r\n\r\n", 1)
-head_str = head.decode()
-assert head_str.startswith("HTTP/1.1 101 ") and "Capsule-Protocol: ?1" in head_str, f"connect-udp upgrade failed: {head_str!r}"
-# RFC 9297 DATAGRAM capsule: type=0x00, length=1+len(payload), context_id=0x00, payload
+# 8. Unmapped synthetic IP in 198.18.0.0/15 fails closed locally in Forwarder without reaching PEP.
+try:
+    socket.create_connection(("198.18.9.9", 443), timeout=5).close()
+    raise SystemExit("FAIL: unmapped synthetic IP 198.18.9.9 succeeded")
+except OSError as e:
+    print("PASS HostTun failed closed on unmapped synthetic IP 198.18.9.9:", e)
+
+# 9. Unmodified UDP socket succeeds transparently over RFC 9298 connect-udp -> connect-proxy -h2.
 payload = b"udp-h2-smoke-ok"
-capsule = bytes([0x00, 1 + len(payload), 0x00]) + payload
-s.sendall(capsule)
-while len(rest) < len(capsule):
-    chunk = s.recv(4096)
-    if not chunk:
-        break
-    rest += chunk
-s.close()
-assert rest == capsule, f"UDP capsule echo mismatch: got={rest!r} want={capsule!r}"
-print("PASS RFC 9298 connect-udp over HTTP/2 extended CONNECT echoed datagram:", payload.decode())
+udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp_sock.settimeout(10)
+udp_sock.sendto(payload, (echo_host, 8444))
+echoed, _ = udp_sock.recvfrom(4096)
+udp_sock.close()
+assert echoed == payload, f"UDP echo mismatch: got={echoed!r} want={payload!r}"
+print("PASS HostTun transparent UDP over RFC 9298 connect-udp echoed:", echoed.decode())
 PY
 
-echo "=== 9. Verify connect-proxy JSONL audit log recorded mTLS peer + h2 TCP & UDP allow + deny ==="
+echo "=== 9. Verify connect-proxy JSONL audit log recorded mTLS peer + h2 TCP & UDP allow + deny (and zero unmapped synthetic IPs) ==="
 PEP_LOGS="$(k -n "${NS}" logs deploy/connect-proxy)"
 echo "${PEP_LOGS}"
 python3 - "${PEP_LOGS}" <<'PY'
@@ -686,10 +672,12 @@ for line in sys.argv[1].splitlines():
 tcp_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "tcp" and r.get("peer") == "dra-agents-net-smoke-client" and r.get("wire") == "h2"]
 udp_allows = [r for r in records if r.get("decision") == "allow" and r.get("transport") == "udp" and r.get("peer") == "dra-agents-net-smoke-client" and r.get("wire") == "h2"]
 blocks = [r for r in records if r.get("decision") == "block" and r.get("destination") == "blocked.example:443" and r.get("reason") == "not-on-allowlist"]
+synthetic_leaks = [r for r in records if "198.18.9.9" in str(r.get("destination", ""))]
 assert tcp_allows, f"missing TCP allow audit record with mTLS peer & h2: {records}"
 assert udp_allows, f"missing UDP allow audit record with mTLS peer & h2: {records}"
 assert blocks, f"missing block audit record for blocked.example:443: {records}"
-print(f"PASS connect-proxy audit: {len(tcp_allows)} TCP allow(s), {len(udp_allows)} UDP allow(s) (mTLS peer + h2), {len(blocks)} block(s)")
+assert not synthetic_leaks, f"unmapped synthetic IP leaked to PEP: {synthetic_leaks}"
+print(f"PASS connect-proxy audit: {len(tcp_allows)} TCP allow(s), {len(udp_allows)} UDP allow(s) (mTLS peer + h2), {len(blocks)} block(s), 0 synthetic IP leaks")
 PY
 
 echo "=== 10. Assert Option 3 Ingress discovery via ResourceClaim.status.devices[].data ==="

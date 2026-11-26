@@ -16,8 +16,8 @@
 // dra-agents-net. Authorized callers (such as sandbox-router) connect to this
 // host listener, issue "CONNECT <podUID>:<port> HTTP/1.1", and dra-agents-net
 // enforces the Sandbox's spec.network.ingressPorts allowlist before dialing
-// either the Pod's agents.net ingress.sock (TunSidecar/TunVM) or the Pod's
-// loopback 127.0.0.1:<port> via socketat (ExplicitProxy / PodNetworkIsolated).
+// either the Pod's agents.net ingress.sock (TunSidecar) or the Pod's
+// loopback 127.0.0.1:<port> via socketat (HostTun / ExplicitProxy).
 package ingress
 
 import (
@@ -176,6 +176,9 @@ func (s *Server) Close() error {
 // Revoke immediately closes all active and in-flight ingress connections for podUID
 // and rejects new ingress attempts until Allow is called.
 func (s *Server) Revoke(podUID types.UID) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	s.revoked[podUID] = struct{}{}
 	conns := s.active[podUID]
@@ -191,6 +194,9 @@ func (s *Server) Revoke(podUID types.UID) {
 // Allow clears a prior Revoke marker for podUID (called when a PodSandbox starts
 // or after podUID has been removed from the store so the revoked set stays bounded).
 func (s *Server) Allow(podUID types.UID) {
+	if s == nil {
+		return
+	}
 	s.mu.Lock()
 	delete(s.revoked, podUID)
 	s.mu.Unlock()
