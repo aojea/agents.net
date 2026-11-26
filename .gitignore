@@ -217,15 +217,6 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Demo -- generated CA/leaf private keys and certs; never commit these.
-demo/certs/
-
-# Demo -- the launcher binary is built from tun2connect (Lab 3), not committed.
-demo/tun2connect
-# Its pre-rename name; stale copies may still exist in working trees.
-demo/nano-init
-
-# Scenarios -- compiled helper binaries
-scenarios/bin/
-scenarios/data/run-*/
+# Local binaries and build outputs
+bin/
 

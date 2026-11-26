@@ -1,0 +1,88 @@
+name: Publish container images
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+      - 'kubernetes/v*'
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  publish:
+    name: Build and push ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: dra-agents-net
+            dockerfile: Dockerfile
+          - name: agents-net-ingress-gateway
+            dockerfile: Dockerfile.ingress-gateway
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image name and tags
+        id: meta
+        shell: bash
+        env:
+          IMAGE_NAME: ${{ matrix.name }}
+        run: |
+          set -euo pipefail
+          repo_lc="${GITHUB_REPOSITORY,,}"
+          image="ghcr.io/${repo_lc}/${IMAGE_NAME}"
+          short_sha="${GITHUB_SHA:0:7}"
+
+          tags=()
+          if [ "${GITHUB_EVENT_NAME}" = "workflow_dispatch" ]; then
+            tags+=("${image}:${short_sha}")
+            tags+=("${image}:${GITHUB_SHA}")
+          else
+            ref_tag="${GITHUB_REF_NAME#kubernetes/}"
+            tags+=("${image}:${ref_tag}")
+            tags+=("${image}:${short_sha}")
+            if [[ "${ref_tag}" == v* && "${ref_tag}" != *-* ]]; then
+              tags+=("${image}:latest")
+            fi
+          fi
+
+          {
+            echo "image=${image}"
+            echo "tags<<EOF"
+            printf '%s\n' "${tags[@]}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
