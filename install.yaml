@@ -77,10 +77,10 @@ subjects:
 # Pairs with DRAConsumableCapacity (Beta, enabled by default since Kubernetes 1.36):
 # each node publishes a single shared "agents-net" device whose requestPolicy defaults
 # to consuming 1 sandbox unit per ResourceClaim.
-# Cluster-admin datapath and PEP settings (confinementMode, nicBlockMode, adapterMode,
+# Cluster-admin datapath and PEP settings (confinementMode, nicBlockMode, dns,
 # policyEnforcementPoint with mandatory mTLS, limits, and attested attributes) belong
-# in DeviceClass (FromClass). Workloads may only layer ingressPorts, proxy port/noProxy,
-# and non-HostPath caTrust sources in ResourceClaimTemplate / ResourceClaim.
+# in DeviceClass (FromClass). Workloads may only layer ingressPorts and
+# non-HostPath caTrust sources in ResourceClaimTemplate / ResourceClaim.
 apiVersion: resource.k8s.io/v1
 kind: DeviceClass
 metadata:
@@ -97,7 +97,6 @@ spec:
           kind: DriverConfig
           confinementMode: PodNetworkIsolated
           nicBlockMode: DropAll
-          adapterMode: HostTun
           maxConnections: 1024
           idleTimeoutSeconds: 300
 ---

@@ -113,6 +113,7 @@ type ControlRequest struct {
 	EnableUDP      bool     `json:"enable_udp,omitempty"`
 	DNSMode        string   `json:"dns_mode,omitempty"`
 	LinkMode       string   `json:"link_mode,omitempty"`
+	MAC            string   `json:"mac,omitempty"`
 	Addresses      []string `json:"addresses,omitempty"`
 	Addr           string   `json:"addr,omitempty"`
 	Port           uint16   `json:"port,omitempty"`
@@ -154,6 +155,7 @@ type AttachConfig struct {
 	EnableUDP      bool
 	DNSMode        string
 	LinkMode       string
+	MAC            string
 	Addresses      []string
 
 	// ServeEgress admits a parent-side kernel socketpair directly into the Pod's

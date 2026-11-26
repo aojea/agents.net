@@ -18,17 +18,21 @@ func NewTUNDevice(fd int, mtu uint32) (stack.LinkEndpoint, error) {
 	return fdbased.New(&fdbased.Options{FDs: []int{fd}, MTU: mtu})
 }
 
-// NewTAPDevice wraps an already-open L2 Ethernet file descriptor (either a
-// kernel IFF_TAP|IFF_NO_PI descriptor or a datagram/seqpacket socketpair such
-// as QEMU -netdev dgram) as the engine's link endpoint with ARP/Ethernet framing.
+// NewTAPDevice wraps an already-open L2 Ethernet file descriptor (a kernel
+// IFF_TAP|IFF_NO_PI descriptor, a QEMU -netdev dgram socketpair, or a pre-bound
+// AF_PACKET SOCK_RAW descriptor) as the engine's link endpoint with ARP/Ethernet
+// framing.
 func NewTAPDevice(fd int, mtu uint32, mac tcpip.LinkAddress) (stack.LinkEndpoint, error) {
 	if len(mac) == 0 {
 		mac = DefaultTAPMAC
 	}
 	return fdbased.New(&fdbased.Options{
-		FDs:            []int{fd},
-		MTU:            mtu,
-		Address:        mac,
-		EthernetHeader: true,
+		FDs:               []int{fd},
+		MTU:               mtu,
+		Address:           mac,
+		EthernetHeader:    true,
+		RXChecksumOffload: true,
+		PreConfigured:     true,
+		IsPacketSocket:    []bool{false},
 	})
 }

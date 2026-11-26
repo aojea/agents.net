@@ -1,110 +1,58 @@
-# agents.net — Kubernetes Networking for the Agentic Era
+# agents.net
 
-Kubernetes needs to evolve for agentic workloads. Spinning out of the cross-SIG discussion in [CNCF Maintainer Summit #126](https://github.com/cncf/maintainer-summit/discussions/126) (*Evolving Kubernetes for Agentic Workloads: Rethinking the Pod and Node Boundary*), `agents.net` is the standalone reference implementation exploring what Kubernetes networking should look like for autonomous AI agents: Pod plumbing without a CNI dependency, a host-side userspace network stack wired through file descriptors, Virtual DNS and forwarding hooks to Policy Enforcement Points (PEPs), mandatory mTLS on network hops, and IP-less inbound delivery aligned with **GAIA** (Gateway API), [`agent-sandbox`](https://github.com/kubernetes-sigs/agent-sandbox), **Agent Substrate**, and **OpenShell**.
+`agents.net` is a standalone Kubernetes network driver and reference implementation for isolated AI agent sandboxes. It removes direct network access from Pods and sends all TCP, UDP, and DNS traffic through an unprivileged userspace network stack on the host to an external Policy Enforcement Point (PEP) over mTLS HTTP `CONNECT`, `connect-udp`, and DoH.
 
-Read the full architecture vision in [docs/architecture.md](docs/architecture.md).
+It does not depend on a CNI plugin, does not inject sidecar containers into workload Pods, and does not rely on `HTTP_PROXY` environment variables. Unmodified applications inside `runc` containers, `gVisor` sandboxes, and KVM microVMs use standard sockets and DNS.
 
----
+See [docs/architecture.md](docs/architecture.md) for the design background, security model, and how this connects to SIG Network, [KEP-6313](https://github.com/kubernetes/enhancements/issues/6313), [GAIA](https://gateway-api.sigs.k8s.io/), and [agent-sandbox](https://github.com/kubernetes-sigs/agent-sandbox).
 
-## Why This Exists
-
-Kubernetes was built around a simple premise: every Pod attaches to a flat cluster network through a CNI plugin and gets a routable Pod IP. That worked well for microservices, but autonomous agents run untrusted generated code, churn at high density, and spend most of their time idle waiting on models or tools. Pushing that traffic through host-kernel `veth` interfaces exposes Linux TCP/IP and `nf_tables` to untrusted packets (forcing node reboots for kernel fixes), burns cluster IPAM space, breaks IP-based firewalls behind CDNs, and leaves credentials exposed whenever a sandbox is compromised.
-
-After several years of industry experimentation, low-level agent networking is settling on **HTTP `CONNECT` proxies talking to Policy Enforcement Points (PEPs)**. We split the architecture cleanly into two tiers kept in sync over that standard, mesh-compatible interface:
-
-- **Tier 1 — Agent Low-Level Networking (SIG Network core):** Accommodates existing Pod networking so less demanding platforms can adopt `agent-sandbox` and GAIA right away, while letting the optimized confined userspace stack evolve free of legacy Pod-IP, IPAM, `Service`, and `EndpointSlice` constraints (DRA + NRI + KEP-6313 `spec.podNetwork: Isolated`, file descriptors as capability and privilege boundaries, unprivileged pluggable userspace stack, and Virtual DNS / PEP forwarding / IP-less inbound hooks).
-- **Tier 2 — Policy Enforcement Points and Agentic Gateways (delegated to GAIA under Gateway API):** Off-sandbox DNS and anti-SSRF, L7/MCP/A2A policy, inference routing, credential injection, auditing, and inbound routing — compatible with existing meshes (Envoy, Istio HBONE) and agent platforms ([Agent Substrate](https://github.com/agent-substrate/substrate), [OpenShell](https://github.com/NVIDIA/OpenShell), `agent-sandbox`).
-
-Rather than bending the core Kubernetes network model, SIG Network has built these composable primitives step by step: starting the **Kubernetes Network Driver** effort at the **Contributor Summit in Paris (2024)**, proving DRA + NRI with [DRANET](https://github.com/kubernetes-sigs/dranet) and [KEP-4817](https://github.com/kubernetes/enhancements/issues/4817) for AI/ML fabrics, and adding [KEP-6313 (`spec.podNetwork: Isolated`)](https://github.com/kubernetes/enhancements/issues/6313) so Pods can opt out of the default cluster network completely.
-
-This project follows the same SIG Network philosophy behind `kube-proxy`, `kindnet`, [`kube-network-policies`](https://github.com/kubernetes-sigs/kube-network-policies), and [`DRANET`](https://github.com/kubernetes-sigs/dranet): keep core small, define clean interfaces for the ecosystem to build on, and back them with a lean upstream reference implementation so developers can iterate fast, users can try the architecture today, and foundational plumbing does not fracture into incompatible proprietary stacks.
-
----
-
-## Evolution of the Thinking
-
-The full git history is kept intact so you can follow how earlier experiments led to this Kubernetes architecture (all earlier standalone prototypes remain browsable at commit [`11d845b`](https://github.com/aojea/agents.net/tree/11d845b)):
-
-1. **Capability channels outside Kubernetes (`demo/`, `scenarios/`, `conformance/` in [`11d845b`](https://github.com/aojea/agents.net/tree/11d845b)):** We started by stripping direct networking out of `--network none` containers and Firecracker/QEMU microVMs, replacing raw routes with Unix socket / `vsock` channels and standard HTTP `CONNECT` framing to a PEP (`connect-proxy`, Envoy). That proved fail-closed hostname policy, PEP-side DNS, and off-sandbox credentials end to end.
-2. **Standalone Kubernetes driver without CNI ([PR #18](https://github.com/aojea/agents.net/pull/18)–[PR #21](https://github.com/aojea/agents.net/pull/21)):** We brought the model into Kubernetes as a DRA (`DRAConsumableCapacity`) + NRI node driver (`dra-agents-net`) with mandatory mTLS (`SPIFFE`, KEP-4317 `PodCertificate`, X.509) and IP-less ingress discovery. Running real agent workloads quickly showed the limits of both explicit proxies (unmodified tools ignore `HTTP_PROXY`) and in-Pod TUN sidecars (privileged network code and extra containers inside every tenant Pod).
-3. **Host-side TUN without sidecars ([PR #22](https://github.com/aojea/agents.net/pull/22)):** Moving the userspace TCP/IP stack (`tun2connect`) and synthetic DNS (`198.18.0.0/15`, `100::/64`) onto the host left only a persistent `tun0` interface and a read-only `/etc/resolv.conf` inside the Pod. Sandboxes run non-root with `capabilities.drop: ["ALL"]`, zero sidecars, and zero direct network access while unmodified TCP, UDP, and DNS apps work transparently.
-4. **Holistic agentic networking for SIG Network and GAIA (current direction):** Pulling those pieces together in [docs/architecture.md](docs/architecture.md): standalone CNI-less Pod plumbing paired with `spec.podNetwork: Isolated`, strict host privilege separation passing `tunFD` and egress FDs (`SCM_RIGHTS`) to an unprivileged pluggable userspace network stack (supporting both multi-tenant and multi-single-tenant workers), explicit Virtual DNS and PEP forwarding hooks, and direct compatibility with **GAIA** (Gateway API), **`agent-sandbox`**, **Agent Substrate**, and **OpenShell**.
-
----
-
-## Architecture at a Glance
+## How it works
 
 ```text
-+-------------------------------------------------------------------+
-| 1. Isolated Sandbox Pod (Zero Caps, No Sidecar, No Secrets)       |
-|    No direct route out (KEP-6313 PodNetworkIsolated or CNI).      |
-|    Only lo + persistent tun0 + ro /etc/resolv.conf.               |
-+-------------------------------------------------------------------+
-                                 |
-                    raw L3 packets via tunFD
-                    (off host kernel TCP/IP)
-                                 v
-+-------------------------------------------------------------------+
-| 2. Two-Container Node DaemonSet (No CNI)                          |
-|    - Container 2: kube-netstack (unprivileged, uid 65534,         |
-|      0 caps, AF_UNIX-only seccomp, zero K8s SA token or mTLS keys)|
-|      Runs userspace stack + Virtual DNS over passed tunFD         |
-|                          ^  SCM_RIGHTS (emptyDir Unix socket)     |
-|                          v                                        |
-|    - Container 1: kube-net-driver (DRA + NRI plumbing + tunnel)   |
-|      Opens persistent tun0, closes tunFD, strips untrusted        |
-|      headers, attaches node-attested identity, dials PEP over mTLS|
-+-------------------------------------------------------------------+
-                                 |
-      Mandatory mTLS + HTTP CONNECT / RFC 9298 connect-udp / DoH
-                                 v
-+-------------------------------------------------------------------+
-| 3. Policy Enforcement Point & Gateways (GAIA / Gateway API / PEP) |
-|    GAIA, Envoy, cmd/kube-pep, cmd/kube-inbound, or cloud SWG      |
-|    Off-sandbox DNS, anti-SSRF, L7/MCP/A2A policy, credential      |
-|    injection, audit logging, and IP-less inbound delivery.        |
-+-------------------------------------------------------------------+
+  Sandbox Pod (non-root, drop ALL caps, no sidecar, no secrets)
+    - runc:    lo + tun0 + ro /etc/resolv.conf
+    - gVisor:  eth0 (host veth moved to an empty isolated netns)
+    - microVM: virtio-net TAP (or AF_VSOCK with kube-tun2connect)
+                       |
+            tunFD / packetFD / tapFD
+                       v
+  kube-netstack (unprivileged container, uid 65534, 0 caps, AF_UNIX-only seccomp)
+    Terminates guest TCP/IP and Virtual DNS (198.18.0.0/15, 100::/64)
+                       |
+          emptyDir AF_UNIX socket + SCM_RIGHTS
+                       v
+  kube-net-driver (DRA + NRI node DaemonSet, no CNI)
+    Plumbs sandbox interfaces, closes packet FDs after handoff, attaches
+    node-attested workload identity, dials PEP over mTLS, serves opt-in
+    mTLS inbound CONNECT <podUID>:<port>
+                       |
+    mTLS HTTP/2 CONNECT / RFC 9298 connect-udp / RFC 8484 DoH
+                       v
+  Policy Enforcement Point and Inbound Gateway
+    Envoy, GAIA, kube-pep, kube-inbound, or any HTTP CONNECT proxy
 ```
 
----
+## Binaries
 
-## Repository Layout
-
-| Path | Contents |
+| Binary | Role |
 | --- | --- |
-| [docs/architecture.md](docs/architecture.md) | SIG Network architecture vision: building blocks, hooks, privilege separation, BYOS, tenancy, and GAIA / ecosystem integration |
-| [install.yaml](install.yaml) | Standalone Kubernetes manifest (`ServiceAccount`, minimal RBAC with zero `secrets` access, `DeviceClass`, two-container `DaemonSet` in `kube-system`) |
-| [cmd/kube-net-driver](cmd/kube-net-driver) | Per-node Kubernetes Network Driver (Container 1: DRA + NRI plumbing, mandatory mTLS egress forwarding, opt-in mTLS ingress bridge) |
-| [cmd/kube-netstack](cmd/kube-netstack) | Unprivileged userspace network stack container (Container 2: `distroless:nonroot`, UID `65534`, `AF_UNIX`-only seccomp-BPF, receives `tunFD`/`tapFD` over `emptyDir` `SCM_RIGHTS`) |
-| [cmd/kube-pep](cmd/kube-pep) | Reference outbound Policy Enforcement Point (mTLS HTTP/2 `CONNECT`, RFC 9298 `connect-udp`, RFC 8484 `DoH`, anti-SSRF, JSONL audit) |
-| [cmd/kube-inbound](cmd/kube-inbound) | Reference stateless mTLS inbound gateway routing external HTTP traffic to IP-less sandboxes via `ResourceClaim.status` |
-| [cmd/kube-tun2connect](cmd/kube-tun2connect) | Optional standalone TUN-to-CONNECT adapter binary (for `TunSidecar` or microVM `vsock` runtimes) |
-| [pkg/driver](pkg/driver) | DRA plugin (`DRAConsumableCapacity`), NRI hooks, `HostTun` / `ExplicitProxy` / `TunSidecar`, netlink confinement, and Pod informer |
-| [pkg/hosttun](pkg/hosttun) | `AF_UNIX SOCK_SEQPACKET` + `SCM_RIGHTS` host-tun transport (`--host-tun-socket` two-container mode + optional child-process `shared`/`per-pod` fallback), `AF_UNIX`-only seccomp-BPF, and automatic crash recovery |
-| [pkg/tun2connect](pkg/tun2connect) | Built-in Go userspace TCP/IP stack (gVisor `netstack`), Virtual DNS (`198.18.0.0/15`, `100::/64`), and `CONNECT` / `connect-udp` forwarding hooks |
-| [pkg/tunnel](pkg/tunnel) | Per-Pod UDS / `socketat` listener manager and mandatory mTLS HTTP/2 + HTTP/1.1 `CONNECT` / `connect-udp` dialer |
-| [pkg/apis](pkg/apis), [pkg/params](pkg/params) | `dra.agents.net/v1alpha1` `DriverConfig` & `DeviceStatus` and strict `FromClass` / `FromClaim` decoding |
-| [pkg/auth](pkg/auth), [pkg/catrust](pkg/catrust) | Mandatory mTLS (`MTLS`, `SPIFFE`, KEP-4317 `PodCertificate`), RFC 8941 attested identity headers, and CA bundle materialization |
-| [pkg/ingress](pkg/ingress), [pkg/gateway](pkg/gateway) | Node-side mTLS `CONNECT <podUID>:<port>` ingress bridge and reference ingress gateway |
-| [pkg/socketat](pkg/socketat), [pkg/store](pkg/store), [pkg/metrics](pkg/metrics), [pkg/proxyenv](pkg/proxyenv) | Cross-netns helpers, BoltDB checkpoint store, Prometheus metrics, and explicit-proxy env helpers |
-| [test/smoke.sh](test/smoke.sh) | End-to-end `kind` v1.36 smoke test (`runc`, `HostTun` two-container `kube-netstack`, `Synthetic` + `DoH`, `kube-pep`, `kube-inbound` `LoadBalancer`) |
-| [test/envoy/run.sh](test/envoy/run.sh) | Unmodified Envoy Proxy (`v1.36.2`) interop E2E (mTLS HTTP/2 `CONNECT` + `connect-udp` + RFC 8484 `DoH` + RBAC + Envoy inbound mTLS `CONNECT` tunneling) |
-| [test/gvisor/run.sh](test/gvisor/run.sh) | End-to-end `kind` v1.36 `RuntimeClass: gvisor` (`runsc`) E2E (confinement, host-UDS `egress.sock` TCP/UDP/DoH -> `kube-pep`, `kube-inbound` -> host-UDS `ingress.sock`) |
-| [test/microvm/run.sh](test/microvm/run.sh) | End-to-end KVM microVM E2E covering both zero-agent QEMU L2 `virtio-net` (`tapFD` -> `kube-netstack` + `OpDialInbound`) and zero-NIC Firecracker `v1.16.1` (`AF_VSOCK` -> `kube-pep`) |
+| `kube-net-driver` | Per-node DRA (`dra.agents.net`) and NRI DaemonSet container. Prepares claims, plumbs `tun0` or isolated L2 `veth` peers, handles mTLS egress forwarding, and runs the optional mTLS ingress bridge. |
+| `kube-netstack` | Unprivileged companion container in the DaemonSet (`distroless:nonroot`, UID `65534`, zero capabilities, `AF_UNIX`-only seccomp, no K8s token or mTLS keys). Runs the userspace TCP/IP stack and Virtual DNS over file descriptors passed by `kube-net-driver`. |
+| `kube-pep` | Reference egress PEP supporting mTLS HTTP/2 `CONNECT`, RFC 9298 `connect-udp`, RFC 8484 DoH, anti-SSRF IP checks, and JSONL audit logs. |
+| `kube-inbound` | Reference stateless inbound gateway that watches `ResourceClaim.status` and forwards external HTTP requests to IP-less sandboxes over mTLS `CONNECT`. |
+| `kube-tun2connect` | Standalone TUN-to-CONNECT launcher for zero-NIC microVMs (`AF_VSOCK`). |
 
----
+## Quick start
 
-## Install and Quick Start
+Requires Kubernetes 1.36+ (`DRAConsumableCapacity` enabled by default) and `containerd` or `CRI-O` with NRI enabled.
 
-Requires Kubernetes 1.36+ (`DRAConsumableCapacity` Beta enabled by default) and containerd/CRI-O with NRI enabled.
+Install the DaemonSet and default `DeviceClass`:
 
 ```bash
 kubectl apply -f https://raw.githubusercontent.com/aojea/agents.net/main/install.yaml
 ```
 
-### Cluster-Admin `DeviceClass` (`FromClass`)
-
-Cluster administrators configure confinement, adapter mode, PEP endpoint, mandatory mTLS authentication, and attested attributes in a `DeviceClass`:
+Cluster admins configure confinement, DNS mode, and the PEP endpoint in a `DeviceClass`:
 
 ```yaml
 apiVersion: resource.k8s.io/v1
@@ -122,9 +70,10 @@ spec:
           apiVersion: dra.agents.net/v1alpha1
           kind: DriverConfig
           confinementMode: PodNetworkIsolated
-          adapterMode: HostTun
+          dns:
+            mode: DoH
           policyEnforcementPoint:
-            url: https://egress-gateway.system.svc:8443
+            url: https://kube-pep.system.svc:8443
             tls:
               trustDomain: cluster.local
             auth:
@@ -133,16 +82,13 @@ spec:
             tenant: team-a
 ```
 
-### Workload `ResourceClaimTemplate` and `Pod`
-
-Any `Pod`, `Deployment`, or `kubernetes-sigs/agent-sandbox` `Sandbox` / `SandboxWarmPool` attaches via standard `resourceClaims` with zero sidecars and zero Pod capabilities:
+Workloads request a claim from that class and run with no extra containers or capabilities:
 
 ```yaml
 apiVersion: resource.k8s.io/v1
 kind: ResourceClaimTemplate
 metadata:
-  name: agent-egress
-  namespace: default
+  name: agent-net
 spec:
   spec:
     devices:
@@ -157,12 +103,11 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: my-agent
-  namespace: default
 spec:
   automountServiceAccountToken: false
   resourceClaims:
     - name: agents-net
-      resourceClaimTemplateName: agent-egress
+      resourceClaimTemplateName: agent-net
   containers:
     - name: agent
       image: python:3.14-slim
@@ -177,56 +122,25 @@ spec:
           drop: ["ALL"]
 ```
 
----
+## Configuration notes
 
-## Adapter & Confinement Modes
+- `confinementMode` defaults to `PodNetworkIsolated` for [KEP-6313](https://github.com/kubernetes/enhancements/issues/6313) loopback-only Pods (no CNI, no Pod IP). On existing CNI clusters, set `NetworkPolicyDenyAll`: `nicBlockMode: DropAll` (default) blocks `eth0` with `tc clsact`, while `nicBlockMode: Disabled` leaves `eth0` to CNI `NetworkPolicy` and keeps return routing in table `100` for kubelet probes. For `gVisor` (`RuntimeClass` handler `runsc`), the driver moves the host `veth` peer into an isolated empty network namespace and hands an `AF_PACKET` descriptor to `kube-netstack`.
+- `dns.mode` defaults to `Synthetic`, which resolves names locally into `198.18.0.0/15` and `100::/64` and works with any HTTP `CONNECT` proxy. Setting `DoH` forwards RFC 8484 `POST /dns-query` over the PEP's mTLS HTTP/2 session (or an optional separate `dns.enforcementPoint`), preserving Kubernetes search domains, `ndots:5`, and real `NXDOMAIN` responses while still rewriting positive answers into the synthetic pool.
+- Inbound traffic without Pod IPs is opt-in. Set `--ingress-addr` with `--ingress-tls-cert`, `--ingress-tls-key`, and `--ingress-client-ca` on `kube-net-driver` and declare `ingressPorts` on the claim. Health checks (`/healthz`, `/healthz/dra`, `/healthz/nri`) and Prometheus metrics (`/metrics`) listen on `--metrics-addr` (default `:9102`).
 
-### Adapters (`adapterMode`, configured in `DeviceClass`)
-
-- **`HostTun` (default):** Creates a persistent `tun0` inside the Pod netns during NRI `RunPodSandbox`, hands `tunFD` and a per-Pod dial-broker FD over an `emptyDir` `SCM_RIGHTS` socket (`--host-tun-socket=/run/hosttun/worker.sock`) to the unprivileged `kube-netstack` container (UID/GID `65534`, zero Linux capabilities, `readOnlyRootFilesystem`, `NoNewPrivs=1`, `AF_UNIX`-only seccomp-BPF, zero K8s ServiceAccount token, zero mTLS keys), and replaces `/etc/resolv.conf` pointing to `198.19.255.253`. Supports pluggable Virtual DNS modes configured in `DeviceClass`: default `Synthetic` (`resolve-all` into `198.18.0.0/15` / `100::/64`, stripping `search`/`ndots`) or `DoH` (RFC 8484 `POST /dns-query` forwarded over the unified Traffic PEP's mTLS HTTP/2 session or an optional dedicated `dns.enforcementPoint`, preserving Kubernetes `search` lists, `ndots:5`, and real `NXDOMAIN` while rewriting positive answers to synthetic IPs). Supports automatic reconnect and recovery over persistent `tun0` when the stack container restarts or is upgraded in place, swappable stack images via `containers[1].image`, and optional child-process `--host-tun-isolation=shared|per-pod` / `--host-tun-worker-bin` fallback when `--host-tun-socket` is unset. Zero sidecar, zero Pod capabilities, zero `egress.sock` exposed inside workload containers.
-- **`ExplicitProxy`:** Binds `127.0.0.1:15001` inside the Pod netns via `socketat` and injects `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` without creating a TUN device or synthetic IPs.
-- **`TunSidecar`:** Attaches `/dev/net/tun` and UDS sockets to an `agents-net-tun2connect` native sidecar when in-guest conversion is needed.
-
-### Confinement (`confinementMode`, configured in `DeviceClass`)
-
-- **`PodNetworkIsolated` (default):** Pairs with [KEP-6313](https://github.com/kubernetes/enhancements/issues/6313) (`spec.podNetwork: Isolated` — loopback-only Pod netns, zero CNI, zero Pod IP).
-- **`NetworkPolicyDenyAll`:** Standalone fallback for existing CNI clusters:
-  - `nicBlockMode: Disabled`: leaves `eth0` to CNI `NetworkPolicy` (Cilium, Calico, etc.) and installs source-IP policy routing in table `100` under `HostTun` so inbound replies (`sandbox-router`, kubelet probes) still exit `eth0`.
-  - `nicBlockMode: DropAll` (default): flushes non-loopback routes and attaches `tc clsact` drop filters on `eth0` for clusters without `NetworkPolicy` enforcement (such as `kindnet`).
-
----
-
-## Health, Metrics, and Ingress
-
-- **Health & metrics (`--metrics-addr`, default `:9102`):** `/healthz`, `/healthz/dra`, `/healthz/nri`, and Prometheus `/metrics` (`dra_agents_net_*`).
-- **IP-less ingress (opt-in, off by default):** Enable `--ingress-addr` with mandatory mTLS flags (`--ingress-tls-cert`, `--ingress-tls-key`, `--ingress-client-ca`, optional `--ingress-allowed-client-san`) to serve `CONNECT <podUID>:<port>` tunnels discovered without Pod IPs.
-
----
-
-## Build and Test
+## Build and test
 
 ```bash
-# Build all binaries (kube-net-driver, kube-netstack, kube-pep, kube-inbound, kube-tun2connect)
-make build
-
-# Run unit and Linux cross-netns integration tests with race detector
-make test
-
-# Static analysis and formatting
-make vet
-
-# End-to-end kind v1.36 smoke test (runc + kube-netstack + kube-pep + kube-inbound)
-USE_CLOUD_PROVIDER_KIND=true ./test/smoke.sh
-
-# Unmodified Envoy Proxy PEP + Inbound E2E interop suite
-make test-envoy
-
-# End-to-end kind v1.36 gVisor (runsc) E2E suite
-make test-gvisor
-
-# End-to-end KVM microVM E2E suite (QEMU L2 tapFD + Firecracker AF_VSOCK; requires /dev/kvm)
-make test-microvm
+make build                                # Build all five kube-* binaries
+make test                                 # Unit and Linux netns integration tests (-race)
+make vet                                  # go vet and formatting checks
+USE_CLOUD_PROVIDER_KIND=true ./test/smoke.sh  # kind v1.36 runc E2E (Synthetic + DoH + inbound)
+make test-envoy                           # Envoy v1.36 PEP + inbound E2E
+make test-gvisor                          # kind v1.36 gVisor (runsc) E2E
+make test-microvm                         # KVM microVM E2E (QEMU TAP + Firecracker vsock)
 ```
+
+Earlier standalone prototypes outside Kubernetes remain in git history at commit [`11d845b`](https://github.com/aojea/agents.net/tree/11d845b).
 
 ## License
 

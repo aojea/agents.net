@@ -53,10 +53,6 @@ const (
 	// device request name used with dra-agents-net.
 	PodClaimName = "agents-net"
 
-	// Tun2ConnectSidecarName is the native sidecar container name injected by workload
-	// controllers when adapterMode is TunSidecar.
-	Tun2ConnectSidecarName = "agents-net-tun2connect"
-
 	// PodCertVolumeName is the projected volume name used for KEP-4317 PodCertificate
 	// authentication.
 	PodCertVolumeName = "agents-net-pod-cert"
@@ -64,10 +60,6 @@ const (
 	// PodCertBundleFile is the credential bundle filename written by kubelet inside
 	// PodCertVolumeName.
 	PodCertBundleFile = "credential-bundle.pem"
-
-	// DefaultProxyPort is the default Pod loopback port (127.0.0.1:15001) bound via
-	// socketat when adapterMode is ExplicitProxy.
-	DefaultProxyPort int32 = 15001
 )
 
 // ConfinementMode defines how the backing Pod is isolated from direct network egress.
@@ -93,31 +85,12 @@ type NICBlockMode string
 const (
 	// NICBlockModeDropAll (default) flushes non-loopback routes and attaches tc clsact
 	// matchall DROP filters on ingress and egress of every non-loopback NIC inside the
-	// Pod netns (excluding tuntap in HostTun and TunSidecar modes).
+	// Pod netns (excluding tun0).
 	NICBlockModeDropAll NICBlockMode = "DropAll"
 
 	// NICBlockModeDisabled leaves eth0 routes and tc filters untouched so CNI NetworkPolicy
 	// enforces isolation while preserving host-to-Pod kubelet probes and CNI flow logs.
 	NICBlockModeDisabled NICBlockMode = "Disabled"
-)
-
-// AdapterMode defines how the Pod network namespace connects to the per-Pod
-// agents.net egress channel managed by dra-agents-net.
-type AdapterMode string
-
-const (
-	// AdapterModeHostTun (default) creates a persistent TUN device (tun0) inside the
-	// Pod netns during NRI RunPodSandbox and terminates TCP, UDP, and VirtualDNS in
-	// userspace on the host via tun2connect, requiring no sidecar container and no
-	// Pod capabilities while capturing clients that ignore HTTP_PROXY transparently.
-	AdapterModeHostTun AdapterMode = "HostTun"
-
-	// AdapterModeTunSidecar injects one tun2connect native sidecar per Pod netns.
-	AdapterModeTunSidecar AdapterMode = "TunSidecar"
-
-	// AdapterModeExplicitProxy binds 127.0.0.1:<port> inside the Pod loopback netns
-	// via socketat alongside egress.sock and injects proxy environment variables.
-	AdapterModeExplicitProxy AdapterMode = "ExplicitProxy"
 )
 
 // DNSMode selects how HostTun resolves guest DNS queries.
@@ -267,28 +240,6 @@ func (c *CATrustConfig) DeepCopy() *CATrustConfig {
 		for i := range c.Sources {
 			out.Sources[i] = *c.Sources[i].DeepCopy()
 		}
-	}
-	return &out
-}
-
-// ExplicitProxyConfig configures the Pod loopback HTTP proxy listener in ExplicitProxy mode.
-type ExplicitProxyConfig struct {
-	Port    *int32   `json:"port,omitempty"`
-	NoProxy []string `json:"noProxy,omitempty"`
-}
-
-// DeepCopy returns a deep copy of p.
-func (p *ExplicitProxyConfig) DeepCopy() *ExplicitProxyConfig {
-	if p == nil {
-		return nil
-	}
-	out := *p
-	if p.Port != nil {
-		v := *p.Port
-		out.Port = &v
-	}
-	if len(p.NoProxy) > 0 {
-		out.NoProxy = slices.Clone(p.NoProxy)
 	}
 	return &out
 }

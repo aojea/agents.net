@@ -25,7 +25,6 @@ import (
 	"errors"
 	"io"
 	"math/big"
-	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -54,11 +53,12 @@ type fakeNetNS struct {
 	verifiedPaths      []string
 	flushedPaths       []string
 	blockedPaths       []string
-	listenedAddrs      []string
 	hostTunPaths       []string
+	hostTunRuntimes    []string
 	hostTunPreserveNIC []bool
 	hostTunCleaned     []string
 	hostTunClosed      int
+	hostTunGuestIP     string
 	verifyErr          error
 	flushErr           error
 	blockErr           error
@@ -66,7 +66,6 @@ type fakeNetNS struct {
 	hasRoutesErr       error
 	nicsUnblocked      bool
 	nicsCheckErr       error
-	listenErr          error
 	hostTunErr         error
 }
 
@@ -104,25 +103,24 @@ func (f *fakeNetNS) VerifyNonLoopbackNICsBlocked(_ string, _ bool) (bool, error)
 	return !f.nicsUnblocked, f.nicsCheckErr
 }
 
-func (f *fakeNetNS) ListenAt(path, network, address string) (net.Listener, error) {
-	f.listenedAddrs = append(f.listenedAddrs, path+"@"+address)
-	if f.listenErr != nil {
-		return nil, f.listenErr
-	}
-	// Bind an ephemeral host loopback listener in offline unit tests.
-	return net.Listen(network, "127.0.0.1:0")
-}
-
-func (f *fakeNetNS) StartHostTun(req HostTunRequest) (io.Closer, error) {
+func (f *fakeNetNS) StartHostTun(req HostTunRequest) (io.Closer, string, error) {
 	f.hostTunPaths = append(f.hostTunPaths, req.NetNSPath)
+	f.hostTunRuntimes = append(f.hostTunRuntimes, req.RuntimeHandler)
 	f.hostTunPreserveNIC = append(f.hostTunPreserveNIC, req.PreserveNICReturn)
 	if f.hostTunErr != nil {
-		return nil, f.hostTunErr
+		return nil, "", f.hostTunErr
 	}
-	return fakeCloser{onClose: func() { f.hostTunClosed++ }}, nil
+	guestIP := ""
+	if isL2VethRuntime(req.RuntimeHandler) {
+		guestIP = f.hostTunGuestIP
+		if guestIP == "" {
+			guestIP = "10.244.0.8"
+		}
+	}
+	return fakeCloser{onClose: func() { f.hostTunClosed++ }}, guestIP, nil
 }
 
-func (f *fakeNetNS) CleanupHostTun(path string) error {
+func (f *fakeNetNS) CleanupHostTun(path, _ string) error {
 	f.hostTunCleaned = append(f.hostTunCleaned, path)
 	return nil
 }
@@ -293,7 +291,6 @@ func TestReportResourceClaimDeviceStatusPropagatesShareID(t *testing.T) {
 	shareID := types.UID("22222222-2222-2222-2222-222222222222")
 	claim := makeTestClaim("pod-uid-share", "claim-uid-share", params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-		AdapterMode:     apis.AdapterModeExplicitProxy,
 	})
 	claim.Status.Allocation.Devices.Results[0].ShareID = &shareID
 
@@ -372,7 +369,6 @@ func TestReportResourceClaimIngressDiscoveryAndRevocation(t *testing.T) {
 	shareID := types.UID("33333333-3333-3333-3333-333333333333")
 	claim := makeTestClaim("pod-uid-ingress", "claim-uid-ingress", params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-		AdapterMode:     apis.AdapterModeExplicitProxy,
 		IngressPorts: []apis.IngressPort{
 			{Port: 8080},
 			{Port: 9000, EndPort: 9005, Protocol: apis.IngressProtocolTCP},
@@ -469,9 +465,6 @@ func TestReportResourceClaimIngressDiscoveryAndRevocation(t *testing.T) {
 		devStatus.Ingress.Ports[1].Port != 9000 || devStatus.Ingress.Ports[1].EndPort != 9005 {
 		t.Fatalf("unexpected ingress ports: %+v", devStatus.Ingress.Ports)
 	}
-	if formatted := formatIngressPorts(devStatus.Ingress.Ports); formatted != "8080,9000-9005" {
-		t.Fatalf("formatIngressPorts = %q, want 8080,9000-9005", formatted)
-	}
 
 	// StopPodSandbox must revoke IngressStatus and mark Ready=False.
 	if err := drv.StopPodSandbox(ctx, podSandbox); err != nil {
@@ -527,7 +520,6 @@ func TestPrepareRunCreateStopRemoveCATrustAndPodSync(t *testing.T) {
 	claimUID := types.UID("claim-uid-abc")
 	claim := makeTestClaim(podUID, claimUID, params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-		AdapterMode:     apis.AdapterModeTunSidecar,
 		CATrust: &apis.CATrustConfig{
 			Mode:       apis.CATrustModeInjectEnv,
 			BundleMode: apis.CABundleModeAppendSystemRoots,
@@ -551,7 +543,7 @@ func TestPrepareRunCreateStopRemoveCATrustAndPodSync(t *testing.T) {
 		t.Fatalf("PrepareResult = %+v, want Err=nil and 0 CDI devices", res)
 	}
 
-	// 2. NRI RunPodSandbox verifies loopback-only netns before any container starts.
+	// 2. NRI RunPodSandbox verifies loopback-only netns and attaches kube-netstack before any container starts.
 	pod := &nriapi.PodSandbox{
 		Uid:       string(podUID),
 		Name:      "sb-1",
@@ -567,33 +559,39 @@ func TestPrepareRunCreateStopRemoveCATrustAndPodSync(t *testing.T) {
 		t.Fatalf("expected VerifyLoopbackOnly called once, got %v", netns.verifiedPaths)
 	}
 
-	// 3. NRI CreateContainer injects /dev/net/tun + egress/ingress sockets ONLY on tun2connect.
-	adjSidecar, _, err := drv.CreateContainer(ctx, pod, &nriapi.Container{Name: Tun2ConnectContainerName})
-	if err != nil || adjSidecar == nil {
-		t.Fatalf("CreateContainer sidecar: adj=%v err=%v", adjSidecar, err)
-	}
-	if len(adjSidecar.Linux.Devices) != 1 || adjSidecar.Linux.Devices[0].Path != "/dev/net/tun" {
-		t.Fatalf("expected /dev/net/tun on sidecar, got %+v", adjSidecar.Linux.Devices)
-	}
-	// Sidecar mounts: egress, ingress, merged CA, extra CA = 4.
-	if len(adjSidecar.Mounts) != 4 {
-		t.Fatalf("expected 4 mounts on sidecar, got %d", len(adjSidecar.Mounts))
-	}
-
-	// Workload container gets CA mounts + agents.net/language CA env vars only — zero /dev/net/tun, zero egress.sock!
-	adjAgent, _, err := drv.CreateContainer(ctx, pod, &nriapi.Container{Name: "agent"})
+	// 3. Workload container gets /etc/resolv.conf + CA mounts + non-clobbering env vars — zero /dev/net/tun, zero proxy env!
+	adjAgent, _, err := drv.CreateContainer(ctx, pod, &nriapi.Container{
+		Name: "agent",
+		Env:  []string{"AGENT_INGRESS_PORT=9999"},
+	})
 	if err != nil || adjAgent == nil {
 		t.Fatalf("CreateContainer agent: adj=%v err=%v", adjAgent, err)
 	}
 	if adjAgent.Linux != nil && len(adjAgent.Linux.Devices) > 0 {
 		t.Fatalf("agent container must NOT receive /dev/net/tun, got %+v", adjAgent.Linux.Devices)
 	}
-	if len(adjAgent.Mounts) != 2 || adjAgent.Mounts[0].Destination != catrust.ContainerCABundlePath || adjAgent.Mounts[1].Destination != catrust.ContainerExtraCAPath {
-		t.Fatalf("agent container mounts = %+v, want merged + extra CA bundles only", adjAgent.Mounts)
+	var sawResolv, sawMergedCA, sawExtraCA bool
+	for _, m := range adjAgent.Mounts {
+		switch m.Destination {
+		case containerResolvConfPath:
+			if m.Source != "" {
+				sawResolv = true
+			}
+		case catrust.ContainerCABundlePath:
+			sawMergedCA = true
+		case catrust.ContainerExtraCAPath:
+			sawExtraCA = true
+		}
+	}
+	if !sawResolv || !sawMergedCA || !sawExtraCA {
+		t.Fatalf("agent container mounts = %+v, want resolv.conf + merged CA + extra CA", adjAgent.Mounts)
 	}
 	agentEnv := envMap(adjAgent.Env)
 	if agentEnv["AGENT_CA_CERT"] != catrust.ContainerCABundlePath || agentEnv["NODE_EXTRA_CA_CERTS"] != catrust.ContainerExtraCAPath || agentEnv["REQUESTS_CA_BUNDLE"] != catrust.ContainerCABundlePath {
 		t.Fatalf("missing expected CA trust env vars: %+v", agentEnv)
+	}
+	if _, clobbered := agentEnv["AGENT_INGRESS_PORT"]; clobbered {
+		t.Fatalf("must not clobber user-defined AGENT_INGRESS_PORT: %+v", agentEnv)
 	}
 
 	// 4. SyncPod captures attested ServiceAccount metadata from the Pod informer.
@@ -625,7 +623,7 @@ func TestPrepareRunCreateStopRemoveCATrustAndPodSync(t *testing.T) {
 	}
 }
 
-func TestExplicitProxySocketAtAndMagicLanguageEnvVars(t *testing.T) {
+func TestConfinementModesAndGVisorL2VethLifecycle(t *testing.T) {
 	ctx := t.Context()
 	st, _ := store.New(nil)
 	tm, err := tunnel.NewManager(shortTempDir(t), nil, tunnel.WithAuditWriter(io.Discard))
@@ -645,11 +643,6 @@ func TestExplicitProxySocketAtAndMagicLanguageEnvVars(t *testing.T) {
 	claimUID := types.UID("claim-compat")
 	claim := makeTestClaim(podUID, claimUID, params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModeNetworkPolicyDenyAll,
-		AdapterMode:     apis.AdapterModeExplicitProxy,
-		Proxy: &apis.ExplicitProxyConfig{
-			Port:    new(int32(18080)),
-			NoProxy: []string{".internal.corp"},
-		},
 	})
 	prepRes, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim})
 	if err != nil || prepRes[claimUID].Err != nil {
@@ -676,9 +669,6 @@ func TestExplicitProxySocketAtAndMagicLanguageEnvVars(t *testing.T) {
 	if len(netns.blockedPaths) != 1 || netns.blockedPaths[0] != "/var/run/netns/compat" {
 		t.Fatalf("expected BlockNonLoopbackNICs called once by default (DropAll), got %v", netns.blockedPaths)
 	}
-	if len(netns.listenedAddrs) != 1 || netns.listenedAddrs[0] != "/var/run/netns/compat@127.0.0.1:18080" {
-		t.Fatalf("expected socketat ListenAt on 127.0.0.1:18080, got %v", netns.listenedAddrs)
-	}
 
 	// Verify nicBlockMode=Disabled (DeviceClass opt-out) skips both FlushNonLoopbackRoutes
 	// and BlockNonLoopbackNICs so CNI NetworkPolicy and kubelet probes keep working.
@@ -687,7 +677,6 @@ func TestExplicitProxySocketAtAndMagicLanguageEnvVars(t *testing.T) {
 	claimOptOut := makeTestClaim(podUIDOptOut, claimUIDOptOut, params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModeNetworkPolicyDenyAll,
 		NICBlockMode:    apis.NICBlockModeDisabled,
-		AdapterMode:     apis.AdapterModeExplicitProxy,
 	})
 	if res, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claimOptOut}); err != nil || res[claimUIDOptOut].Err != nil {
 		t.Fatalf("PrepareResourceClaims opt-out: err=%v res=%+v", err, res[claimUIDOptOut])
@@ -710,7 +699,6 @@ func TestExplicitProxySocketAtAndMagicLanguageEnvVars(t *testing.T) {
 	claimUIDFail := types.UID("claim-nic-fail")
 	claimFail := makeTestClaim(podUIDFail, claimUIDFail, params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModeNetworkPolicyDenyAll,
-		AdapterMode:     apis.AdapterModeExplicitProxy,
 	})
 	if res, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claimFail}); err != nil || res[claimUIDFail].Err != nil {
 		t.Fatalf("PrepareResourceClaims fail: err=%v res=%+v", err, res[claimUIDFail])
@@ -725,24 +713,36 @@ func TestExplicitProxySocketAtAndMagicLanguageEnvVars(t *testing.T) {
 	}
 	netns.blockErr = nil
 
-	// Verify ExplicitProxy injects all language magic proxy env vars pointing at http://127.0.0.1:18080
-	// and appends cleanly to existing JAVA_TOOL_OPTIONS.
-	adj, _, err := drv.CreateContainer(ctx, pod, &nriapi.Container{
-		Name: "agent",
-		Env:  []string{"JAVA_TOOL_OPTIONS=-Xmx256m"},
+	// Verify gVisor (RuntimeHandler="runsc") skips eth0 route flush / tc drop
+	// (host veth moves to an isolated netns) and checkpoints GuestIP for L2 ingress.
+	podUIDGV := types.UID("pod-gvisor-l2")
+	claimUIDGV := types.UID("claim-gvisor-l2")
+	claimGV := makeTestClaim(podUIDGV, claimUIDGV, params.NetworkParameters{
+		ConfinementMode: apis.ConfinementModeNetworkPolicyDenyAll,
+		IngressPorts:    []apis.IngressPort{{Port: 8080}},
 	})
-	if err != nil || adj == nil {
-		t.Fatalf("CreateContainer ExplicitProxy: adj=%+v err=%v", adj, err)
+	if res, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claimGV}); err != nil || res[claimUIDGV].Err != nil {
+		t.Fatalf("PrepareResourceClaims gvisor: err=%v res=%+v", err, res[claimUIDGV])
 	}
-	envs := envMap(adj.Env)
-	if envs["HTTP_PROXY"] != "http://127.0.0.1:18080" || envs["http_proxy"] != "http://127.0.0.1:18080" {
-		t.Fatalf("unexpected HTTP_PROXY/http_proxy: %+v", envs)
+	flushedBeforeGV := len(netns.flushedPaths)
+	blockedBeforeGV := len(netns.blockedPaths)
+	netns.hostTunGuestIP = "10.244.0.42"
+	gvPod := &nriapi.PodSandbox{
+		Id:             "sb-gvisor-1",
+		Uid:            string(podUIDGV),
+		Name:           "gvisor-agent",
+		Namespace:      "agents",
+		RuntimeHandler: "runsc",
+		Linux:          &nriapi.LinuxPodSandbox{Namespaces: []*nriapi.LinuxNamespace{{Type: "network", Path: "/var/run/netns/gvisor"}}},
 	}
-	if envs["NODE_USE_ENV_PROXY"] != "1" || envs["GRPC_PROXY_EXP"] != "http://127.0.0.1:18080" {
-		t.Fatalf("missing Node/gRPC proxy env vars: %+v", envs)
+	if err := drv.RunPodSandbox(ctx, gvPod); err != nil {
+		t.Fatalf("RunPodSandbox gvisor: %v", err)
 	}
-	if !strings.HasPrefix(envs["JAVA_TOOL_OPTIONS"], "-Xmx256m -Dhttp.proxyHost=127.0.0.1 -Dhttp.proxyPort=18080") {
-		t.Fatalf("unexpected JAVA_TOOL_OPTIONS: %q", envs["JAVA_TOOL_OPTIONS"])
+	if len(netns.flushedPaths) != flushedBeforeGV || len(netns.blockedPaths) != blockedBeforeGV {
+		t.Fatalf("gVisor L2 veth capture must not flush or tc-drop eth0, got flushed=%v blocked=%v", netns.flushedPaths, netns.blockedPaths)
+	}
+	if gotCfg, ok := st.Get(podUIDGV); !ok || gotCfg.GuestIP != "10.244.0.42" {
+		t.Fatalf("gVisor PodConfig GuestIP = %q (ok=%v), want 10.244.0.42", gotCfg.GuestIP, ok)
 	}
 
 	// Verify loopback check failure aborts RunPodSandbox.
@@ -796,7 +796,6 @@ func TestPodSandboxRecreationStaleGCAndIdempotentPrepare(t *testing.T) {
 	claimUID := types.UID("claim-recreate-1")
 	claim := makeTestClaim(podUID, claimUID, params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-		AdapterMode:     apis.AdapterModeExplicitProxy,
 	})
 	if res, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim}); err != nil || res[claimUID].Err != nil {
 		t.Fatalf("PrepareResourceClaims: err=%v res=%+v", err, res)
@@ -827,8 +826,8 @@ func TestPodSandboxRecreationStaleGCAndIdempotentPrepare(t *testing.T) {
 	if err := drv.RunPodSandbox(ctx, sb2); err != nil {
 		t.Fatalf("RunPodSandbox(sb2) after retry: %v", err)
 	}
-	if !tm.HasExtraListener(podUID) {
-		t.Fatal("expected re-armed socketat listener on recreated sandbox sb2")
+	if !drv.hasHostTun(podUID) {
+		t.Fatal("expected re-attached HostTun on recreated sandbox sb2")
 	}
 
 	// Stale StopPodSandbox/RemovePodSandbox for sb1 must NOT disrupt live sb2.
@@ -838,7 +837,7 @@ func TestPodSandboxRecreationStaleGCAndIdempotentPrepare(t *testing.T) {
 	if err := drv.RemovePodSandbox(ctx, sb1); err != nil {
 		t.Fatalf("stale RemovePodSandbox(sb1): %v", err)
 	}
-	if !tm.HasExtraListener(podUID) {
+	if !drv.hasHostTun(podUID) {
 		t.Fatal("stale sb1 teardown disrupted live replacement sandbox sb2")
 	}
 	cfg, ok := st.Get(podUID)
@@ -857,7 +856,7 @@ func TestPodSandboxRecreationStaleGCAndIdempotentPrepare(t *testing.T) {
 	}
 }
 
-func TestHostTunDefaultZeroSidecarLifecycle(t *testing.T) {
+func TestHostTunZeroSidecarLifecycle(t *testing.T) {
 	ctx := t.Context()
 	tmp := shortTempDir(t)
 	st, _ := store.New(nil)
@@ -874,7 +873,6 @@ func TestHostTunDefaultZeroSidecarLifecycle(t *testing.T) {
 	}
 	drv.nriConnected.Store(true)
 
-	// Empty AdapterMode must default to HostTun.
 	podUID := types.UID("pod-hosttun-1")
 	claimUID := types.UID("claim-hosttun-1")
 	claim := makeTestClaim(podUID, claimUID, params.NetworkParameters{
@@ -888,9 +886,6 @@ func TestHostTunDefaultZeroSidecarLifecycle(t *testing.T) {
 	cfg, ok := st.Get(podUID)
 	if !ok {
 		t.Fatal("missing PodConfig in store")
-	}
-	if cfg.Parameters.EffectiveAdapterMode() != apis.AdapterModeHostTun {
-		t.Fatalf("EffectiveAdapterMode = %q, want HostTun", cfg.Parameters.EffectiveAdapterMode())
 	}
 	if cfg.SocketPaths.ResolvConfPath == "" {
 		t.Fatal("expected ResolvConfPath written for HostTun")
@@ -916,9 +911,6 @@ func TestHostTunDefaultZeroSidecarLifecycle(t *testing.T) {
 	if len(netns.hostTunPaths) != 1 || netns.hostTunPaths[0] != "/var/run/netns/ht1" || netns.hostTunPreserveNIC[0] {
 		t.Fatalf("unexpected HostTun start: paths=%v preserveNIC=%v", netns.hostTunPaths, netns.hostTunPreserveNIC)
 	}
-	if len(netns.listenedAddrs) != 0 {
-		t.Fatalf("HostTun must not bind ExplicitProxy loopback port, got %v", netns.listenedAddrs)
-	}
 
 	// CreateContainer replaces /etc/resolv.conf without mounting egress.sock or injecting HTTP_PROXY or /dev/net/tun.
 	adj, _, err := drv.CreateContainer(ctx, pod, &nriapi.Container{Name: "agent"})
@@ -930,9 +922,6 @@ func TestHostTunDefaultZeroSidecarLifecycle(t *testing.T) {
 	}
 	var sawRemoveResolv, sawAddResolv bool
 	for _, m := range adj.Mounts {
-		if m.Destination == containerEgressMountDir {
-			t.Fatalf("HostTun must not mount egress.sock into container: %+v", adj.Mounts)
-		}
 		if strings.HasSuffix(m.Destination, containerResolvConfPath) && m.Source == "" {
 			sawRemoveResolv = true
 		}
@@ -957,7 +946,6 @@ func TestHostTunDefaultZeroSidecarLifecycle(t *testing.T) {
 	claim2 := makeTestClaim(podUID2, claimUID2, params.NetworkParameters{
 		ConfinementMode: apis.ConfinementModeNetworkPolicyDenyAll,
 		NICBlockMode:    apis.NICBlockModeDisabled,
-		AdapterMode:     apis.AdapterModeHostTun,
 	})
 	if res, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim2}); err != nil || res[claimUID2].Err != nil {
 		t.Fatalf("PrepareResourceClaims 2: err=%v res=%+v", err, res)
@@ -989,62 +977,5 @@ func TestHostTunDefaultZeroSidecarLifecycle(t *testing.T) {
 	}
 	if netns.hostTunClosed != 2 || len(netns.hostTunCleaned) != 1 || netns.hostTunCleaned[0] != "/var/run/netns/ht1" {
 		t.Fatalf("after RemovePodSandbox: closed=%d cleaned=%v", netns.hostTunClosed, netns.hostTunCleaned)
-	}
-}
-
-func TestExplicitProxyMountsIngressSocketDirWhenDeclared(t *testing.T) {
-	ctx := t.Context()
-	st, _ := store.New(nil)
-	tm, _ := tunnel.NewManager(shortTempDir(t), nil, tunnel.WithAuditWriter(io.Discard))
-	defer tm.Close()
-
-	podUID := types.UID("pod-explicit-ingress")
-	claimUID := types.UID("claim-explicit-ingress")
-	claim := makeTestClaim(podUID, claimUID, params.NetworkParameters{
-		ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-		AdapterMode:     apis.AdapterModeExplicitProxy,
-		IngressPorts:    []apis.IngressPort{{Port: 8080}},
-	})
-
-	drv, err := New(Config{
-		NodeName:   "worker-1",
-		KubeClient: fake.NewClientset(claim),
-		Store:      st,
-		Tunnel:     tm,
-		NetNS:      &fakeNetNS{},
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	drv.nriConnected.Store(true)
-	if res, err := drv.PrepareResourceClaims(ctx, []*resourceapi.ResourceClaim{claim}); err != nil || res[claimUID].Err != nil {
-		t.Fatalf("PrepareResourceClaims: err=%v res=%+v", err, res)
-	}
-	pod := &nriapi.PodSandbox{
-		Id: "sb-exp-ing", Uid: string(podUID), Name: "gvisor-agent", Namespace: "agents",
-		Linux: &nriapi.LinuxPodSandbox{Namespaces: []*nriapi.LinuxNamespace{{Type: "network", Path: "/var/run/netns/gv1"}}},
-	}
-	adj, _, err := drv.CreateContainer(ctx, pod, &nriapi.Container{Name: "agent"})
-	if err != nil || adj == nil {
-		t.Fatalf("CreateContainer: adj=%+v err=%v", adj, err)
-	}
-	var sawEgress, sawIngress bool
-	for _, m := range adj.Mounts {
-		if m.Destination == containerEgressMountDir {
-			sawEgress = true
-		}
-		if m.Destination == containerIngressMountDir {
-			sawIngress = true
-		}
-	}
-	if !sawEgress || !sawIngress {
-		t.Fatalf("ExplicitProxy with IngressPorts must mount egress and ingress dirs, got %+v", adj.Mounts)
-	}
-	envs := envMap(adj.Env)
-	if envs["AGENTS_NET_INGRESS_SOCKET"] != filepath.Join(containerIngressMountDir, tunnel.IngressSocketName) {
-		t.Fatalf("AGENTS_NET_INGRESS_SOCKET = %q", envs["AGENTS_NET_INGRESS_SOCKET"])
-	}
-	if envs["AGENT_INGRESS_PORT"] != "8080" {
-		t.Fatalf("AGENT_INGRESS_PORT = %q, want 8080", envs["AGENT_INGRESS_PORT"])
 	}
 }

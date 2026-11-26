@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"slices"
@@ -38,6 +39,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -183,6 +185,13 @@ func main() {
 		cancel()
 	}
 
+	hostTunMgr := hosttun.NewManager(hosttun.ManagerConfig{
+		WorkerSocket: hostTunSocket,
+		Isolation:    isolationMode,
+		WorkerBin:    hostTunWorkerBin,
+	})
+	defer func() { _ = hostTunMgr.Close() }()
+
 	var (
 		ingressSrv        *ingress.Server
 		ingressRevoker    driver.IngressRevoker
@@ -199,19 +208,15 @@ func main() {
 			ListenAddr: ingressAddr,
 			Store:      podStore,
 			TLSConfig:  ingressTLS,
+			DialGuest: func(ctx context.Context, podUID types.UID, guestIP netip.Addr, port uint16) (net.Conn, error) {
+				return hostTunMgr.DialInbound(ctx, string(podUID), guestIP, port)
+			},
 		})
 		if err != nil {
 			klog.Fatalf("create ingress bridge: %v", err)
 		}
 		ingressRevoker = ingressSrv
 	}
-
-	hostTunMgr := hosttun.NewManager(hosttun.ManagerConfig{
-		WorkerSocket: hostTunSocket,
-		Isolation:    isolationMode,
-		WorkerBin:    hostTunWorkerBin,
-	})
-	defer func() { _ = hostTunMgr.Close() }()
 
 	drv, err := driver.New(driver.Config{
 		DriverName:           driverName,

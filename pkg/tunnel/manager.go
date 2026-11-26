@@ -48,9 +48,6 @@ const (
 	// EgressSocketName is the standardized agents.net egress UDS filename.
 	EgressSocketName = "egress.sock"
 
-	// IngressSocketName is the standardized agents.net ingress UDS filename.
-	IngressSocketName = "ingress.sock"
-
 	defaultDialTimeout = 10 * time.Second
 	defaultHeadTimeout = 10 * time.Second
 	defaultMaxConns    = 1024
@@ -82,7 +79,6 @@ type ListenerConfig struct {
 	DNSMode                apis.DNSMode
 	DNSEnforcementPoint    *apis.PolicyEnforcementPointConfig
 	PodCertVolumeName      string
-	HasIngress             bool
 	MaxConnections         int
 	IdleTimeoutSeconds     int
 }
@@ -297,27 +293,6 @@ func (m *Manager) EnsureListener(ctx context.Context, podUID types.UID, cfg List
 		EgressDir:        egressDir,
 		EgressSocketPath: filepath.Join(egressDir, EgressSocketName),
 	}
-	if cfg.HasIngress {
-		ingressDir := filepath.Join(podRoot, "ingress")
-		if err := os.MkdirAll(ingressDir, 0o777); err != nil {
-			closeDialers()
-			return store.SocketPaths{}, fmt.Errorf("mkdir ingress dir %q: %w", ingressDir, err)
-		}
-		// Explicitly chmod past process umask so non-root tun2connect can bind ingress.sock.
-		if err := os.Chmod(ingressDir, 0o777); err != nil {
-			closeDialers()
-			return store.SocketPaths{}, fmt.Errorf("chmod ingress dir %q: %w", ingressDir, err)
-		}
-		// Pre-create empty mountpoint stub inside egressDir so bind-mounting /run/agents.net
-		// read-only followed by /run/agents.net/ingress read-write succeeds without EROFS.
-		ingressStub := filepath.Join(egressDir, "ingress")
-		if err := os.MkdirAll(ingressStub, 0o755); err != nil {
-			closeDialers()
-			return store.SocketPaths{}, fmt.Errorf("mkdir ingress mountpoint stub %q: %w", ingressStub, err)
-		}
-		paths.IngressDir = ingressDir
-		paths.IngressSocketPath = filepath.Join(ingressDir, IngressSocketName)
-	}
 
 	_ = os.Remove(paths.EgressSocketPath)
 	ln, err := net.Listen("unix", paths.EgressSocketPath)
@@ -365,27 +340,10 @@ func (m *Manager) EnsureListener(ctx context.Context, podUID types.UID, cfg List
 	return paths, nil
 }
 
-// AttachListener attaches an additional net.Listener (such as a Pod-loopback TCP listener
-// created via socketat.ListenAtPath during NRI RunPodSandbox for ExplicitProxy mode) to
-// podUID's tunnel pipeline so both listeners share upstream auth, limits, metrics, and Revoke.
-func (m *Manager) AttachListener(podUID types.UID, ln net.Listener) error {
-	if ln == nil {
-		return errors.New("listener is required")
-	}
-	m.mu.Lock()
-	sl := m.listeners[podUID]
-	m.mu.Unlock()
-	if sl == nil {
-		_ = ln.Close()
-		return fmt.Errorf("no sandbox listener found for pod %s", podUID)
-	}
-	return sl.attachListener(ln)
-}
-
 // ServeConn admits an already-connected stream (such as a kernel socketpair
-// brokered for an unprivileged HostTun userspace stack worker) directly into
-// podUID's tunnel pipeline so it shares upstream auth, limits, metrics, and Revoke
-// without requiring filesystem access to egress.sock.
+// brokered for kube-netstack) directly into podUID's tunnel pipeline so it
+// shares upstream auth, limits, metrics, and Revoke without requiring
+// filesystem access to egress.sock.
 func (m *Manager) ServeConn(podUID types.UID, conn net.Conn) error {
 	if conn == nil {
 		return errors.New("connection is required")
@@ -401,21 +359,6 @@ func (m *Manager) ServeConn(podUID types.UID, conn net.Conn) error {
 		return fmt.Errorf("sandbox listener for pod %s rejected connection", podUID)
 	}
 	return nil
-}
-
-// HasExtraListener reports whether podUID already has an active attached listener
-// (for example, a live socketat Pod-loopback listener that survived a container
-// runtime restart and NRI reconnect in the same dra-agents-net process).
-func (m *Manager) HasExtraListener(podUID types.UID) bool {
-	m.mu.Lock()
-	sl := m.listeners[podUID]
-	m.mu.Unlock()
-	if sl == nil {
-		return false
-	}
-	sl.mu.RLock()
-	defer sl.mu.RUnlock()
-	return !sl.stopped && !sl.revoked && len(sl.extraListeners) > 0
 }
 
 // UpdateIdentity refreshes the attested Pod/Sandbox/Claim metadata for podUID.
@@ -440,21 +383,9 @@ func (m *Manager) Revoke(podUID types.UID) {
 	}
 }
 
-// DetachExtraListeners closes any sandbox-scoped attached listeners (such as socketat
-// loopback listeners) while keeping the DRA-owned egress.sock listener intact for
-// potential PodSandbox recreation or final UnprepareResourceClaims.
-func (m *Manager) DetachExtraListeners(podUID types.UID) {
-	m.mu.Lock()
-	sl := m.listeners[podUID]
-	m.mu.Unlock()
-	if sl != nil {
-		sl.detachExtraListeners()
-	}
-}
-
-// Rearm clears a prior StopPodSandbox revocation, closes any stale attached listeners
-// from a previous sandbox instance, and arms a fresh revocation context for a newly
-// created PodSandbox sharing the same Pod UID and DRA ResourceClaim.
+// Rearm clears a prior StopPodSandbox revocation and arms a fresh revocation
+// context for a newly created PodSandbox sharing the same Pod UID and DRA
+// ResourceClaim.
 func (m *Manager) Rearm(podUID types.UID) {
 	m.mu.Lock()
 	sl := m.listeners[podUID]
@@ -543,42 +474,17 @@ type sandboxListener struct {
 	maxConns    int
 	idleTimeout time.Duration
 
-	mu             sync.RWMutex
-	revokeCtx      context.Context
-	revokeCancel   context.CancelFunc
-	identity       auth.WorkloadIdentity
-	identityGen    uint64
-	revoked        bool
-	stopped        bool
-	extraListeners []net.Listener
-	active         map[net.Conn]func()
+	mu           sync.RWMutex
+	revokeCtx    context.Context
+	revokeCancel context.CancelFunc
+	identity     auth.WorkloadIdentity
+	identityGen  uint64
+	revoked      bool
+	stopped      bool
+	active       map[net.Conn]func()
 
 	stopOnce sync.Once
 	wg       sync.WaitGroup
-}
-
-func (l *sandboxListener) attachListener(ln net.Listener) error {
-	l.mu.Lock()
-	if l.stopped || l.revoked {
-		l.mu.Unlock()
-		_ = ln.Close()
-		return errors.New("sandbox listener is already revoked or stopped")
-	}
-	l.extraListeners = append(l.extraListeners, ln)
-	// Start the accept loop while holding l.mu so wg.Add(1) happens-before stop()'s wg.Wait().
-	l.wg.Go(func() { l.acceptLoop(ln) })
-	l.mu.Unlock()
-	return nil
-}
-
-func (l *sandboxListener) detachExtraListeners() {
-	l.mu.Lock()
-	extras := append([]net.Listener(nil), l.extraListeners...)
-	l.extraListeners = nil
-	l.mu.Unlock()
-	for _, eln := range extras {
-		_ = eln.Close()
-	}
 }
 
 func (l *sandboxListener) rearm() {
@@ -587,8 +493,6 @@ func (l *sandboxListener) rearm() {
 		l.mu.Unlock()
 		return
 	}
-	extras := append([]net.Listener(nil), l.extraListeners...)
-	l.extraListeners = nil
 	oldCancel := l.revokeCancel
 	closers := make([]func(), 0, len(l.active))
 	for conn, closeFn := range l.active {
@@ -600,9 +504,6 @@ func (l *sandboxListener) rearm() {
 	l.mu.Unlock()
 
 	oldCancel()
-	for _, eln := range extras {
-		_ = eln.Close()
-	}
 	for _, fn := range closers {
 		fn()
 	}
@@ -645,15 +546,10 @@ func (l *sandboxListener) stop() {
 	l.stopOnce.Do(func() {
 		l.mu.Lock()
 		l.stopped = true
-		extras := append([]net.Listener(nil), l.extraListeners...)
-		l.extraListeners = nil
 		l.mu.Unlock()
 
 		l.revoke()
 		_ = l.ln.Close()
-		for _, eln := range extras {
-			_ = eln.Close()
-		}
 		l.wg.Wait()
 		if l.dnsDialer != nil && l.dnsDialer != l.dialer {
 			_ = l.dnsDialer.Close()

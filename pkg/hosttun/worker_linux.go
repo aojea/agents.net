@@ -33,6 +33,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"k8s.io/klog/v2"
 
@@ -395,7 +396,15 @@ func (w *builtinWorker) addPod(req ControlRequest, tunFD, brokerFD int) error {
 			return fmt.Errorf("create gvisor tun endpoint: %w", err)
 		}
 	case LinkModeTAP:
-		dev, err = tun2connect.NewTAPDevice(tunFD, uint32(mtu), "")
+		var linkAddr tcpip.LinkAddress
+		if req.MAC != "" {
+			hw, merr := net.ParseMAC(req.MAC)
+			if merr != nil {
+				return fmt.Errorf("invalid tap MAC %q: %w", req.MAC, merr)
+			}
+			linkAddr = tcpip.LinkAddress(hw)
+		}
+		dev, err = tun2connect.NewTAPDevice(tunFD, uint32(mtu), linkAddr)
 		if err != nil {
 			return fmt.Errorf("create gvisor tap endpoint: %w", err)
 		}

@@ -51,7 +51,6 @@ func TestBoltStoreCheckpointAndReload(t *testing.T) {
 		ShareID:        "11111111-1111-1111-1111-111111111111",
 		Parameters: params.NetworkParameters{
 			ConfinementMode: apis.ConfinementModePodNetworkIsolated,
-			AdapterMode:     apis.AdapterModeTunSidecar,
 			PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
 				URL: "https://portal.sandbox-system.svc:8443",
 			},
@@ -68,6 +67,9 @@ func TestBoltStoreCheckpointAndReload(t *testing.T) {
 	}
 	if err := s1.UpdateNetNS(podUID, "/var/run/netns/cni-1", time.Now().UTC()); err != nil {
 		t.Fatalf("UpdateNetNS: %v", err)
+	}
+	if err := s1.UpdateGuestIP(podUID, "10.244.0.8"); err != nil {
+		t.Fatalf("UpdateGuestIP: %v", err)
 	}
 	if err := s1.UpdateIdentity(podUID, "sb-1", "agents", "coding-sa"); err != nil {
 		t.Fatalf("UpdateIdentity: %v", err)
@@ -90,8 +92,8 @@ func TestBoltStoreCheckpointAndReload(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected pod %s after reload", podUID)
 	}
-	if got.ServiceAccount != "coding-sa" || got.ShareID != "11111111-1111-1111-1111-111111111111" {
-		t.Fatalf("identity/shareID lost after reload: %+v", got)
+	if got.ServiceAccount != "coding-sa" || got.ShareID != "11111111-1111-1111-1111-111111111111" || got.GuestIP != "10.244.0.8" {
+		t.Fatalf("identity/shareID/guestIP lost after reload: %+v", got)
 	}
 	if got.Parameters.PolicyEnforcementPoint == nil || got.Parameters.PolicyEnforcementPoint.URL != "https://portal.sandbox-system.svc:8443" {
 		t.Fatalf("policyEnforcementPoint lost after reload: %+v", got.Parameters.PolicyEnforcementPoint)

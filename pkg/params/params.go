@@ -55,11 +55,9 @@ type NetworkParameters struct {
 	metav1.TypeMeta        `json:",inline"`
 	ConfinementMode        apis.ConfinementMode               `json:"confinementMode,omitempty"`
 	NICBlockMode           apis.NICBlockMode                  `json:"nicBlockMode,omitempty"`
-	AdapterMode            apis.AdapterMode                   `json:"adapterMode,omitempty"`
 	PolicyEnforcementPoint *apis.PolicyEnforcementPointConfig `json:"policyEnforcementPoint,omitempty"`
 	DNS                    *apis.DNSConfig                    `json:"dns,omitempty"`
 	CATrust                *apis.CATrustConfig                `json:"caTrust,omitempty"`
-	Proxy                  *apis.ExplicitProxyConfig          `json:"proxy,omitempty"`
 	IngressPorts           []apis.IngressPort                 `json:"ingressPorts,omitempty"`
 	PodCertVolumeName      string                             `json:"podCertVolumeName,omitempty"`
 	MaxConnections         *int32                             `json:"maxConnections,omitempty"`
@@ -69,28 +67,12 @@ type NetworkParameters struct {
 	Custom map[string]string `json:"custom,omitempty"`
 }
 
-// EffectiveAdapterMode returns the configured AdapterMode or the default (HostTun).
-func (p NetworkParameters) EffectiveAdapterMode() apis.AdapterMode {
-	if p.AdapterMode != "" {
-		return p.AdapterMode
-	}
-	return apis.AdapterModeHostTun
-}
-
 // EffectiveNICBlockMode returns the configured NICBlockMode or the default (DropAll).
 func (p NetworkParameters) EffectiveNICBlockMode() apis.NICBlockMode {
 	if p.NICBlockMode != "" {
 		return p.NICBlockMode
 	}
 	return apis.NICBlockModeDropAll
-}
-
-// EffectiveProxyPort returns the configured ExplicitProxy loopback port or the default (15001).
-func (p NetworkParameters) EffectiveProxyPort() int32 {
-	if p.Proxy != nil && p.Proxy.Port != nil && *p.Proxy.Port > 0 {
-		return *p.Proxy.Port
-	}
-	return apis.DefaultProxyPort
 }
 
 // EffectiveDNSMode returns the configured HostTun DNS mode or the default (Synthetic).
@@ -123,7 +105,6 @@ func Defaults() NetworkParameters {
 	return NetworkParameters{
 		ConfinementMode:    apis.ConfinementModePodNetworkIsolated,
 		NICBlockMode:       apis.NICBlockModeDropAll,
-		AdapterMode:        apis.AdapterModeHostTun,
 		MaxConnections:     new(DefaultMaxConnections),
 		IdleTimeoutSeconds: new(DefaultIdleTimeoutSeconds),
 	}
@@ -138,7 +119,7 @@ func Decode(configs []resourceapi.DeviceAllocationConfiguration, driverName stri
 // DecodeForRequest merges OpaqueDeviceConfiguration entries matching driverName and
 // requestName (when non-empty), applying DeviceClass (FromClass) entries strictly
 // before ResourceClaim (FromClaim) entries. Security-sensitive fields (confinementMode,
-// nicBlockMode, adapterMode, policyEnforcementPoint, podCertVolumeName, custom attributes,
+// nicBlockMode, dns, policyEnforcementPoint, podCertVolumeName, custom attributes,
 // HostPath CA sources, and resource limits) are restricted strictly to DeviceClass.
 func DecodeForRequest(configs []resourceapi.DeviceAllocationConfiguration, driverName, requestName string) (NetworkParameters, error) {
 	out := Defaults()
@@ -221,9 +202,6 @@ func validateClaimLayer(layer *NetworkParameters) error {
 	if layer.NICBlockMode != "" {
 		return fmt.Errorf("nicBlockMode is restricted to DeviceClass configuration")
 	}
-	if layer.AdapterMode != "" {
-		return fmt.Errorf("adapterMode is restricted to DeviceClass configuration")
-	}
 	if layer.PolicyEnforcementPoint != nil {
 		return fmt.Errorf("policyEnforcementPoint is restricted to DeviceClass configuration")
 	}
@@ -261,11 +239,6 @@ func (p NetworkParameters) Validate() error {
 	default:
 		return fmt.Errorf("invalid nicBlockMode %q", p.NICBlockMode)
 	}
-	switch p.AdapterMode {
-	case "", apis.AdapterModeHostTun, apis.AdapterModeExplicitProxy, apis.AdapterModeTunSidecar:
-	default:
-		return fmt.Errorf("invalid adapterMode %q", p.AdapterMode)
-	}
 	if p.PolicyEnforcementPoint != nil {
 		if err := validatePEP(p.PolicyEnforcementPoint); err != nil {
 			return err
@@ -291,16 +264,6 @@ func (p NetworkParameters) Validate() error {
 	}
 	if p.IdleTimeoutSeconds != nil && (*p.IdleTimeoutSeconds < 1 || *p.IdleTimeoutSeconds > MaxIdleTimeoutSeconds) {
 		return fmt.Errorf("idleTimeoutSeconds %d out of range [1, %d]", *p.IdleTimeoutSeconds, MaxIdleTimeoutSeconds)
-	}
-	if p.Proxy != nil {
-		if p.Proxy.Port != nil && (*p.Proxy.Port < 1 || *p.Proxy.Port > 65535) {
-			return fmt.Errorf("proxy.port %d out of range [1, 65535]", *p.Proxy.Port)
-		}
-		for _, entry := range p.Proxy.NoProxy {
-			if strings.ContainsAny(entry, " \t\r\n\"'|") {
-				return fmt.Errorf("invalid proxy.noProxy entry %q: contains forbidden characters", entry)
-			}
-		}
 	}
 	if p.PodCertVolumeName != "" && !isDNS1123Label(p.PodCertVolumeName) {
 		return fmt.Errorf("invalid podCertVolumeName %q: must be a DNS-1123 label", p.PodCertVolumeName)
@@ -394,9 +357,6 @@ func Merge(dst, src *NetworkParameters) {
 	if src.NICBlockMode != "" {
 		dst.NICBlockMode = src.NICBlockMode
 	}
-	if src.AdapterMode != "" {
-		dst.AdapterMode = src.AdapterMode
-	}
 	if src.PolicyEnforcementPoint != nil {
 		dst.PolicyEnforcementPoint = mergePEP(dst.PolicyEnforcementPoint, src.PolicyEnforcementPoint)
 	}
@@ -405,9 +365,6 @@ func Merge(dst, src *NetworkParameters) {
 	}
 	if src.CATrust != nil {
 		dst.CATrust = mergeCATrust(dst.CATrust, src.CATrust)
-	}
-	if src.Proxy != nil {
-		dst.Proxy = mergeProxy(dst.Proxy, src.Proxy)
 	}
 	if len(src.IngressPorts) > 0 {
 		dst.IngressPorts = slices.Clone(src.IngressPorts)
@@ -444,20 +401,6 @@ func mergeCATrust(base, overlay *apis.CATrustConfig) *apis.CATrustConfig {
 		for i := range overlay.Sources {
 			out.Sources = append(out.Sources, *overlay.Sources[i].DeepCopy())
 		}
-	}
-	return out
-}
-
-func mergeProxy(base, overlay *apis.ExplicitProxyConfig) *apis.ExplicitProxyConfig {
-	if base == nil {
-		return overlay.DeepCopy()
-	}
-	out := base.DeepCopy()
-	if overlay.Port != nil {
-		out.Port = new(*overlay.Port)
-	}
-	if len(overlay.NoProxy) > 0 {
-		out.NoProxy = append(out.NoProxy, overlay.NoProxy...)
 	}
 	return out
 }

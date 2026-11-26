@@ -142,6 +142,7 @@ func (m *Manager) Attach(cfg AttachConfig) (io.Closer, error) {
 		EnableUDP:      cfg.EnableUDP,
 		DNSMode:        cfg.DNSMode,
 		LinkMode:       cfg.LinkMode,
+		MAC:            cfg.MAC,
 		Addresses:      cfg.Addresses,
 	}
 	sendErr := wp.call(req, tunFD, int(brokerWorker.Fd()))
@@ -514,6 +515,7 @@ func (m *Manager) recoverPod(ap *attachedPod, crashed *workerProcess) error {
 		EnableUDP:      ap.cfg.EnableUDP,
 		DNSMode:        ap.cfg.DNSMode,
 		LinkMode:       ap.cfg.LinkMode,
+		MAC:            ap.cfg.MAC,
 		Addresses:      ap.cfg.Addresses,
 	}
 	sendErr := newWP.call(req, tunFD, int(brokerWorker.Fd()))

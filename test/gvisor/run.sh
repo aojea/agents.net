@@ -14,20 +14,18 @@
 # limitations under the License.
 #
 # End-to-end Kubernetes test for gVisor (runsc) sandboxes with kube-net-driver,
-# kube-pep (mTLS HTTP/2 CONNECT + connect-udp + RFC 8484 DoH), and kube-inbound.
+# kube-netstack (L2 isolated veth capture), kube-pep (mTLS HTTP/2 CONNECT +
+# connect-udp + RFC 8484 DoH), and kube-inbound.
 #
-# Because containerd invokes NRI RunPodSandbox after CRI RunPodSandbox starts the
-# gVisor Sentry (which snapshots Pod netns interfaces at startup and owns an
-# internal 127.0.0.1 loopback), this suite validates the production gVisor model
-# available on stock Kubernetes today:
-#   - RuntimeClass: gvisor (runsc with --host-uds=all and --platform=systrap)
-#   - Confinement: eth0 routes flushed + tc clsact DROP (no direct egress)
-#   - Outbound: host-UDS egress.sock -> kube-net-driver -> mandatory mTLS HTTP/2
-#     -> kube-pep (TCP CONNECT allow/deny, RFC 9298 connect-udp, RFC 8484 DoH
-#     NOERROR + NXDOMAIN)
+# Validates unmodified applications inside gVisor Sentry with zero HTTP_PROXY,
+# zero --host-uds, and zero sidecars:
+#   - RuntimeClass: gvisor (runsc with --platform=systrap only)
+#   - Confinement: host veth peer moved into an isolated empty netns (no host route)
+#   - Outbound: unmodified DNS/TCP/UDP -> eth0 -> AF_PACKET -> kube-netstack
+#     -> kube-net-driver -> mandatory mTLS HTTP/2 -> kube-pep
 #   - Inbound: kube-inbound watches ResourceClaim.status -> mandatory mTLS
-#     CONNECT <podUID>:8080 -> kube-net-driver -> host-UDS ingress.sock ->
-#     server inside gVisor Sentry (plus unpinned port 403 & post-delete 404).
+#     CONNECT <podUID>:8080 -> kube-net-driver -> kube-netstack DialInbound
+#     -> eth0 -> standard HTTP server inside gVisor Sentry.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -133,7 +131,6 @@ if [ -d /usr/local/bin/gvisor-bin ]; then
 fi
 cat > /etc/containerd/runsc.toml <<EOF
 [runsc_config]
-  host-uds = "all"
   platform = "systrap"
 EOF
 systemctl restart containerd
@@ -548,7 +545,6 @@ spec:
           kind: DriverConfig
           confinementMode: NetworkPolicyDenyAll
           nicBlockMode: DropAll
-          adapterMode: ExplicitProxy
           dns:
             mode: DoH
           policyEnforcementPoint:
@@ -620,55 +616,20 @@ spec:
         - python3
         - -c
         - |
-          import os, socket, threading
+          import http.server
 
-          # Serve agents.net ingress.sock over host-UDS inside gVisor Sentry:
-          # accepts "CONNECT 127.0.0.1:8080 HTTP/1.1" from kube-net-driver and
-          # responds directly over the established stream.
-          sock_path = os.environ["AGENTS_NET_INGRESS_SOCKET"]
-          if os.path.exists(sock_path):
-              os.unlink(sock_path)
-          srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-          srv.bind(sock_path)
-          os.chmod(sock_path, 0o666)
-          srv.listen(32)
+          class H(http.server.BaseHTTPRequestHandler):
+              def do_GET(self):
+                  body = f"gvisor-ingress-ok:{self.path}".encode()
+                  self.send_response(200)
+                  self.send_header("Content-Type", "text/plain")
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+              def log_message(self, *args):
+                  pass
 
-          def handle(conn):
-              try:
-                  buf = b""
-                  while b"\r\n\r\n" not in buf:
-                      chunk = conn.recv(4096)
-                      if not chunk:
-                          return
-                      buf += chunk
-                  head, rest = buf.split(b"\r\n\r\n", 1)
-                  first = head.decode().splitlines()[0]
-                  if not first.startswith("CONNECT 127.0.0.1:8080 "):
-                      conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
-                      return
-                  conn.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                  req = rest
-                  while b"\r\n\r\n" not in req:
-                      chunk = conn.recv(4096)
-                      if not chunk:
-                          return
-                      req += chunk
-                  req_line = req.decode(errors="replace").splitlines()[0]
-                  path = req_line.split(" ")[1] if len(req_line.split(" ")) >= 2 else "/"
-                  body = f"gvisor-ingress-ok:{path}".encode()
-                  resp = (
-                      b"HTTP/1.1 200 OK\r\n"
-                      b"Content-Type: text/plain\r\n"
-                      + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode()
-                      + body
-                  )
-                  conn.sendall(resp)
-              finally:
-                  conn.close()
-
-          while True:
-              c, _ = srv.accept()
-              threading.Thread(target=handle, args=(c,), daemon=True).start()
+          http.server.ThreadingHTTPServer(("0.0.0.0", 8080), H).serve_forever()
       resources:
         claims:
           - name: agents-net
@@ -680,129 +641,72 @@ EOF
 
 k -n "${NS}" wait --for=condition=Ready pod/gvisor-agent --timeout=120s
 
-echo "=== 9. Verify gVisor kernel, confinement, outbound TCP/UDP/DoH over host-UDS ==="
+echo "=== 9. Verify gVisor kernel, confinement, and transparent DNS/TCP/UDP via kube-netstack ==="
 k -n "${NS}" exec -i gvisor-agent -- env NS="${NS}" ECHO_IP="${ECHO_IP}" python3 - <<'PY'
-import json, os, socket, ssl, struct
+import ipaddress, os, socket, urllib.request
 
 ns = os.environ["NS"]
 echo_ip = os.environ["ECHO_IP"]
-echo_host = f"echo.{ns}.svc.cluster.local"
-egress_sock = os.environ["AGENTS_NET_EGRESS_SOCKET"]
-ingress_sock = os.environ["AGENTS_NET_INGRESS_SOCKET"]
+echo_fqdn = f"echo.{ns}.svc.cluster.local"
+pool = ipaddress.ip_network("198.18.0.0/15")
 
-# 1. Confirm we are actually running inside gVisor Sentry.
+# 1. Confirm gVisor Sentry kernel, zero proxy env vars, and DoH resolv.conf.
 with open("/proc/version") as f:
     ver = f.read().strip()
 print("Pod /proc/version:", ver)
 assert "gvisor" in ver.lower(), f"expected gVisor Sentry kernel, got: {ver}"
-assert os.path.exists(egress_sock), f"missing {egress_sock}"
-assert os.path.exists(ingress_sock), f"missing {ingress_sock}"
+for var in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "AGENTS_NET_EGRESS_SOCKET", "AGENTS_NET_INGRESS_SOCKET"):
+    assert not os.environ.get(var), f"unexpected env var {var}={os.environ.get(var)!r}"
+with open("/etc/resolv.conf") as f:
+    resolv = f.read()
+assert "nameserver 198.19.255.253" in resolv, f"unexpected resolv.conf:\n{resolv}"
+assert f"search {ns}.svc.cluster.local" in resolv, f"missing search domain in resolv.conf:\n{resolv}"
+print("PASS gVisor Sentry verified with zero proxy env vars and DoH resolv.conf")
 
-# 2. Direct TCP to echo ClusterIP must fail closed (eth0 blocked in Pod netns).
+# 2. Direct TCP to echo ClusterIP must fail closed (host veth isolated; kube-pep rejects literal IP).
 try:
-    s = socket.create_connection((echo_ip, 8443), timeout=2)
+    s = socket.create_connection((echo_ip, 8443), timeout=3)
     s.close()
     raise SystemExit("FAIL: direct TCP to echo ClusterIP succeeded from gVisor Pod")
 except OSError as e:
-    print("PASS direct TCP from gVisor Pod blocked:", e)
+    print("PASS direct TCP to echo ClusterIP blocked:", e)
 
-def dial_egress():
-    u = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    u.settimeout(10)
-    u.connect(egress_sock)
-    return u
+# 3. Short Kubernetes Service name resolves through search list + DoH into synthetic pool.
+resolved_ip = socket.gethostbyname("echo")
+assert ipaddress.ip_address(resolved_ip) in pool, f"expected synthetic IP in {pool}, got {resolved_ip}"
+print(f"PASS gVisor DoH resolved short name 'echo' -> {resolved_ip}")
 
-def read_http_head(s):
-    buf = b""
-    while b"\r\n\r\n" not in buf:
-        chunk = s.recv(4096)
-        if not chunk:
-            break
-        buf += chunk
-    head, rest = buf.split(b"\r\n\r\n", 1)
-    return head.decode(), rest
+# 4. Non-existent domain returns real NXDOMAIN from kube-pep.
+try:
+    bad = socket.gethostbyname("doesnotexist.example")
+    raise SystemExit(f"FAIL: doesnotexist.example resolved to {bad}")
+except socket.gaierror as e:
+    print("PASS gVisor DoH returned NXDOMAIN for doesnotexist.example:", e)
 
-# 3. Outbound TCP CONNECT over host-UDS egress.sock -> mTLS H2 -> kube-pep -> echo HTTPS.
-import http.client
-u = dial_egress()
-u.sendall(f"CONNECT {echo_host}:8443 HTTP/1.1\r\nHost: {echo_host}:8443\r\n\r\n".encode())
-head, rest = read_http_head(u)
-assert head.startswith("HTTP/1.1 200"), f"CONNECT allowed failed: {head!r}"
-tls_ctx = ssl.create_default_context(cafile=os.environ["SSL_CERT_FILE"])
-tls_sock = tls_ctx.wrap_socket(u, server_hostname=echo_host)
-tls_sock.sendall(f"GET /gvisor-tcp HTTP/1.1\r\nHost: {echo_host}\r\nConnection: close\r\n\r\n".encode())
-hresp = http.client.HTTPResponse(tls_sock)
-hresp.begin()
-body = hresp.read()
-tls_sock.close()
-assert hresp.status == 200 and b'"/gvisor-tcp"' in body, (hresp.status, body)
-print("PASS gVisor outbound TCP CONNECT via host-UDS -> kube-pep succeeded")
+# 5. Unmodified HTTPS client connects via echo FQDN -> kube-netstack -> mTLS H2 -> kube-pep.
+with urllib.request.urlopen(f"https://{echo_fqdn}:8443/gvisor-tcp", timeout=10) as resp:
+    body = resp.read()
+    assert resp.status == 200 and b'"/gvisor-tcp"' in body, (resp.status, body)
+print("PASS gVisor unmodified HTTPS client reached echo via kube-netstack -> kube-pep")
 
-# 4. Denied TCP host fails closed with 403 at kube-pep.
-u = dial_egress()
-u.sendall(b"CONNECT blocked.example:443 HTTP/1.1\r\nHost: blocked.example:443\r\n\r\n")
-head, _ = read_http_head(u)
+# 6. Denied host fails closed at kube-pep.
+try:
+    socket.create_connection(("blocked.example", 443), timeout=3)
+    raise SystemExit("FAIL: blocked.example unexpectedly connected")
+except OSError as e:
+    print("PASS gVisor blocked.example denied:", e)
+
+# 7. Unmodified UDP socket reaches echo:8444 via connect-udp.
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.settimeout(5)
+u.sendto(b"gvisor-udp-ok", (echo_fqdn, 8444))
+data, _ = u.recvfrom(4096)
 u.close()
-assert head.startswith("HTTP/1.1 403"), f"expected 403 for blocked.example, got: {head!r}"
-print("PASS gVisor outbound denied host rejected:", head.splitlines()[0])
-
-# 5. Outbound UDP (RFC 9298 connect-udp) over host-UDS egress.sock -> mTLS H2 -> kube-pep.
-def encode_varint(n):
-    if n < 64:
-        return bytes([n])
-    raise ValueError(n)
-
-u = dial_egress()
-u.sendall(
-    f"GET /.well-known/masque/udp/{echo_host}/8444/ HTTP/1.1\r\n"
-    f"Host: boundary\r\nConnection: Upgrade\r\nUpgrade: connect-udp\r\nCapsule-Protocol: ?1\r\n\r\n".encode()
-)
-head, rest = read_http_head(u)
-assert head.startswith("HTTP/1.1 101"), f"connect-udp upgrade failed: {head!r}"
-payload = b"gvisor-udp-ok"
-# Capsule: type=0 (DATAGRAM), length=1+len(payload), context_id=0, payload
-capsule = encode_varint(0) + encode_varint(1 + len(payload)) + encode_varint(0) + payload
-u.sendall(capsule)
-data = rest
-while len(data) < len(capsule):
-    chunk = u.recv(4096)
-    if not chunk:
-        break
-    data += chunk
-u.close()
-assert data[:len(capsule)] == capsule, f"UDP capsule echo mismatch: {data!r} != {capsule!r}"
-print("PASS gVisor outbound UDP connect-udp via host-UDS -> kube-pep echoed:", payload.decode())
-
-# 6. Outbound RFC 8484 DoH over host-UDS egress.sock -> mTLS H2 -> kube-pep (NOERROR + NXDOMAIN).
-def build_dns_query(name):
-    labels = b"".join(bytes([len(p)]) + p.encode() for p in name.strip(".").split(".")) + b"\x00"
-    return struct.pack("!HHHHHH", 0x1234, 0x0100, 1, 0, 0, 0) + labels + struct.pack("!HH", 1, 1)
-
-def doh_query(name):
-    wire = build_dns_query(name)
-    u = dial_egress()
-    req = (
-        f"POST /dns-query HTTP/1.1\r\nHost: boundary\r\n"
-        f"Content-Type: application/dns-message\r\nAccept: application/dns-message\r\n"
-        f"Content-Length: {len(wire)}\r\nConnection: close\r\n\r\n"
-    ).encode() + wire
-    u.sendall(req)
-    hresp = http.client.HTTPResponse(u)
-    hresp.begin()
-    body = hresp.read()
-    u.close()
-    assert hresp.status == 200, f"DoH failed for {name}: {hresp.status}"
-    flags = struct.unpack("!H", body[2:4])[0]
-    return flags & 0x000F
-
-rcode_ok = doh_query(echo_host)
-assert rcode_ok == 0, f"DoH {echo_host} rcode={rcode_ok}, want 0 (NOERROR)"
-rcode_nx = doh_query("doesnotexist.example")
-assert rcode_nx == 3, f"DoH doesnotexist.example rcode={rcode_nx}, want 3 (NXDOMAIN)"
-print("PASS gVisor outbound RFC 8484 DoH returned NOERROR for echo and real NXDOMAIN for doesnotexist.example")
+assert data == b"gvisor-udp-ok", f"UDP echo mismatch: {data!r}"
+print("PASS gVisor unmodified UDP socket echoed payload via kube-netstack -> kube-pep")
 PY
 
-echo "=== 10. Verify IP-less inbound via kube-inbound -> mTLS CONNECT -> host-UDS ingress.sock inside gVisor ==="
+echo "=== 10. Verify IP-less inbound via kube-inbound -> mTLS CONNECT -> kube-netstack DialInbound -> gVisor ==="
 cat <<EOF | k apply -f -
 apiVersion: v1
 kind: Pod
@@ -830,7 +734,7 @@ for _ in range(25):
         with urllib.request.urlopen(url, timeout=5) as resp:
             body = resp.read().decode()
             assert resp.status == 200 and body == "gvisor-ingress-ok:/hello-gvisor", (resp.status, body)
-            print("PASS kube-inbound -> mTLS CONNECT -> gVisor host-UDS ingress.sock:", body)
+            print("PASS kube-inbound -> mTLS CONNECT -> kube-netstack DialInbound -> gVisor:", body)
             last_err = None
             break
     except Exception as e:
@@ -850,14 +754,16 @@ PY
 
 echo "=== 11. Verify kube-pep JSONL audit log for gVisor TCP, UDP, and DoH flows ==="
 PEP_LOGS="$(k -n "${NS}" logs deploy/kube-pep)"
-python3 - "${PEP_LOGS}" <<'PY'
+python3 - "${PEP_LOGS}" "${ECHO_IP}" <<'PY'
 import json, sys
+echo_ip = sys.argv[2]
 records = [json.loads(l) for l in sys.argv[1].splitlines() if l.strip().startswith("{")]
 assert any(r.get("decision") == "allow" and r.get("transport") == "tcp" and r.get("wire") == "h2" and r.get("peer") == "kube-net-driver-gvisor-client" for r in records), records
 assert any(r.get("decision") == "allow" and r.get("transport") == "udp" and r.get("wire") == "h2" and r.get("peer") == "kube-net-driver-gvisor-client" for r in records), records
 assert any(r.get("decision") == "allow" and r.get("transport") == "dns" and r.get("wire") == "h2" and r.get("peer") == "kube-net-driver-gvisor-client" for r in records), records
 assert any(r.get("decision") == "block" and r.get("transport") == "dns" and r.get("destination") == "doesnotexist.example" for r in records), records
-assert any(r.get("decision") == "block" and r.get("destination") == "blocked.example:443" for r in records), records
+assert any(r.get("decision") == "block" and r.get("transport") == "dns" and r.get("destination") == "blocked.example" for r in records), records
+assert any(r.get("decision") == "block" and r.get("transport") == "tcp" and echo_ip in r.get("destination", "") for r in records), records
 print("PASS kube-pep JSONL audit verified gVisor mTLS H2 TCP, UDP, and DoH allow/block records")
 PY
 

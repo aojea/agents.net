@@ -66,7 +66,6 @@ import (
 	"github.com/aojea/agents.net/pkg/hosttun"
 	"github.com/aojea/agents.net/pkg/metrics"
 	"github.com/aojea/agents.net/pkg/params"
-	"github.com/aojea/agents.net/pkg/proxyenv"
 	"github.com/aojea/agents.net/pkg/store"
 	"github.com/aojea/agents.net/pkg/tun2connect"
 	"github.com/aojea/agents.net/pkg/tunnel"
@@ -85,12 +84,7 @@ const (
 	// node status.allocatable.pods cannot be read and --max-sandboxes is unset.
 	DefaultMaxSandboxes int64 = 110
 
-	// Tun2ConnectContainerName is the name of the single per-Pod tun2connect native sidecar.
-	Tun2ConnectContainerName = apis.Tun2ConnectSidecarName
-
-	containerEgressMountDir  = "/run/agents.net"
-	containerIngressMountDir = "/run/agents.net/ingress"
-	containerResolvConfPath  = "/etc/resolv.conf"
+	containerResolvConfPath = "/etc/resolv.conf"
 
 	// maxNRIAttempts caps consecutive NRI connection failures before exiting.
 	// The containerd/nri v0.12.5 stub cannot reconnect after a failed registration.
@@ -114,11 +108,15 @@ const (
 	eventReasonPrepareFailed   = "AgentsNetPrepareFailed"
 )
 
-// HostTunRequest describes a sandbox Pod whose persistent tun0 device is
-// attached to an unprivileged host-side userspace stack worker.
+// HostTunRequest describes a sandbox Pod attached to kube-netstack, either via
+// an L3 persistent tun0 device (standard containers) or an L2 isolated veth
+// peer (gVisor runsc).
 type HostTunRequest struct {
 	PodUID            types.UID
 	NetNSPath         string
+	RuntimeHandler    string
+	PodIPs            []string
+	PodRootDir        string
 	EgressSocketPath  string
 	ServeEgress       func(net.Conn) error
 	MaxConnections    int
@@ -127,22 +125,21 @@ type HostTunRequest struct {
 }
 
 // NetNSManager abstracts Pod network namespace inspection, route flushing,
-// tc clsact NIC blocking, cross-netns listener binding (socketat), and
-// host-side TUN injection (HostTun).
+// tc clsact NIC blocking, and host-side kube-netstack attachment.
 type NetNSManager interface {
 	VerifyLoopbackOnly(netnsPath string, allowTunTap bool) error
 	FlushNonLoopbackRoutes(netnsPath string) error
 	HasNonLoopbackRoutes(netnsPath string) (bool, error)
 	BlockNonLoopbackNICs(netnsPath string, allowTunTap bool) error
 	VerifyNonLoopbackNICsBlocked(netnsPath string, allowTunTap bool) (bool, error)
-	ListenAt(netnsPath, network, address string) (net.Listener, error)
-	StartHostTun(req HostTunRequest) (io.Closer, error)
-	CleanupHostTun(netnsPath string) error
+	StartHostTun(req HostTunRequest) (closer io.Closer, guestIP string, err error)
+	CleanupHostTun(netnsPath, podRootDir string) error
 }
 
 type hostTunEntry struct {
-	closer io.Closer
-	netns  string
+	closer     io.Closer
+	netns      string
+	podRootDir string
 }
 
 // IngressRevoker revokes and re-allows host ingress connections across a Pod's lifecycle.
@@ -183,8 +180,8 @@ type Config struct {
 }
 
 // Driver combines a DRA kubeletplugin.DRAPlugin (slow path), an NRI runtime
-// plugin (fast path, zero CDI files), socketat Pod-loopback listeners for ExplicitProxy,
-// and a node-scoped core/v1 Pod informer for ServiceAccount and warm-pool claim sync.
+// plugin (fast path, zero CDI files), host-side kube-netstack attachment,
+// and a node-scoped core/v1 Pod informer for ServiceAccount metadata sync.
 type Driver struct {
 	driverName           string
 	nodeName             string
@@ -587,8 +584,12 @@ func (d *Driver) Stop(ctxCancel context.CancelFunc) {
 	klog.InfoS("dra-agents-net driver stopped", "driver", d.driverName)
 }
 
-func usesTunAdapter(mode apis.AdapterMode) bool {
-	return mode == apis.AdapterModeHostTun || mode == apis.AdapterModeTunSidecar
+// isL2VethRuntime reports whether runtimeHandler runs its own userspace network
+// stack over eth0 (such as gVisor runsc), requiring L2 capture on the host veth
+// peer instead of injecting an L3 tun0 device inside the Pod network namespace.
+func isL2VethRuntime(runtimeHandler string) bool {
+	h := strings.ToLower(strings.TrimSpace(runtimeHandler))
+	return h == "runsc" || strings.Contains(h, "gvisor")
 }
 
 func hostTunDNSMode(mode apis.DNSMode) string {
@@ -613,7 +614,7 @@ func writeHostTunResolvConf(podRootDir, podNamespace string, netParams params.Ne
 		b.WriteString("options ndots:5\n")
 	}
 	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
-		return "", fmt.Errorf("write HostTun resolv.conf %q: %w", path, err)
+		return "", fmt.Errorf("write resolv.conf %q: %w", path, err)
 	}
 	return path, nil
 }
@@ -625,12 +626,15 @@ func (d *Driver) hasHostTun(podUID types.UID) bool {
 	return ok
 }
 
-func (d *Driver) startHostTun(podUID types.UID, netnsPath, egressSocketPath string, maxConns int, preserveNICReturn bool, dnsMode apis.DNSMode) error {
-	// Detach any prior host TUN instance for this Pod before re-opening tun0.
+func (d *Driver) startHostTun(podUID types.UID, netnsPath, runtimeHandler string, podIPs []string, podRootDir, egressSocketPath string, maxConns int, preserveNICReturn bool, dnsMode apis.DNSMode) (string, error) {
+	// Detach any prior kube-netstack attachment for this Pod before re-attaching.
 	d.stopHostTun(podUID, false)
-	closer, err := d.netns.StartHostTun(HostTunRequest{
+	closer, guestIP, err := d.netns.StartHostTun(HostTunRequest{
 		PodUID:           podUID,
 		NetNSPath:        netnsPath,
+		RuntimeHandler:   runtimeHandler,
+		PodIPs:           podIPs,
+		PodRootDir:       podRootDir,
 		EgressSocketPath: egressSocketPath,
 		ServeEgress: func(conn net.Conn) error {
 			return d.tunnel.ServeConn(podUID, conn)
@@ -640,7 +644,7 @@ func (d *Driver) startHostTun(podUID types.UID, netnsPath, egressSocketPath stri
 		DNSMode:           hostTunDNSMode(dnsMode),
 	})
 	if err != nil {
-		return err
+		return "", err
 	}
 	d.hostTunMu.Lock()
 	if prev, ok := d.hostTuns[podUID]; ok {
@@ -649,9 +653,9 @@ func (d *Driver) startHostTun(podUID types.UID, netnsPath, egressSocketPath stri
 		_ = prev.closer.Close()
 		d.hostTunMu.Lock()
 	}
-	d.hostTuns[podUID] = hostTunEntry{closer: closer, netns: netnsPath}
+	d.hostTuns[podUID] = hostTunEntry{closer: closer, netns: netnsPath, podRootDir: podRootDir}
 	d.hostTunMu.Unlock()
-	return nil
+	return guestIP, nil
 }
 
 func (d *Driver) stopHostTun(podUID types.UID, deleteDevice bool) {
@@ -661,14 +665,26 @@ func (d *Driver) stopHostTun(podUID types.UID, deleteDevice bool) {
 		delete(d.hostTuns, podUID)
 	}
 	d.hostTunMu.Unlock()
-	if !ok {
-		return
-	}
-	if entry.closer != nil {
+
+	netnsPath := entry.netns
+	podRootDir := entry.podRootDir
+	if ok && entry.closer != nil {
 		_ = entry.closer.Close()
 	}
-	if deleteDevice && entry.netns != "" {
-		_ = d.netns.CleanupHostTun(entry.netns)
+	if deleteDevice {
+		if netnsPath == "" || podRootDir == "" {
+			if cfg, exists := d.store.Get(podUID); exists {
+				if netnsPath == "" {
+					netnsPath = cfg.NetNS
+				}
+				if podRootDir == "" {
+					podRootDir = cfg.SocketPaths.PodRootDir
+				}
+			}
+		}
+		if netnsPath != "" || podRootDir != "" {
+			_ = d.netns.CleanupHostTun(netnsPath, podRootDir)
+		}
 	}
 }
 
@@ -684,8 +700,8 @@ func (d *Driver) stopAllHostTuns(deleteDevice bool) {
 		if entry.closer != nil {
 			_ = entry.closer.Close()
 		}
-		if deleteDevice && entry.netns != "" {
-			_ = d.netns.CleanupHostTun(entry.netns)
+		if deleteDevice && (entry.netns != "" || entry.podRootDir != "") {
+			_ = d.netns.CleanupHostTun(entry.netns, entry.podRootDir)
 		}
 	}
 }
@@ -1000,7 +1016,6 @@ func (d *Driver) prepareResourceClaim(ctx context.Context, claim *resourceapi.Re
 		DNSMode:                netParams.EffectiveDNSMode(),
 		DNSEnforcementPoint:    dnsEP,
 		PodCertVolumeName:      netParams.PodCertVolumeName,
-		HasIngress:             len(netParams.IngressPorts) > 0,
 		MaxConnections:         int(*netParams.MaxConnections),
 		IdleTimeoutSeconds:     int(*netParams.IdleTimeoutSeconds),
 	})
@@ -1008,16 +1023,14 @@ func (d *Driver) prepareResourceClaim(ctx context.Context, claim *resourceapi.Re
 		return kubeletplugin.PrepareResult{Err: fmt.Errorf("start agents.net listener for pod %s: %w", podUID, err)}, metrics.StatusFailed
 	}
 
-	if netParams.EffectiveAdapterMode() == apis.AdapterModeHostTun {
-		resolvPath, err := writeHostTunResolvConf(paths.PodRootDir, claim.Namespace, netParams)
-		if err != nil {
-			if !existed {
-				_ = d.tunnel.Remove(podUID)
-			}
-			return kubeletplugin.PrepareResult{Err: fmt.Errorf("prepare HostTun resolv.conf for pod %s: %w", podUID, err)}, metrics.StatusFailed
+	resolvPath, err := writeHostTunResolvConf(paths.PodRootDir, claim.Namespace, netParams)
+	if err != nil {
+		if !existed {
+			_ = d.tunnel.Remove(podUID)
 		}
-		paths.ResolvConfPath = resolvPath
+		return kubeletplugin.PrepareResult{Err: fmt.Errorf("prepare resolv.conf for pod %s: %w", podUID, err)}, metrics.StatusFailed
 	}
+	paths.ResolvConfPath = resolvPath
 
 	caBundle, err := d.caMat.Materialize(ctx, netParams.CATrust, claim.Namespace, filepath.Join(paths.PodRootDir, "ca"))
 	if err != nil {
@@ -1044,6 +1057,7 @@ func (d *Driver) prepareResourceClaim(ctx context.Context, claim *resourceapi.Re
 		ShareID:         shareID,
 		SandboxID:       existing.SandboxID,
 		NetNS:           existing.NetNS,
+		GuestIP:         existing.GuestIP,
 		Parameters:      netParams,
 		SocketPaths:     paths,
 		CABundle:        caBundle,
@@ -1200,7 +1214,6 @@ func (d *Driver) Synchronize(ctx context.Context, pods []*nriapi.PodSandbox, con
 			DNSMode:                cfg.Parameters.EffectiveDNSMode(),
 			DNSEnforcementPoint:    dnsEP,
 			PodCertVolumeName:      cfg.Parameters.PodCertVolumeName,
-			HasIngress:             len(cfg.Parameters.IngressPorts) > 0,
 			MaxConnections:         maxConns,
 			IdleTimeoutSeconds:     idleSecs,
 		}); err != nil {
@@ -1208,24 +1221,14 @@ func (d *Driver) Synchronize(ctx context.Context, pods []*nriapi.PodSandbox, con
 			continue
 		}
 
-		switch cfg.Parameters.EffectiveAdapterMode() {
-		case apis.AdapterModeHostTun:
-			if ns != "" && !d.hasHostTun(uid) {
-				preserveNICReturn := cfg.Parameters.ConfinementMode == apis.ConfinementModeNetworkPolicyDenyAll &&
-					cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDisabled
-				if err := d.startHostTun(uid, ns, cfg.SocketPaths.EgressSocketPath, maxConns, preserveNICReturn, cfg.Parameters.EffectiveDNSMode()); err != nil {
-					klog.ErrorS(err, "failed to restore HostTun adapter during Synchronize", "podUID", uid)
-				}
-			}
-		case apis.AdapterModeExplicitProxy:
-			if ns != "" && !d.tunnel.HasExtraListener(uid) {
-				addr := fmt.Sprintf("127.0.0.1:%d", cfg.Parameters.EffectiveProxyPort())
-				ln, err := d.netns.ListenAt(ns, "tcp", addr)
-				if err != nil {
-					klog.ErrorS(err, "failed to restore socketat loopback proxy listener during Synchronize", "podUID", uid, "addr", addr)
-				} else if err := d.tunnel.AttachListener(uid, ln); err != nil {
-					klog.ErrorS(err, "failed to attach restored loopback listener", "podUID", uid)
-				}
+		if ns != "" && !d.hasHostTun(uid) {
+			preserveNICReturn := cfg.Parameters.ConfinementMode == apis.ConfinementModeNetworkPolicyDenyAll &&
+				cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDisabled
+			guestIP, err := d.startHostTun(uid, ns, pod.GetRuntimeHandler(), pod.GetIps(), cfg.SocketPaths.PodRootDir, cfg.SocketPaths.EgressSocketPath, maxConns, preserveNICReturn, cfg.Parameters.EffectiveDNSMode())
+			if err != nil {
+				klog.ErrorS(err, "failed to restore kube-netstack attachment during Synchronize", "podUID", uid)
+			} else if guestIP != "" && guestIP != cfg.GuestIP {
+				_ = d.store.UpdateGuestIP(uid, guestIP)
 			}
 		}
 	}
@@ -1260,15 +1263,14 @@ func (d *Driver) reportMissingPlumbing(pod *nriapi.PodSandbox, runningCtrs []*nr
 	ns := getNetworkNamespace(pod)
 	if ns == "" {
 		missing = append(missing, "pod-netns")
-	} else {
+	} else if !isL2VethRuntime(pod.GetRuntimeHandler()) {
 		mode := cfg.Parameters.ConfinementMode
 		if mode == "" {
 			mode = apis.ConfinementModePodNetworkIsolated
 		}
 		switch mode {
 		case apis.ConfinementModePodNetworkIsolated:
-			allowTunTap := usesTunAdapter(cfg.Parameters.EffectiveAdapterMode())
-			if err := d.netns.VerifyLoopbackOnly(ns, allowTunTap); err != nil {
+			if err := d.netns.VerifyLoopbackOnly(ns, true); err != nil {
 				missing = append(missing, "loopback-only-netns")
 			}
 		case apis.ConfinementModeNetworkPolicyDenyAll:
@@ -1280,8 +1282,7 @@ func (d *Driver) reportMissingPlumbing(pod *nriapi.PodSandbox, runningCtrs []*nr
 				} else if hasRoutes {
 					missing = append(missing, "non-loopback-routes-unflushed")
 				}
-				allowTunTap := usesTunAdapter(cfg.Parameters.EffectiveAdapterMode())
-				blocked, err := d.netns.VerifyNonLoopbackNICsBlocked(ns, allowTunTap)
+				blocked, err := d.netns.VerifyNonLoopbackNICsBlocked(ns, true)
 				if err != nil {
 					klog.ErrorS(err, "failed to inspect Pod tc NIC drop filters during Synchronize",
 						"pod", klog.KRef(pod.GetNamespace(), pod.GetName()), "podUID", pod.GetUid())
@@ -1293,33 +1294,11 @@ func (d *Driver) reportMissingPlumbing(pod *nriapi.PodSandbox, runningCtrs []*nr
 	}
 
 	// 2. Verify required NRI container mounts on running containers.
-	switch cfg.Parameters.EffectiveAdapterMode() {
-	case apis.AdapterModeHostTun:
-		if cfg.SocketPaths.ResolvConfPath != "" {
-			for _, ctr := range runningCtrs {
-				if !containerHasMountSource(ctr, containerResolvConfPath, cfg.SocketPaths.ResolvConfPath) {
-					missing = append(missing, "host-tun-resolv-conf")
-					break
-				}
-			}
-		}
-	case apis.AdapterModeExplicitProxy:
+	if cfg.SocketPaths.ResolvConfPath != "" {
 		for _, ctr := range runningCtrs {
-			if !containerHasMount(ctr, containerEgressMountDir) {
-				missing = append(missing, "egress-socket-mount")
+			if !containerHasMountSource(ctr, containerResolvConfPath, cfg.SocketPaths.ResolvConfPath) {
+				missing = append(missing, "host-tun-resolv-conf")
 				break
-			}
-		}
-	case apis.AdapterModeTunSidecar:
-		for _, ctr := range runningCtrs {
-			if ctr.GetName() != Tun2ConnectContainerName {
-				continue
-			}
-			if !containerHasMount(ctr, containerEgressMountDir) {
-				missing = append(missing, "tun2connect-egress-mount")
-			}
-			if len(cfg.Parameters.IngressPorts) > 0 && !containerHasMount(ctr, containerIngressMountDir) {
-				missing = append(missing, "tun2connect-ingress-mount")
 			}
 		}
 	}
@@ -1373,11 +1352,12 @@ func podObjectRef(pod *nriapi.PodSandbox) *corev1.ObjectReference {
 	}
 }
 
-// RunPodSandbox runs synchronously once per Pod BEFORE any container is created or started.
-// Under PodNetworkIsolated it verifies the Pod netns has only loopback; under NetworkPolicyDenyAll
-// it flushes routes on non-loopback interfaces (eth0) so tun0 owns 0.0.0.0/0 and ::/0 cleanly.
-// Under ExplicitProxy it also binds 127.0.0.1:<port> inside the Pod netns via socketat so every
-// language HTTP client can reach the agents.net boundary over loopback without a sidecar.
+// RunPodSandbox runs synchronously once per Pod before any container starts.
+// For standard containers it confines the Pod netns (verifying loopback-only or
+// flushing routes and blocking non-loopback NICs) and injects a persistent tun0
+// handed to kube-netstack. For L2 runtimes such as gVisor runsc, it moves the
+// host veth peer into an empty isolated netns and hands an AF_PACKET descriptor
+// to kube-netstack so unmodified workloads route through the same pipeline.
 func (d *Driver) RunPodSandbox(_ context.Context, pod *nriapi.PodSandbox) error {
 	start := time.Now()
 	status := metrics.StatusNoop
@@ -1402,28 +1382,33 @@ func (d *Driver) RunPodSandbox(_ context.Context, pod *nriapi.PodSandbox) error 
 		mode = apis.ConfinementModePodNetworkIsolated
 	}
 
-	switch mode {
-	case apis.ConfinementModePodNetworkIsolated:
-		allowExistingHostTun := cfg.Parameters.EffectiveAdapterMode() == apis.AdapterModeHostTun && cfg.NetNS == ns
-		if err := d.netns.VerifyLoopbackOnly(ns, allowExistingHostTun); err != nil {
+	runtimeHandler := pod.GetRuntimeHandler()
+	if !isL2VethRuntime(runtimeHandler) {
+		switch mode {
+		case apis.ConfinementModePodNetworkIsolated:
+			allowExistingHostTun := cfg.NetNS == ns
+			if err := d.netns.VerifyLoopbackOnly(ns, allowExistingHostTun); err != nil {
+				status = metrics.StatusFailed
+				return fmt.Errorf("PodNetworkIsolated check failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
+			}
+		case apis.ConfinementModeNetworkPolicyDenyAll:
+			// Under nicBlockMode=Disabled, defer eth0 isolation to CNI NetworkPolicy
+			// so host-to-Pod kubelet probes and CNI drop visibility keep working.
+			if cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDropAll {
+				if err := d.netns.FlushNonLoopbackRoutes(ns); err != nil {
+					status = metrics.StatusFailed
+					return fmt.Errorf("NetworkPolicyDenyAll route flush failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
+				}
+				if err := d.netns.BlockNonLoopbackNICs(ns, true); err != nil {
+					status = metrics.StatusFailed
+					return fmt.Errorf("NetworkPolicyDenyAll tc NIC blocking failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
+				}
+			}
+		default:
 			status = metrics.StatusFailed
-			return fmt.Errorf("PodNetworkIsolated check failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
+			return fmt.Errorf("unsupported confinementMode %q for pod %s/%s", mode, pod.GetNamespace(), pod.GetName())
 		}
-	case apis.ConfinementModeNetworkPolicyDenyAll:
-		// Under nicBlockMode=Disabled, defer eth0 isolation to CNI NetworkPolicy
-		// so host-to-Pod kubelet probes and CNI drop visibility keep working.
-		if cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDropAll {
-			if err := d.netns.FlushNonLoopbackRoutes(ns); err != nil {
-				status = metrics.StatusFailed
-				return fmt.Errorf("NetworkPolicyDenyAll route flush failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
-			}
-			allowTunTap := usesTunAdapter(cfg.Parameters.EffectiveAdapterMode())
-			if err := d.netns.BlockNonLoopbackNICs(ns, allowTunTap); err != nil {
-				status = metrics.StatusFailed
-				return fmt.Errorf("NetworkPolicyDenyAll tc NIC blocking failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
-			}
-		}
-	default:
+	} else if mode != apis.ConfinementModePodNetworkIsolated && mode != apis.ConfinementModeNetworkPolicyDenyAll {
 		status = metrics.StatusFailed
 		return fmt.Errorf("unsupported confinementMode %q for pod %s/%s", mode, pod.GetNamespace(), pod.GetName())
 	}
@@ -1435,34 +1420,29 @@ func (d *Driver) RunPodSandbox(_ context.Context, pod *nriapi.PodSandbox) error 
 		d.ingress.Allow(podUID)
 	}
 
-	switch cfg.Parameters.EffectiveAdapterMode() {
-	case apis.AdapterModeHostTun:
-		maxConns := int(params.DefaultMaxConnections)
-		if cfg.Parameters.MaxConnections != nil {
-			maxConns = int(*cfg.Parameters.MaxConnections)
-		}
-		preserveNICReturn := mode == apis.ConfinementModeNetworkPolicyDenyAll &&
-			cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDisabled
-		if err := d.startHostTun(podUID, ns, cfg.SocketPaths.EgressSocketPath, maxConns, preserveNICReturn, cfg.Parameters.EffectiveDNSMode()); err != nil {
-			status = metrics.StatusFailed
-			return fmt.Errorf("start HostTun in pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
-		}
-	case apis.AdapterModeExplicitProxy:
-		addr := fmt.Sprintf("127.0.0.1:%d", cfg.Parameters.EffectiveProxyPort())
-		ln, err := d.netns.ListenAt(ns, "tcp", addr)
-		if err != nil {
-			status = metrics.StatusFailed
-			return fmt.Errorf("bind ExplicitProxy loopback listener %s in pod %s/%s via socketat: %w", addr, pod.GetNamespace(), pod.GetName(), err)
-		}
-		if err := d.tunnel.AttachListener(podUID, ln); err != nil {
-			status = metrics.StatusFailed
-			return fmt.Errorf("attach ExplicitProxy loopback listener for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
-		}
+	maxConns := int(params.DefaultMaxConnections)
+	if cfg.Parameters.MaxConnections != nil {
+		maxConns = int(*cfg.Parameters.MaxConnections)
+	}
+	preserveNICReturn := !isL2VethRuntime(runtimeHandler) &&
+		mode == apis.ConfinementModeNetworkPolicyDenyAll &&
+		cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDisabled
+	guestIP, err := d.startHostTun(podUID, ns, runtimeHandler, pod.GetIps(), cfg.SocketPaths.PodRootDir, cfg.SocketPaths.EgressSocketPath, maxConns, preserveNICReturn, cfg.Parameters.EffectiveDNSMode())
+	if err != nil {
+		status = metrics.StatusFailed
+		return fmt.Errorf("start kube-netstack in pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
 	}
 
 	if err := d.store.UpdateSandbox(podUID, pod.GetId(), ns, d.clock.Now().UTC()); err != nil {
 		status = metrics.StatusFailed
 		return fmt.Errorf("record pod netns: %w", err)
+	}
+	if guestIP != "" {
+		if err := d.store.UpdateGuestIP(podUID, guestIP); err != nil {
+			status = metrics.StatusFailed
+			return fmt.Errorf("record pod guest IP: %w", err)
+		}
+		cfg.GuestIP = guestIP
 	}
 	cfg.SandboxID = pod.GetId()
 	cfg.NetNS = ns
@@ -1475,8 +1455,8 @@ func (d *Driver) RunPodSandbox(_ context.Context, pod *nriapi.PodSandbox) error 
 	return nil
 }
 
-// CreateContainer runs per container in the Pod and injects mounts, /dev/net/tun, Pod CA
-// certificates, and language-specific proxy/CA environment variables in memory via
+// CreateContainer runs per container in the Pod and injects /etc/resolv.conf,
+// materialized Pod CA certificates, and non-clobbering CA/ingress env vars via
 // ContainerAdjustment with zero CDI files.
 func (d *Driver) CreateContainer(_ context.Context, pod *nriapi.PodSandbox, ctr *nriapi.Container) (*nriapi.ContainerAdjustment, []*nriapi.ContainerUpdate, error) {
 	start := time.Now()
@@ -1495,85 +1475,23 @@ func (d *Driver) CreateContainer(_ context.Context, pod *nriapi.PodSandbox, ctr 
 	adj := &nriapi.ContainerAdjustment{}
 	changed := false
 	desiredEnv := make(map[string]string)
-	var javaToolOpts string
 
-	switch cfg.Parameters.EffectiveAdapterMode() {
-	case apis.AdapterModeHostTun:
-		if cfg.SocketPaths.ResolvConfPath != "" {
-			changed = true
-			adj.RemoveMount(containerResolvConfPath)
-			adj.AddMount(&nriapi.Mount{
-				Destination: containerResolvConfPath,
-				Source:      cfg.SocketPaths.ResolvConfPath,
-				Type:        "bind",
-				Options:     []string{"rbind", "ro"},
-			})
-		}
-
-	case apis.AdapterModeTunSidecar:
-		if ctr.GetName() == Tun2ConnectContainerName {
-			changed = true
-			adj.AddMount(&nriapi.Mount{
-				Destination: containerEgressMountDir,
-				Source:      cfg.SocketPaths.EgressDir,
-				Type:        "bind",
-				Options:     []string{"rbind", "ro"},
-			})
-			desiredEnv["AGENTS_NET_EGRESS_SOCKET"] = filepath.Join(containerEgressMountDir, tunnel.EgressSocketName)
-			if len(cfg.Parameters.IngressPorts) > 0 {
-				adj.AddMount(&nriapi.Mount{
-					Destination: containerIngressMountDir,
-					Source:      cfg.SocketPaths.IngressDir,
-					Type:        "bind",
-					Options:     []string{"rbind", "rw"},
-				})
-				desiredEnv["AGENTS_NET_INGRESS_SOCKET"] = filepath.Join(containerIngressMountDir, tunnel.IngressSocketName)
-				desiredEnv["AGENTS_NET_INGRESS_PORTS"] = formatIngressPorts(cfg.Parameters.IngressPorts)
-			}
-			if cfg.Parameters.ConfinementMode == apis.ConfinementModeNetworkPolicyDenyAll {
-				desiredEnv["AGENTS_NET_COMPAT_ISOLATED"] = "1"
-			}
-			adj.AddDevice(&nriapi.LinuxDevice{
-				Path:  "/dev/net/tun",
-				Type:  "c",
-				Major: 10,
-				Minor: 200,
-			})
-		}
-
-	case apis.AdapterModeExplicitProxy:
+	if cfg.SocketPaths.ResolvConfPath != "" {
 		changed = true
+		adj.RemoveMount(containerResolvConfPath)
 		adj.AddMount(&nriapi.Mount{
-			Destination: containerEgressMountDir,
-			Source:      cfg.SocketPaths.EgressDir,
+			Destination: containerResolvConfPath,
+			Source:      cfg.SocketPaths.ResolvConfPath,
 			Type:        "bind",
 			Options:     []string{"rbind", "ro"},
 		})
-		if len(cfg.Parameters.IngressPorts) > 0 && cfg.SocketPaths.IngressDir != "" {
-			adj.AddMount(&nriapi.Mount{
-				Destination: containerIngressMountDir,
-				Source:      cfg.SocketPaths.IngressDir,
-				Type:        "bind",
-				Options:     []string{"rbind", "rw"},
-			})
-			desiredEnv["AGENTS_NET_INGRESS_SOCKET"] = filepath.Join(containerIngressMountDir, tunnel.IngressSocketName)
-		}
-		egressSock := filepath.Join(containerEgressMountDir, tunnel.EgressSocketName)
-		var extraNoProxy []string
-		if cfg.Parameters.Proxy != nil {
-			extraNoProxy = cfg.Parameters.Proxy.NoProxy
-		}
-		pVars, jOpts := proxyenv.ExplicitProxyEnv(egressSock, cfg.Parameters.EffectiveProxyPort(), extraNoProxy)
-		maps.Copy(desiredEnv, pVars)
-		javaToolOpts = jOpts
 	}
 
-	// Advertise the primary pinned ingress port to workload containers per agents.net ingress.md §1.
-	if len(cfg.Parameters.IngressPorts) > 0 && ctr.GetName() != Tun2ConnectContainerName {
+	if len(cfg.Parameters.IngressPorts) > 0 {
 		desiredEnv["AGENT_INGRESS_PORT"] = strconv.FormatInt(int64(cfg.Parameters.IngressPorts[0].Port), 10)
 	}
 
-	// Inject materialized Pod CA bundles into EVERY container in the Pod per agents.net Section 2.3.B.
+	// Inject materialized Pod CA bundles into every container in the Pod.
 	if cfg.CABundle.MergedHostPath != "" && cfg.Parameters.CATrust != nil && cfg.Parameters.CATrust.Mode != apis.CATrustModeNone {
 		changed = true
 		adj.AddMount(&nriapi.Mount{
@@ -1596,19 +1514,9 @@ func (d *Driver) CreateContainer(_ context.Context, pod *nriapi.PodSandbox, ctr 
 		}
 	}
 
-	hasJavaOpts := false
-	for _, kv := range ctr.GetEnv() {
-		if strings.HasPrefix(kv, "JAVA_TOOL_OPTIONS=") {
-			hasJavaOpts = true
-			break
-		}
-	}
-	for _, entry := range proxyenv.MergeNonClobbering(ctr.GetEnv(), desiredEnv, javaToolOpts) {
+	for _, entry := range mergeNonClobberingEnv(ctr.GetEnv(), desiredEnv) {
 		changed = true
-		if entry.Key == "JAVA_TOOL_OPTIONS" && hasJavaOpts {
-			adj.RemoveEnv("JAVA_TOOL_OPTIONS")
-		}
-		adj.AddEnv(entry.Key, entry.Value)
+		adj.AddEnv(entry.key, entry.value)
 	}
 
 	status = metrics.StatusSuccess
@@ -1671,11 +1579,11 @@ func (d *Driver) RemovePodSandbox(_ context.Context, pod *nriapi.PodSandbox) err
 	}
 	d.stopHostTun(podUID, true)
 	d.tunnel.Revoke(podUID)
-	d.tunnel.DetachExtraListeners(podUID)
 	if err := d.store.UpdateSandbox(podUID, "", "", time.Time{}); err != nil {
 		status = metrics.StatusFailed
 		return err
 	}
+	_ = d.store.UpdateGuestIP(podUID, "")
 	status = metrics.StatusSuccess
 	return nil
 }
@@ -1823,14 +1731,28 @@ func getNetworkNamespace(pod *nriapi.PodSandbox) string {
 	return ""
 }
 
-func formatIngressPorts(ports []apis.IngressPort) string {
-	parts := make([]string, 0, len(ports))
-	for _, p := range ports {
-		if p.EndPort > p.Port {
-			parts = append(parts, fmt.Sprintf("%d-%d", p.Port, p.EndPort))
-		} else {
-			parts = append(parts, strconv.FormatInt(int64(p.Port), 10))
+type envEntry struct {
+	key   string
+	value string
+}
+
+func mergeNonClobberingEnv(existing []string, desired map[string]string) []envEntry {
+	present := make(map[string]struct{}, len(existing))
+	for _, kv := range existing {
+		if k, _, ok := strings.Cut(kv, "="); ok {
+			present[k] = struct{}{}
 		}
 	}
-	return strings.Join(parts, ",")
+	keys := make([]string, 0, len(desired))
+	for k := range desired {
+		if _, ok := present[k]; !ok {
+			keys = append(keys, k)
+		}
+	}
+	slices.Sort(keys)
+	out := make([]envEntry, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, envEntry{key: k, value: desired[k]})
+	}
+	return out
 }
