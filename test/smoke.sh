@@ -22,7 +22,9 @@
 #   3. Standard Pod + ResourceClaimTemplate attachment (zero custom workload CRDs)
 #   4. Confinement & HostTun (default, zero sidecar, zero Pod caps):
 #      - Route flush + pure-netlink tc clsact DROP blocks eth0
-#      - Persistent tun0 inside Pod netns handled by host userspace tun2connect
+#      - Persistent tun0 inside Pod netns handled by unprivileged host worker
+#        (UID/GID 65534, zero Linux capabilities, NoNewPrivs=1, isolated netns,
+#        and automatic crash recovery on worker SIGKILL)
 #      - /etc/resolv.conf replaced via NRI pointing to 198.19.255.253 (198.18.0.0/15)
 #      - No HTTP_PROXY env vars, no egress.sock, and no /dev/net/tun in container
 #   5. Transparent egress via real cmd/connect-proxy (mTLS + HTTP/2 CONNECT):
@@ -657,6 +659,91 @@ udp_sock.close()
 assert echoed == payload, f"UDP echo mismatch: got={echoed!r} want={payload!r}"
 print("PASS HostTun transparent UDP over RFC 9298 connect-udp echoed:", echoed.decode())
 PY
+
+if docker inspect "${KIND_CLUSTER_NAME}-control-plane" >/dev/null 2>&1; then
+  echo "=== 8b. Assert unprivileged HostTun worker privilege separation & automatic crash recovery ==="
+  OLD_WORKER_PID="$(docker exec "${KIND_CLUSTER_NAME}-control-plane" bash -euo pipefail -c '
+    parent_pid=""
+    worker_pid=""
+    for p in /proc/[0-9]*; do
+      pid="${p#/proc/}"
+      cmd="$(tr "\0" " " < "${p}/cmdline" 2>/dev/null || true)"
+      if [[ "${cmd}" == "/dra-agents-net --host-tun-worker"* ]]; then
+        worker_pid="${pid}"
+      elif [[ "${cmd}" == "/dra-agents-net "* ]]; then
+        parent_pid="${pid}"
+      fi
+    done
+    if [ -z "${parent_pid}" ] || [ -z "${worker_pid}" ]; then
+      echo "FAIL: could not locate parent (${parent_pid}) or worker (${worker_pid}) /dra-agents-net processes" >&2
+      exit 1
+    fi
+    for tstatus in "/proc/${worker_pid}/task/"*/status; do
+      status="$(cat "${tstatus}")"
+      for pat in \
+        "^Uid:[[:space:]]+65534[[:space:]]+65534[[:space:]]+65534[[:space:]]+65534$" \
+        "^Gid:[[:space:]]+65534[[:space:]]+65534[[:space:]]+65534[[:space:]]+65534$" \
+        "^CapEff:[[:space:]]+0000000000000000$" \
+        "^CapPrm:[[:space:]]+0000000000000000$" \
+        "^CapInh:[[:space:]]+0000000000000000$" \
+        "^CapAmb:[[:space:]]+0000000000000000$" \
+        "^NoNewPrivs:[[:space:]]+1$"; do
+        if ! grep -qE "${pat}" <<<"${status}"; then
+          echo "FAIL: worker thread ${tstatus} failed check ${pat}" >&2
+          grep -E "^(Uid|Gid|Cap|NoNewPrivs):" <<<"${status}" >&2 || true
+          exit 1
+        fi
+      done
+    done
+    parent_ns="$(readlink "/proc/${parent_pid}/ns/net")"
+    worker_ns="$(readlink "/proc/${worker_pid}/ns/net")"
+    if [ "${parent_ns}" = "${worker_ns}" ]; then
+      echo "FAIL: worker PID ${worker_pid} shares parent netns ${parent_ns}" >&2
+      exit 1
+    fi
+    # Verify parent holds zero open /dev/net/tun descriptors after SCM_RIGHTS handoff.
+    if ls -l "/proc/${parent_pid}/fd" 2>/dev/null | grep -q "/dev/net/tun"; then
+      echo "FAIL: parent dra-agents-net still holds an open /dev/net/tun FD" >&2
+      exit 1
+    fi
+    echo "PASS unprivileged worker PID=${worker_pid} (all threads uid=65534, CapEff/Prm/Inh/Amb=0, NoNewPrivs=1, netns=${worker_ns} != parent ${parent_ns})" >&2
+    echo "${worker_pid}"
+  ')"
+
+  # Kill the worker process directly and verify automatic recovery over persistent tun0.
+  docker exec "${KIND_CLUSTER_NAME}-control-plane" kill -9 "${OLD_WORKER_PID}"
+  NEW_WORKER_PID=""
+  for _ in $(seq 1 30); do
+    NEW_WORKER_PID="$(docker exec "${KIND_CLUSTER_NAME}-control-plane" bash -c '
+      for p in /proc/[0-9]*; do
+        pid="${p#/proc/}"
+        cmd="$(tr "\0" " " < "${p}/cmdline" 2>/dev/null || true)"
+        if [[ "${cmd}" == "/dra-agents-net --host-tun-worker"* ]]; then
+          echo "${pid}"
+          exit 0
+        fi
+      done
+    ' || true)"
+    if [ -n "${NEW_WORKER_PID}" ] && [ "${NEW_WORKER_PID}" != "${OLD_WORKER_PID}" ]; then
+      break
+    fi
+    sleep 0.2
+  done
+  if [ -z "${NEW_WORKER_PID}" ] || [ "${NEW_WORKER_PID}" = "${OLD_WORKER_PID}" ]; then
+    echo "FAIL: HostTun worker did not respawn after SIGKILL (old=${OLD_WORKER_PID} new=${NEW_WORKER_PID})" >&2
+    exit 1
+  fi
+  echo "PASS HostTun worker respawned automatically after SIGKILL: ${OLD_WORKER_PID} -> ${NEW_WORKER_PID}"
+
+  k -n "${NS}" exec -i smoke-agent -- env NS="${NS}" python3 - <<'PY'
+import json, os, urllib.request
+echo_host = f"echo.{os.environ['NS']}.svc.cluster.local"
+with urllib.request.urlopen(f"https://{echo_host}:8443/after-worker-kill", timeout=10) as resp:
+    data = json.loads(resp.read().decode())
+    assert resp.status == 200 and data["ok"] is True and data["path"] == "/after-worker-kill", data
+    print("PASS HostTun transparent HTTPS recovered after worker SIGKILL:", data)
+PY
+fi
 
 echo "=== 9. Verify connect-proxy JSONL audit log recorded mTLS peer + h2 TCP & UDP allow + deny (and zero unmapped synthetic IPs) ==="
 PEP_LOGS="$(k -n "${NS}" logs deploy/connect-proxy)"

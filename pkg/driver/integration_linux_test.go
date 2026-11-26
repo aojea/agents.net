@@ -58,6 +58,7 @@ import (
 	"github.com/aojea/agents.net/internal/testutils"
 	"github.com/aojea/agents.net/pkg/apis"
 	"github.com/aojea/agents.net/pkg/auth"
+	"github.com/aojea/agents.net/pkg/hosttun"
 	"github.com/aojea/agents.net/pkg/ingress"
 	"github.com/aojea/agents.net/pkg/metrics"
 	"github.com/aojea/agents.net/pkg/params"
@@ -66,6 +67,17 @@ import (
 	"github.com/aojea/agents.net/pkg/tun2connect"
 	"github.com/aojea/agents.net/pkg/tunnel"
 )
+
+func TestMain(m *testing.M) {
+	if hosttun.IsWorkerEnv() {
+		if err := hosttun.RunWorker(); err != nil {
+			fmt.Fprintf(os.Stderr, "host-tun worker exited with error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 func createNamedPodNetNS(t *testing.T, prefix string) (nsPath string, nsHandle netns.NsHandle) {
 	t.Helper()
@@ -746,11 +758,14 @@ func testIntegrationExplicitProxyCrossNetNS(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 	defer tm.Close()
+	htMgr := hosttun.NewManager(hosttun.ManagerConfig{Isolation: hosttun.IsolationShared})
+	defer func() { _ = htMgr.Close() }()
 	drv, err := New(Config{
 		DriverName: apis.DriverName,
 		NodeName:   "test-node",
 		Store:      st,
 		Tunnel:     tm,
+		NetNS:      NewLinuxNetNSManagerWithHostTun(htMgr),
 	})
 	if err != nil {
 		t.Fatalf("driver.New: %v", err)
@@ -1417,11 +1432,14 @@ func testIntegrationHostTunCrossNetNS(t *testing.T) {
 		t.Fatalf("NewManager: %v", err)
 	}
 	defer tm.Close()
+	htMgr := hosttun.NewManager(hosttun.ManagerConfig{Isolation: hosttun.IsolationShared})
+	defer func() { _ = htMgr.Close() }()
 	drv, err := New(Config{
 		DriverName: apis.DriverName,
 		NodeName:   "test-node",
 		Store:      st,
 		Tunnel:     tm,
+		NetNS:      NewLinuxNetNSManagerWithHostTun(htMgr),
 	})
 	if err != nil {
 		t.Fatalf("driver.New: %v", err)
@@ -1484,6 +1502,39 @@ func testIntegrationHostTunCrossNetNS(t *testing.T) {
 	}
 	if err := drv.RunPodSandbox(ctx, pod); err != nil {
 		t.Fatalf("RunPodSandbox: %v", err)
+	}
+
+	// Verify HostTun runs inside a separate hardened unprivileged worker process
+	// and the parent driver no longer holds any open /dev/net/tun FD.
+	workerPID := htMgr.WorkerPID(string(podUID))
+	if workerPID <= 0 {
+		t.Fatalf("expected active HostTun worker PID for %s, got %d", podUID, workerPID)
+	}
+	statusRaw, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", workerPID))
+	if err != nil {
+		t.Fatalf("read worker /proc/%d/status: %v", workerPID, err)
+	}
+	statusText := string(statusRaw)
+	if !strings.Contains(statusText, "CapEff:\t0000000000000000") || !strings.Contains(statusText, "NoNewPrivs:\t1") {
+		t.Fatalf("HostTun worker PID %d is not hardened:\n%s", workerPID, statusText)
+	}
+	parentNetNS, err := os.Readlink("/proc/self/ns/net")
+	if err != nil {
+		t.Fatalf("readlink /proc/self/ns/net: %v", err)
+	}
+	workerNetNS, err := os.Readlink(fmt.Sprintf("/proc/%d/ns/net", workerPID))
+	if err != nil {
+		t.Fatalf("readlink /proc/%d/ns/net: %v", workerPID, err)
+	}
+	if workerNetNS == parentNetNS {
+		t.Fatalf("HostTun worker PID %d shares parent netns %s", workerPID, parentNetNS)
+	}
+	if fds, err := os.ReadDir("/proc/self/fd"); err == nil {
+		for _, fdEntry := range fds {
+			if target, err := os.Readlink(filepath.Join("/proc/self/fd", fdEntry.Name())); err == nil && strings.Contains(target, "/dev/net/tun") {
+				t.Fatalf("parent driver still holds open TUN descriptor fd %s -> %s", fdEntry.Name(), target)
+			}
+		}
 	}
 
 	syntheticPool := netip.MustParsePrefix("198.18.0.0/15")
@@ -1562,6 +1613,43 @@ func testIntegrationHostTunCrossNetNS(t *testing.T) {
 	}
 	seenMu.Unlock()
 
+	// 4b. Kill the unprivileged worker abruptly and verify automatic recovery over persistent tun0.
+	if err := syscall.Kill(workerPID, syscall.SIGKILL); err != nil {
+		t.Fatalf("SIGKILL HostTun worker %d: %v", workerPID, err)
+	}
+	recoverDeadline := time.Now().Add(5 * time.Second)
+	var recoveredPID int
+	for time.Now().Before(recoverDeadline) {
+		recoveredPID = htMgr.WorkerPID(string(podUID))
+		if recoveredPID > 0 && recoveredPID != workerPID {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if recoveredPID <= 0 || recoveredPID == workerPID {
+		t.Fatalf("HostTun worker did not recover after SIGKILL: old=%d new=%d", workerPID, recoveredPID)
+	}
+	recoveredIPs, err := resolver.LookupNetIP(ctx, "ip4", "api.allowed.test")
+	if err != nil || len(recoveredIPs) != 1 {
+		t.Fatalf("LookupNetIP after worker crash recovery = (%v, %v)", recoveredIPs, err)
+	}
+	recConn, err := socketat.DialAtPath(podNSPath, "tcp4", net.JoinHostPort(recoveredIPs[0].String(), destHTTPPort), 5*time.Second)
+	if err != nil {
+		t.Fatalf("TCP dial after worker crash recovery: %v", err)
+	}
+	_, _ = io.WriteString(recConn, "GET /after-worker-kill HTTP/1.1\r\nHost: api.allowed.test\r\nConnection: close\r\n\r\n")
+	recResp, err := http.ReadResponse(bufio.NewReader(recConn), nil)
+	if err != nil {
+		_ = recConn.Close()
+		t.Fatalf("read HTTP response after worker crash recovery: %v", err)
+	}
+	recBody, _ := io.ReadAll(recResp.Body)
+	_ = recResp.Body.Close()
+	_ = recConn.Close()
+	if string(recBody) != "hosttun-dest:/after-worker-kill" {
+		t.Fatalf("post-recovery HTTP body = %q, want hosttun-dest:/after-worker-kill", recBody)
+	}
+
 	// 5. Verify persistent tun0 survives DaemonSet shutdown (stopAllHostTuns(false))
 	// and re-attaches cleanly on NRI Synchronize so new connections succeed without recreating the Pod.
 	drv.stopAllHostTuns(false)
@@ -1628,7 +1716,18 @@ func testIntegrationHostTunCrossNetNS(t *testing.T) {
 
 	cfg, _ := st.Get(podUID)
 	mgr := NewLinuxNetNSManager()
-	htCloser, err := mgr.StartHostTun(disabledNSPath, cfg.SocketPaths.EgressSocketPath, 64, true)
+	defer func() {
+		if closer, ok := mgr.(io.Closer); ok {
+			_ = closer.Close()
+		}
+	}()
+	htCloser, err := mgr.StartHostTun(HostTunRequest{
+		PodUID:            "pod-hosttun-disabled",
+		NetNSPath:         disabledNSPath,
+		EgressSocketPath:  cfg.SocketPaths.EgressSocketPath,
+		MaxConnections:    64,
+		PreserveNICReturn: true,
+	})
 	if err != nil {
 		t.Fatalf("StartHostTun preserveNICReturn: %v", err)
 	}

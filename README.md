@@ -75,6 +75,7 @@ The full git history is kept intact so you can follow how earlier experiments le
 | [cmd/connect-proxy](cmd/connect-proxy) | Reference mTLS HTTP `CONNECT` / `connect-udp` Policy Enforcement Point (used by tests and demos) |
 | [cmd/tun2connect](cmd/tun2connect) | Optional standalone TUN adapter binary (for `TunSidecar` or microVM `vsock` runtimes) |
 | [pkg/driver](pkg/driver) | DRA plugin (`DRAConsumableCapacity`), NRI hooks, `HostTun` / `ExplicitProxy` / `TunSidecar`, netlink confinement, and Pod informer |
+| [pkg/hosttun](pkg/hosttun) | Unprivileged `HostTun` userspace worker supervisor and built-in worker over `SCM_RIGHTS` (`--host-tun-isolation=shared\|per-pod`, pluggable `--host-tun-worker-bin`, automatic crash recovery) |
 | [pkg/tun2connect](pkg/tun2connect) | Built-in Go userspace TCP/IP stack (gVisor `netstack`), Virtual DNS (`198.18.0.0/15`, `100::/64`), and `CONNECT` / `connect-udp` forwarding hooks |
 | [pkg/tunnel](pkg/tunnel) | Per-Pod UDS / `socketat` listener manager and mandatory mTLS HTTP/2 + HTTP/1.1 `CONNECT` / `connect-udp` dialer |
 | [pkg/apis](pkg/apis), [pkg/params](pkg/params) | `dra.agents.net/v1alpha1` `DriverConfig` & `DeviceStatus` and strict `FromClass` / `FromClaim` decoding |
@@ -174,7 +175,7 @@ spec:
 
 ### Adapters (`adapterMode`, configured in `DeviceClass`)
 
-- **`HostTun` (default):** Creates a persistent `tun0` inside the Pod netns during NRI `RunPodSandbox`, terminates TCP/UDP/DNS in the host userspace stack (`198.18.0.0/15`, `100::/64`), and replaces `/etc/resolv.conf` with a read-only bind mount to `198.19.255.253`. Zero sidecar, zero Pod capabilities, zero `egress.sock` exposed inside containers.
+- **`HostTun` (default):** Creates a persistent `tun0` inside the Pod netns during NRI `RunPodSandbox`, hands `tunFD` and a per-Pod dial-broker FD over `SCM_RIGHTS` to an unprivileged host worker process (UID/GID `65534`, zero Linux capabilities, `NoNewPrivs=1`, isolated empty netns) that terminates TCP/UDP/DNS (`198.18.0.0/15`, `100::/64`), and replaces `/etc/resolv.conf` with a read-only bind mount to `198.19.255.253`. Supports `--host-tun-isolation=shared` (default, one multi-tenant worker per node) or `--host-tun-isolation=per-pod` (one dedicated worker per Pod), custom bring-your-own userspace stacks via `--host-tun-worker-bin`, and automatic crash recovery over persistent `tun0`. Zero sidecar, zero Pod capabilities, zero `egress.sock` exposed inside containers.
 - **`ExplicitProxy`:** Binds `127.0.0.1:15001` inside the Pod netns via `socketat` and injects `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` without creating a TUN device or synthetic IPs.
 - **`TunSidecar`:** Attaches `/dev/net/tun` and UDS sockets to an `agents-net-tun2connect` native sidecar when in-guest conversion is needed.
 

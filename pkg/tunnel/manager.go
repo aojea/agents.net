@@ -350,6 +350,27 @@ func (m *Manager) AttachListener(podUID types.UID, ln net.Listener) error {
 	return sl.attachListener(ln)
 }
 
+// ServeConn admits an already-connected stream (such as a kernel socketpair
+// brokered for an unprivileged HostTun userspace stack worker) directly into
+// podUID's tunnel pipeline so it shares upstream auth, limits, metrics, and Revoke
+// without requiring filesystem access to egress.sock.
+func (m *Manager) ServeConn(podUID types.UID, conn net.Conn) error {
+	if conn == nil {
+		return errors.New("connection is required")
+	}
+	m.mu.Lock()
+	sl := m.listeners[podUID]
+	m.mu.Unlock()
+	if sl == nil {
+		_ = conn.Close()
+		return fmt.Errorf("no sandbox listener found for pod %s", podUID)
+	}
+	if !sl.admitConn(conn) {
+		return fmt.Errorf("sandbox listener for pod %s rejected connection", podUID)
+	}
+	return nil
+}
+
 // HasExtraListener reports whether podUID already has an active attached listener
 // (for example, a live socketat Pod-loopback listener that survived a container
 // runtime restart and NRI reconnect in the same dra-agents-net process).
@@ -611,41 +632,53 @@ func (l *sandboxListener) acceptLoop(ln net.Listener) {
 		if err != nil {
 			return
 		}
-		l.mu.Lock()
-		if l.stopped {
-			l.mu.Unlock()
-			_ = conn.Close()
-			return
+		if !l.admitConn(conn) {
+			l.mu.RLock()
+			stopped := l.stopped
+			l.mu.RUnlock()
+			if stopped {
+				return
+			}
 		}
-		if l.revoked {
-			l.mu.Unlock()
-			metrics.TunnelsTotal.WithLabelValues("tcp", l.authMode, "deny", "listener_revoked").Inc()
-			writeH1Deny(conn, l.manager.headTimeout, http.StatusServiceUnavailable, "listener-revoked")
-			_ = conn.Close()
-			continue
-		}
-		if len(l.active) >= l.maxConns {
-			l.mu.Unlock()
-			metrics.TunnelsTotal.WithLabelValues("tcp", l.authMode, "deny", "max_connections").Inc()
-			writeH1Deny(conn, l.manager.headTimeout, http.StatusServiceUnavailable, "busy")
-			_ = conn.Close()
-			continue
-		}
-		l.active[conn] = func() {}
-		metrics.ActiveTunnels.Inc()
-		// Start handler goroutine while holding l.mu so wg.Add(1) happens-before stop()'s wg.Wait().
-		l.wg.Go(func() {
-			defer func() {
-				l.mu.Lock()
-				delete(l.active, conn)
-				l.mu.Unlock()
-				metrics.ActiveTunnels.Dec()
-				_ = conn.Close()
-			}()
-			l.serveConn(conn)
-		})
-		l.mu.Unlock()
 	}
+}
+
+func (l *sandboxListener) admitConn(conn net.Conn) bool {
+	l.mu.Lock()
+	if l.stopped {
+		l.mu.Unlock()
+		_ = conn.Close()
+		return false
+	}
+	if l.revoked {
+		l.mu.Unlock()
+		metrics.TunnelsTotal.WithLabelValues("tcp", l.authMode, "deny", "listener_revoked").Inc()
+		writeH1Deny(conn, l.manager.headTimeout, http.StatusServiceUnavailable, "listener-revoked")
+		_ = conn.Close()
+		return false
+	}
+	if len(l.active) >= l.maxConns {
+		l.mu.Unlock()
+		metrics.TunnelsTotal.WithLabelValues("tcp", l.authMode, "deny", "max_connections").Inc()
+		writeH1Deny(conn, l.manager.headTimeout, http.StatusServiceUnavailable, "busy")
+		_ = conn.Close()
+		return false
+	}
+	l.active[conn] = func() {}
+	metrics.ActiveTunnels.Inc()
+	// Start handler goroutine while holding l.mu so wg.Add(1) happens-before stop()'s wg.Wait().
+	l.wg.Go(func() {
+		defer func() {
+			l.mu.Lock()
+			delete(l.active, conn)
+			l.mu.Unlock()
+			metrics.ActiveTunnels.Dec()
+			_ = conn.Close()
+		}()
+		l.serveConn(conn)
+	})
+	l.mu.Unlock()
+	return true
 }
 
 func (l *sandboxListener) setConnCloser(conn net.Conn, gen uint64, fn func()) bool {

@@ -17,26 +17,52 @@
 package driver
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"sync"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 
+	"github.com/aojea/agents.net/pkg/hosttun"
 	"github.com/aojea/agents.net/pkg/socketat"
 	"github.com/aojea/agents.net/pkg/tun2connect"
 )
 
-type linuxNetNSManager struct{}
+type linuxNetNSManager struct {
+	hostTun     *hosttun.Manager
+	ownsHostTun bool
+}
 
-// NewLinuxNetNSManager returns a NetNSManager backed by socketat and Linux netlink.
+// NewLinuxNetNSManager returns a NetNSManager backed by socketat, Linux netlink,
+// and an isolated unprivileged HostTun worker manager (shared mode by default).
 func NewLinuxNetNSManager() NetNSManager {
-	return linuxNetNSManager{}
+	return &linuxNetNSManager{
+		hostTun:     hosttun.NewManager(hosttun.ManagerConfig{Isolation: hosttun.IsolationShared}),
+		ownsHostTun: true,
+	}
+}
+
+// NewLinuxNetNSManagerWithHostTun returns a NetNSManager that delegates HostTun
+// packet processing to the caller-owned unprivileged hosttun.Manager.
+func NewLinuxNetNSManagerWithHostTun(mgr *hosttun.Manager) NetNSManager {
+	if mgr == nil {
+		return NewLinuxNetNSManager()
+	}
+	return &linuxNetNSManager{
+		hostTun:     mgr,
+		ownsHostTun: false,
+	}
+}
+
+// Close stops the internally-owned hosttun.Manager, if any.
+func (m *linuxNetNSManager) Close() error {
+	if m.ownsHostTun && m.hostTun != nil {
+		return m.hostTun.Close()
+	}
+	return nil
 }
 
 const (
@@ -103,7 +129,7 @@ func shouldSkipLinkForIsolation(handle *netlink.Handle, link netlink.Link, allow
 	return false
 }
 
-func (linuxNetNSManager) VerifyLoopbackOnly(netnsPath string, allowTunTap bool) error {
+func (*linuxNetNSManager) VerifyLoopbackOnly(netnsPath string, allowTunTap bool) error {
 	return socketat.DoAtNSPath(netnsPath, func() error {
 		handle, err := netlink.NewHandle()
 		if err != nil {
@@ -130,7 +156,7 @@ func (linuxNetNSManager) VerifyLoopbackOnly(netnsPath string, allowTunTap bool) 
 // pure netlink (zero exec, zero iptables/nftables). This blocks all L2/L3 traffic
 // on primary and secondary NICs independently of CNI NetworkPolicy enforcement
 // while leaving loopback (lo) untouched.
-func (linuxNetNSManager) BlockNonLoopbackNICs(netnsPath string, allowTunTap bool) error {
+func (*linuxNetNSManager) BlockNonLoopbackNICs(netnsPath string, allowTunTap bool) error {
 	return socketat.DoAtNSPath(netnsPath, func() error {
 		handle, err := netlink.NewHandle()
 		if err != nil {
@@ -202,7 +228,7 @@ func attachDropAllTC(handle *netlink.Handle, link netlink.Link) error {
 
 // VerifyNonLoopbackNICsBlocked reports whether every non-loopback NIC in netnsPath
 // has a leading tc clsact matchall DROP filter installed on both ingress and egress.
-func (linuxNetNSManager) VerifyNonLoopbackNICsBlocked(netnsPath string, allowTunTap bool) (bool, error) {
+func (*linuxNetNSManager) VerifyNonLoopbackNICsBlocked(netnsPath string, allowTunTap bool) (bool, error) {
 	allBlocked := true
 	err := socketat.DoAtNSPath(netnsPath, func() error {
 		handle, err := netlink.NewHandle()
@@ -268,7 +294,7 @@ func hasLeadingMatchAllDrop(filters []netlink.Filter) bool {
 	return false
 }
 
-func (linuxNetNSManager) FlushNonLoopbackRoutes(netnsPath string) error {
+func (*linuxNetNSManager) FlushNonLoopbackRoutes(netnsPath string) error {
 	return socketat.DoAtNSPath(netnsPath, func() error {
 		handle, err := netlink.NewHandle()
 		if err != nil {
@@ -312,7 +338,7 @@ func (linuxNetNSManager) FlushNonLoopbackRoutes(netnsPath string) error {
 	})
 }
 
-func (linuxNetNSManager) HasNonLoopbackRoutes(netnsPath string) (bool, error) {
+func (*linuxNetNSManager) HasNonLoopbackRoutes(netnsPath string) (bool, error) {
 	var found bool
 	err := socketat.DoAtNSPath(netnsPath, func() error {
 		handle, err := netlink.NewHandle()
@@ -361,62 +387,40 @@ func (linuxNetNSManager) HasNonLoopbackRoutes(netnsPath string) (bool, error) {
 	return found, err
 }
 
-func (linuxNetNSManager) ListenAt(netnsPath, network, address string) (net.Listener, error) {
+func (*linuxNetNSManager) ListenAt(netnsPath, network, address string) (net.Listener, error) {
 	return socketat.ListenAtPath(netnsPath, network, address)
 }
 
-type hostTunHandle struct {
-	eng  *tun2connect.Engine
-	fd   int
-	once sync.Once
-}
-
-func (h *hostTunHandle) Close() error {
-	var closeErr error
-	h.once.Do(func() {
-		h.eng.Close()
-		closeErr = unix.Close(h.fd)
-	})
-	return closeErr
-}
-
 // StartHostTun creates or re-attaches a persistent TUN device (tun0) inside
-// netnsPath, configures synthetic addresses and default routes inside the Pod
-// netns, and runs a host-side userspace tun2connect Engine over the returned
-// TUN file descriptor with zero sidecar container and zero Pod capabilities.
-func (linuxNetNSManager) StartHostTun(netnsPath, egressSocketPath string, maxConns int, preserveNICReturn bool) (io.Closer, error) {
-	fd, err := openAndConfigureHostTun(netnsPath, preserveNICReturn)
+// req.NetNSPath, configures synthetic addresses and default routes inside the
+// Pod netns, hands off the TUN FD over SCM_RIGHTS to an unprivileged userspace
+// stack worker, and immediately closes the parent's TUN FD.
+func (m *linuxNetNSManager) StartHostTun(req HostTunRequest) (io.Closer, error) {
+	fd, err := openAndConfigureHostTun(req.NetNSPath, req.PreserveNICReturn)
 	if err != nil {
 		return nil, err
 	}
-	dev, err := tun2connect.NewTUNDevice(fd, hostTunMTU)
-	if err != nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("create gvisor tun endpoint: %w", err)
+	podID := string(req.PodUID)
+	if podID == "" {
+		podID = req.NetNSPath
 	}
-	var dialer net.Dialer
-	client := &tun2connect.BoundaryClient{
-		DialBoundary: func(ctx context.Context) (net.Conn, error) {
-			return dialer.DialContext(ctx, "unix", egressSocketPath)
+	return m.hostTun.Attach(hosttun.AttachConfig{
+		PodID:            podID,
+		TunFD:            fd,
+		MTU:              hostTunMTU,
+		MaxConnections:   req.MaxConnections,
+		EnableUDP:        true,
+		ServeEgress:      req.ServeEgress,
+		EgressSocketPath: req.EgressSocketPath,
+		ReopenTun: func() (int, error) {
+			return openAndConfigureHostTun(req.NetNSPath, req.PreserveNICReturn)
 		},
-	}
-	eng, err := tun2connect.New(tun2connect.Config{
-		Device:         dev,
-		Dialer:         client,
-		DNS:            tun2connect.NewVirtualDNS(),
-		EnableUDP:      true,
-		MaxConnections: maxConns,
 	})
-	if err != nil {
-		_ = unix.Close(fd)
-		return nil, fmt.Errorf("start host tun2connect engine: %w", err)
-	}
-	return &hostTunHandle{eng: eng, fd: fd}, nil
 }
 
 // CleanupHostTun deletes the persistent tun0 interface from netnsPath when the
 // sandbox is removed. Missing netns or link errors are ignored.
-func (linuxNetNSManager) CleanupHostTun(netnsPath string) error {
+func (*linuxNetNSManager) CleanupHostTun(netnsPath string) error {
 	if netnsPath == "" {
 		return nil
 	}

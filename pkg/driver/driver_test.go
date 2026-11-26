@@ -113,9 +113,9 @@ func (f *fakeNetNS) ListenAt(path, network, address string) (net.Listener, error
 	return net.Listen(network, "127.0.0.1:0")
 }
 
-func (f *fakeNetNS) StartHostTun(path, _ string, _ int, preserveNICReturn bool) (io.Closer, error) {
-	f.hostTunPaths = append(f.hostTunPaths, path)
-	f.hostTunPreserveNIC = append(f.hostTunPreserveNIC, preserveNICReturn)
+func (f *fakeNetNS) StartHostTun(req HostTunRequest) (io.Closer, error) {
+	f.hostTunPaths = append(f.hostTunPaths, req.NetNSPath)
+	f.hostTunPreserveNIC = append(f.hostTunPreserveNIC, req.PreserveNICReturn)
 	if f.hostTunErr != nil {
 		return nil, f.hostTunErr
 	}

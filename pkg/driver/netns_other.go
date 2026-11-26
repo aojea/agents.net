@@ -20,12 +20,19 @@ import (
 	"errors"
 	"io"
 	"net"
+
+	"github.com/aojea/agents.net/pkg/hosttun"
 )
 
 type unsupportedNetNSManager struct{}
 
 // NewLinuxNetNSManager returns a stub NetNSManager on non-Linux hosts.
 func NewLinuxNetNSManager() NetNSManager {
+	return unsupportedNetNSManager{}
+}
+
+// NewLinuxNetNSManagerWithHostTun returns a stub NetNSManager on non-Linux hosts.
+func NewLinuxNetNSManagerWithHostTun(*hosttun.Manager) NetNSManager {
 	return unsupportedNetNSManager{}
 }
 
@@ -53,7 +60,7 @@ func (unsupportedNetNSManager) ListenAt(string, string, string) (net.Listener, e
 	return nil, errors.New("socketat network namespace listener requires Linux")
 }
 
-func (unsupportedNetNSManager) StartHostTun(string, string, int, bool) (io.Closer, error) {
+func (unsupportedNetNSManager) StartHostTun(HostTunRequest) (io.Closer, error) {
 	return nil, errors.New("host TUN adapter requires Linux")
 }
 

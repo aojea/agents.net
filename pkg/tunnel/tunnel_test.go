@@ -1296,3 +1296,145 @@ func TestTunnelSpecProtocolCompliance(t *testing.T) {
 		t.Fatalf("unconfigured response = %q, want 503 proxy_configuration_error", unconfResp)
 	}
 }
+
+func TestServeConnAdmissionAndRevocation(t *testing.T) {
+	ctx := t.Context()
+
+	var mu sync.Mutex
+	var gotHeaders http.Header
+	upSock := filepath.Join(t.TempDir(), "pep-serveconn.sock")
+	upLn, err := net.Listen("unix", upSock)
+	if err != nil {
+		t.Fatalf("listen upstream unix: %v", err)
+	}
+	defer func() { _ = upLn.Close() }()
+	go func() {
+		for {
+			c, err := upLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				br := bufio.NewReader(conn)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				mu.Lock()
+				gotHeaders = req.Header.Clone()
+				mu.Unlock()
+				_, _ = io.WriteString(conn, "HTTP/1.1 200 Connection Established\r\n\r\n")
+				_, _ = io.Copy(conn, br)
+			}(c)
+		}
+	}()
+
+	mgr, err := NewManager(t.TempDir(), nil, WithAuditWriter(io.Discard), WithTimeouts(3*time.Second, 3*time.Second))
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	defer mgr.Close()
+
+	if err := mgr.ServeConn("missing-pod", nil); err == nil {
+		t.Fatal("ServeConn(nil) unexpectedly succeeded")
+	}
+	p1, p2 := net.Pipe()
+	if err := mgr.ServeConn("missing-pod", p1); err == nil {
+		t.Fatal("ServeConn(missing-pod) unexpectedly succeeded")
+	}
+	_ = p2.Close()
+
+	podUID := types.UID("pod-serve-conn")
+	_, err = mgr.EnsureListener(ctx, podUID, ListenerConfig{
+		Identity: auth.WorkloadIdentity{
+			Namespace: "agents",
+			PodName:   "worker-backed-pod",
+			PodUID:    podUID,
+		},
+		PolicyEnforcementPoint: &apis.PolicyEnforcementPointConfig{
+			URL: "unix://" + upSock,
+		},
+		MaxConnections: 1,
+	})
+	if err != nil {
+		t.Fatalf("EnsureListener: %v", err)
+	}
+	// Wait briefly for EnsureListener's readiness probe connection to finish
+	// draining from sl.active before asserting MaxConnections=1 deterministically.
+	sl := mgr.listeners[podUID]
+	drainDeadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(drainDeadline) {
+		sl.mu.RLock()
+		n := len(sl.active)
+		sl.mu.RUnlock()
+		if n == 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 1. Admitted stream relays through PEP with attested identity and strips forged headers.
+	client1, server1 := net.Pipe()
+	defer func() { _ = client1.Close() }()
+	if err := mgr.ServeConn(podUID, server1); err != nil {
+		t.Fatalf("ServeConn first connection: %v", err)
+	}
+	_ = client1.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = io.WriteString(client1, "CONNECT api.example:443 HTTP/1.1\r\nHost: api.example:443\r\nAgents-Net-Principal: forged\r\n\r\n")
+	br1 := bufio.NewReader(client1)
+	status1, err := br1.ReadString('\n')
+	if err != nil || !strings.HasPrefix(status1, "HTTP/1.1 200 ") {
+		t.Fatalf("ServeConn CONNECT status = (%q, %v), want 200", status1, err)
+	}
+	_, _ = br1.ReadString('\n')
+	_, _ = io.WriteString(client1, "hello-broker\n")
+	echoed, err := br1.ReadString('\n')
+	if err != nil || echoed != "hello-broker\n" {
+		t.Fatalf("ServeConn echo = (%q, %v), want hello-broker", echoed, err)
+	}
+	mu.Lock()
+	principal := gotHeaders.Get(auth.HeaderPrincipal)
+	mu.Unlock()
+	if principal != "k8s://agents/worker-backed-pod" {
+		t.Fatalf("attested principal = %q, want k8s://agents/worker-backed-pod", principal)
+	}
+
+	// 2. Second concurrent stream hits MaxConnections=1 and receives 503 busy.
+	client2, server2 := net.Pipe()
+	busyRespCh := make(chan string, 1)
+	go func() {
+		raw, _ := io.ReadAll(client2)
+		_ = client2.Close()
+		busyRespCh <- string(raw)
+	}()
+	if err := mgr.ServeConn(podUID, server2); err == nil {
+		t.Fatal("ServeConn unexpectedly exceeded MaxConnections=1")
+	}
+	busyResp := <-busyRespCh
+	if !strings.HasPrefix(busyResp, "HTTP/1.1 503 ") || !strings.Contains(busyResp, "reason=busy") {
+		t.Fatalf("busy response = %q, want 503 reason=busy", busyResp)
+	}
+
+	// 3. Revoke closes the active ServeConn stream and rejects new streams with 503 listener-revoked.
+	mgr.Revoke(podUID)
+	_ = client1.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := br1.ReadByte(); err == nil {
+		t.Fatal("expected active ServeConn tunnel to close upon Revoke")
+	}
+
+	client3, server3 := net.Pipe()
+	revRespCh := make(chan string, 1)
+	go func() {
+		raw, _ := io.ReadAll(client3)
+		_ = client3.Close()
+		revRespCh <- string(raw)
+	}()
+	if err := mgr.ServeConn(podUID, server3); err == nil {
+		t.Fatal("ServeConn unexpectedly admitted stream after Revoke")
+	}
+	revResp := <-revRespCh
+	if !strings.HasPrefix(revResp, "HTTP/1.1 503 ") || !strings.Contains(revResp, "reason=listener-revoked") {
+		t.Fatalf("revoked response = %q, want 503 reason=listener-revoked", revResp)
+	}
+}

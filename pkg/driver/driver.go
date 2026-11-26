@@ -113,6 +113,17 @@ const (
 	eventReasonPrepareFailed   = "AgentsNetPrepareFailed"
 )
 
+// HostTunRequest describes a sandbox Pod whose persistent tun0 device is
+// attached to an unprivileged host-side userspace stack worker.
+type HostTunRequest struct {
+	PodUID            types.UID
+	NetNSPath         string
+	EgressSocketPath  string
+	ServeEgress       func(net.Conn) error
+	MaxConnections    int
+	PreserveNICReturn bool
+}
+
 // NetNSManager abstracts Pod network namespace inspection, route flushing,
 // tc clsact NIC blocking, cross-netns listener binding (socketat), and
 // host-side TUN injection (HostTun).
@@ -123,7 +134,7 @@ type NetNSManager interface {
 	BlockNonLoopbackNICs(netnsPath string, allowTunTap bool) error
 	VerifyNonLoopbackNICsBlocked(netnsPath string, allowTunTap bool) (bool, error)
 	ListenAt(netnsPath, network, address string) (net.Listener, error)
-	StartHostTun(netnsPath, egressSocketPath string, maxConns int, preserveNICReturn bool) (io.Closer, error)
+	StartHostTun(req HostTunRequest) (io.Closer, error)
 	CleanupHostTun(netnsPath string) error
 }
 
@@ -561,9 +572,13 @@ func (d *Driver) Stop(ctxCancel context.CancelFunc) {
 		nriPlugin.Stop()
 	}
 	d.nriWG.Wait()
-	// Stop host-side tun2connect engines while preserving persistent tun0 devices
-	// inside live Pod netns so the replacement dra-agents-net can re-attach on restart.
+	// Stop host-side tun2connect worker attachments while preserving persistent
+	// tun0 devices inside live Pod netns so the replacement dra-agents-net can
+	// re-attach on restart.
 	d.stopAllHostTuns(false)
+	if closer, ok := d.netns.(io.Closer); ok {
+		_ = closer.Close()
+	}
 	if d.eventBroadcaster != nil {
 		d.eventBroadcaster.Shutdown()
 	}
@@ -593,7 +608,16 @@ func (d *Driver) hasHostTun(podUID types.UID) bool {
 func (d *Driver) startHostTun(podUID types.UID, netnsPath, egressSocketPath string, maxConns int, preserveNICReturn bool) error {
 	// Detach any prior host TUN instance for this Pod before re-opening tun0.
 	d.stopHostTun(podUID, false)
-	closer, err := d.netns.StartHostTun(netnsPath, egressSocketPath, maxConns, preserveNICReturn)
+	closer, err := d.netns.StartHostTun(HostTunRequest{
+		PodUID:           podUID,
+		NetNSPath:        netnsPath,
+		EgressSocketPath: egressSocketPath,
+		ServeEgress: func(conn net.Conn) error {
+			return d.tunnel.ServeConn(podUID, conn)
+		},
+		MaxConnections:    maxConns,
+		PreserveNICReturn: preserveNICReturn,
+	})
 	if err != nil {
 		return err
 	}
