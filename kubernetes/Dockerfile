@@ -17,13 +17,16 @@ FROM --platform=$BUILDPLATFORM golang:1.27.3 AS builder
 ARG TARGETARCH
 
 WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
+COPY sdk/go.mod sdk/go.sum ./sdk/
+COPY kubernetes/go.mod kubernetes/go.sum ./kubernetes/
+RUN cd kubernetes && GOWORK=off go mod download
 
-COPY cmd/ ./cmd/
-COPY pkg/ ./pkg/
+COPY sdk/ ./sdk/
+COPY kubernetes/cmd/ ./kubernetes/cmd/
+COPY kubernetes/pkg/ ./kubernetes/pkg/
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=${TARGETARCH} go build \
+WORKDIR /src/kubernetes
+RUN CGO_ENABLED=0 GOWORK=off GOOS=linux GOARCH=${TARGETARCH} go build \
     -ldflags="-s -w" \
     -o /dra-agents-net ./cmd/dra-agents-net
 

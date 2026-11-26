@@ -175,7 +175,7 @@ func main() {
 
   sudo ip link set %[1]s up
   sudo ip addr add 10.255.255.2/32 dev %[1]s
-  sudo ip route add 100.64.0.0/10 dev %[1]s src 10.255.255.2
+  sudo ip route add 198.18.0.0/15 dev %[1]s src 10.255.255.2
   sudo ip -6 route add 100::/64 dev %[1]s
 
 then point DNS at the virtual resolver (any pool address works: the

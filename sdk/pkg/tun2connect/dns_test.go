@@ -46,8 +46,27 @@ func TestResolveStableAndReverse(t *testing.T) {
 
 func TestReverseMissForUnknownAddress(t *testing.T) {
 	d := NewVirtualDNS()
-	if name, ok := d.Reverse(netip.MustParseAddr("100.64.9.9")); ok {
+	if name, ok := d.Reverse(netip.MustParseAddr("198.18.9.9")); ok {
 		t.Fatalf("unexpected mapping %q for an address never handed out", name)
+	}
+}
+
+func TestInSyntheticPool(t *testing.T) {
+	d := NewVirtualDNS()
+	for _, tc := range []struct {
+		addr string
+		want bool
+	}{
+		{"198.18.0.1", true},
+		{"198.19.255.253", true},
+		{"100::1", true},
+		{"100.64.0.1", false},
+		{"203.0.113.10", false},
+		{"2001:db8::1", false},
+	} {
+		if got := d.InSyntheticPool(netip.MustParseAddr(tc.addr)); got != tc.want {
+			t.Errorf("InSyntheticPool(%s) = %v, want %v", tc.addr, got, tc.want)
+		}
 	}
 }
 

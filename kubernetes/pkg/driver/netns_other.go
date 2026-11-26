@@ -18,6 +18,7 @@ package driver
 
 import (
 	"errors"
+	"io"
 	"net"
 )
 
@@ -50,4 +51,12 @@ func (unsupportedNetNSManager) VerifyNonLoopbackNICsBlocked(string, bool) (bool,
 
 func (unsupportedNetNSManager) ListenAt(string, string, string) (net.Listener, error) {
 	return nil, errors.New("socketat network namespace listener requires Linux")
+}
+
+func (unsupportedNetNSManager) StartHostTun(string, string, int, bool) (io.Closer, error) {
+	return nil, errors.New("host TUN adapter requires Linux")
+}
+
+func (unsupportedNetNSManager) CleanupHostTun(string) error {
+	return nil
 }

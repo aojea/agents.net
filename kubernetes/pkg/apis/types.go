@@ -93,7 +93,7 @@ type NICBlockMode string
 const (
 	// NICBlockModeDropAll (default) flushes non-loopback routes and attaches tc clsact
 	// matchall DROP filters on ingress and egress of every non-loopback NIC inside the
-	// Pod netns (excluding tuntap in TunSidecar mode).
+	// Pod netns (excluding tuntap in HostTun and TunSidecar modes).
 	NICBlockModeDropAll NICBlockMode = "DropAll"
 
 	// NICBlockModeDisabled leaves eth0 routes and tc filters untouched so CNI NetworkPolicy
@@ -106,6 +106,12 @@ const (
 type AdapterMode string
 
 const (
+	// AdapterModeHostTun (default) creates a persistent TUN device (tun0) inside the
+	// Pod netns during NRI RunPodSandbox and terminates TCP, UDP, and VirtualDNS in
+	// userspace on the host via tun2connect, requiring no sidecar container and no
+	// Pod capabilities while capturing clients that ignore HTTP_PROXY transparently.
+	AdapterModeHostTun AdapterMode = "HostTun"
+
 	// AdapterModeTunSidecar injects one tun2connect native sidecar per Pod netns.
 	AdapterModeTunSidecar AdapterMode = "TunSidecar"
 

@@ -14,7 +14,10 @@ const (
 	dnsIdleTimeout  = 3 * time.Second
 )
 
-var ErrInvalidDestination = errors.New("tun2connect: invalid destination")
+var (
+	ErrInvalidDestination      = errors.New("tun2connect: invalid destination")
+	ErrUnknownSyntheticAddress = errors.New("tun2connect: unmapped synthetic address")
+)
 
 type Forwarder struct {
 	Dialer         Dialer
@@ -38,6 +41,9 @@ func (f *Forwarder) targetHost(destination netip.AddrPort) (string, error) {
 	address := destination.Addr().Unmap()
 	if name, ok := f.DNS.Reverse(address); ok {
 		return name, nil
+	}
+	if f.DNS.InSyntheticPool(address) {
+		return "", ErrUnknownSyntheticAddress
 	}
 	return address.String(), nil
 }

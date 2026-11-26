@@ -163,6 +163,7 @@ func main() {
 
 	var (
 		ingressSrv        *ingress.Server
+		ingressRevoker    driver.IngressRevoker
 		ingressTLSEnabled bool
 	)
 	if ingressAddr != "" {
@@ -180,6 +181,7 @@ func main() {
 		if err != nil {
 			klog.Fatalf("create ingress bridge: %v", err)
 		}
+		ingressRevoker = ingressSrv
 	}
 
 	drv, err := driver.New(driver.Config{
@@ -189,7 +191,7 @@ func main() {
 		KubeClient:           kubeClient,
 		Store:                podStore,
 		Tunnel:               tunnelMgr,
-		Ingress:              ingressSrv,
+		Ingress:              ingressRevoker,
 		CAMaterializer:       catrust.NewMaterializer(kubeClient, systemRootsPath),
 		MaxSandboxes:         maxSandboxes,
 		KubeletRootDir:       kubeletRoot,

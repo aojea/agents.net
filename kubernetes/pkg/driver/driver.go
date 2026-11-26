@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"os"
@@ -67,6 +68,7 @@ import (
 	"github.com/aojea/agents.net/kubernetes/pkg/proxyenv"
 	"github.com/aojea/agents.net/kubernetes/pkg/store"
 	"github.com/aojea/agents.net/kubernetes/pkg/tunnel"
+	"github.com/aojea/agents.net/sdk/pkg/tun2connect"
 )
 
 const (
@@ -87,6 +89,7 @@ const (
 
 	containerEgressMountDir  = "/run/agents.net"
 	containerIngressMountDir = "/run/agents.net/ingress"
+	containerResolvConfPath  = "/etc/resolv.conf"
 
 	// maxNRIAttempts caps consecutive NRI connection failures before exiting.
 	// The containerd/nri v0.12.5 stub cannot reconnect after a failed registration.
@@ -111,7 +114,8 @@ const (
 )
 
 // NetNSManager abstracts Pod network namespace inspection, route flushing,
-// tc clsact NIC blocking, and goroutine-safe cross-netns listener binding (socketat).
+// tc clsact NIC blocking, cross-netns listener binding (socketat), and
+// host-side TUN injection (HostTun).
 type NetNSManager interface {
 	VerifyLoopbackOnly(netnsPath string, allowTunTap bool) error
 	FlushNonLoopbackRoutes(netnsPath string) error
@@ -119,6 +123,13 @@ type NetNSManager interface {
 	BlockNonLoopbackNICs(netnsPath string, allowTunTap bool) error
 	VerifyNonLoopbackNICsBlocked(netnsPath string, allowTunTap bool) (bool, error)
 	ListenAt(netnsPath, network, address string) (net.Listener, error)
+	StartHostTun(netnsPath, egressSocketPath string, maxConns int, preserveNICReturn bool) (io.Closer, error)
+	CleanupHostTun(netnsPath string) error
+}
+
+type hostTunEntry struct {
+	closer io.Closer
+	netns  string
 }
 
 // IngressRevoker revokes and re-allows host ingress connections across a Pod's lifecycle.
@@ -202,6 +213,9 @@ type Driver struct {
 
 	unhealthy atomic.Bool
 	statusWG  sync.WaitGroup
+
+	hostTunMu sync.Mutex
+	hostTuns  map[types.UID]hostTunEntry
 }
 
 var _ kubeletplugin.DRAPlugin = &Driver{}
@@ -278,6 +292,7 @@ func New(cfg Config) (*Driver, error) {
 		eventBroadcaster:     broadcaster,
 		eventRecorder:        recorder,
 		onNRIFatal:           onNRIFatal,
+		hostTuns:             make(map[types.UID]hostTunEntry),
 	}, nil
 }
 
@@ -546,10 +561,88 @@ func (d *Driver) Stop(ctxCancel context.CancelFunc) {
 		nriPlugin.Stop()
 	}
 	d.nriWG.Wait()
+	// Stop host-side tun2connect engines while preserving persistent tun0 devices
+	// inside live Pod netns so the replacement dra-agents-net can re-attach on restart.
+	d.stopAllHostTuns(false)
 	if d.eventBroadcaster != nil {
 		d.eventBroadcaster.Shutdown()
 	}
 	klog.InfoS("dra-agents-net driver stopped", "driver", d.driverName)
+}
+
+func usesTunAdapter(mode apis.AdapterMode) bool {
+	return mode == apis.AdapterModeHostTun || mode == apis.AdapterModeTunSidecar
+}
+
+func writeHostTunResolvConf(podRootDir string) (string, error) {
+	path := filepath.Join(podRootDir, "resolv.conf")
+	content := fmt.Sprintf("nameserver %s\n", tun2connect.DefaultResolverAddr)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", fmt.Errorf("write HostTun resolv.conf %q: %w", path, err)
+	}
+	return path, nil
+}
+
+func (d *Driver) hasHostTun(podUID types.UID) bool {
+	d.hostTunMu.Lock()
+	defer d.hostTunMu.Unlock()
+	_, ok := d.hostTuns[podUID]
+	return ok
+}
+
+func (d *Driver) startHostTun(podUID types.UID, netnsPath, egressSocketPath string, maxConns int, preserveNICReturn bool) error {
+	// Detach any prior host TUN instance for this Pod before re-opening tun0.
+	d.stopHostTun(podUID, false)
+	closer, err := d.netns.StartHostTun(netnsPath, egressSocketPath, maxConns, preserveNICReturn)
+	if err != nil {
+		return err
+	}
+	d.hostTunMu.Lock()
+	if prev, ok := d.hostTuns[podUID]; ok {
+		delete(d.hostTuns, podUID)
+		d.hostTunMu.Unlock()
+		_ = prev.closer.Close()
+		d.hostTunMu.Lock()
+	}
+	d.hostTuns[podUID] = hostTunEntry{closer: closer, netns: netnsPath}
+	d.hostTunMu.Unlock()
+	return nil
+}
+
+func (d *Driver) stopHostTun(podUID types.UID, deleteDevice bool) {
+	d.hostTunMu.Lock()
+	entry, ok := d.hostTuns[podUID]
+	if ok {
+		delete(d.hostTuns, podUID)
+	}
+	d.hostTunMu.Unlock()
+	if !ok {
+		return
+	}
+	if entry.closer != nil {
+		_ = entry.closer.Close()
+	}
+	if deleteDevice && entry.netns != "" {
+		_ = d.netns.CleanupHostTun(entry.netns)
+	}
+}
+
+func (d *Driver) stopAllHostTuns(deleteDevice bool) {
+	d.hostTunMu.Lock()
+	entries := make([]hostTunEntry, 0, len(d.hostTuns))
+	for uid, entry := range d.hostTuns {
+		entries = append(entries, entry)
+		delete(d.hostTuns, uid)
+	}
+	d.hostTunMu.Unlock()
+	for _, entry := range entries {
+		if entry.closer != nil {
+			_ = entry.closer.Close()
+		}
+		if deleteDevice && entry.netns != "" {
+			_ = d.netns.CleanupHostTun(entry.netns)
+		}
+	}
 }
 
 func (d *Driver) startNodePodInformer(ctx context.Context) {
@@ -864,6 +957,17 @@ func (d *Driver) prepareResourceClaim(ctx context.Context, claim *resourceapi.Re
 		return kubeletplugin.PrepareResult{Err: fmt.Errorf("start agents.net listener for pod %s: %w", podUID, err)}, metrics.StatusFailed
 	}
 
+	if netParams.EffectiveAdapterMode() == apis.AdapterModeHostTun {
+		resolvPath, err := writeHostTunResolvConf(paths.PodRootDir)
+		if err != nil {
+			if !existed {
+				_ = d.tunnel.Remove(podUID)
+			}
+			return kubeletplugin.PrepareResult{Err: fmt.Errorf("prepare HostTun resolv.conf for pod %s: %w", podUID, err)}, metrics.StatusFailed
+		}
+		paths.ResolvConfPath = resolvPath
+	}
+
 	caBundle, err := d.caMat.Materialize(ctx, netParams.CATrust, claim.Namespace, filepath.Join(paths.PodRootDir, "ca"))
 	if err != nil {
 		if !existed {
@@ -927,6 +1031,7 @@ func (d *Driver) UnprepareResourceClaims(_ context.Context, claims []kubeletplug
 		if d.ingress != nil {
 			d.ingress.Revoke(podCfg.PodUID)
 		}
+		d.stopHostTun(podCfg.PodUID, true)
 		if err := d.tunnel.Remove(podCfg.PodUID); err != nil {
 			errs = append(errs, err)
 		}
@@ -1004,6 +1109,7 @@ func (d *Driver) Synchronize(ctx context.Context, pods []*nriapi.PodSandbox, con
 			if d.ingress != nil {
 				d.ingress.Revoke(uid)
 			}
+			d.stopHostTun(uid, false)
 			_ = d.tunnel.Remove(uid)
 			if err := d.store.Delete(uid); err == nil && d.ingress != nil {
 				d.ingress.Allow(uid)
@@ -1045,13 +1151,24 @@ func (d *Driver) Synchronize(ctx context.Context, pods []*nriapi.PodSandbox, con
 			continue
 		}
 
-		if cfg.Parameters.EffectiveAdapterMode() == apis.AdapterModeExplicitProxy && ns != "" && !d.tunnel.HasExtraListener(uid) {
-			addr := fmt.Sprintf("127.0.0.1:%d", cfg.Parameters.EffectiveProxyPort())
-			ln, err := d.netns.ListenAt(ns, "tcp", addr)
-			if err != nil {
-				klog.ErrorS(err, "failed to restore socketat loopback proxy listener during Synchronize", "podUID", uid, "addr", addr)
-			} else if err := d.tunnel.AttachListener(uid, ln); err != nil {
-				klog.ErrorS(err, "failed to attach restored loopback listener", "podUID", uid)
+		switch cfg.Parameters.EffectiveAdapterMode() {
+		case apis.AdapterModeHostTun:
+			if ns != "" && !d.hasHostTun(uid) {
+				preserveNICReturn := cfg.Parameters.ConfinementMode == apis.ConfinementModeNetworkPolicyDenyAll &&
+					cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDisabled
+				if err := d.startHostTun(uid, ns, cfg.SocketPaths.EgressSocketPath, maxConns, preserveNICReturn); err != nil {
+					klog.ErrorS(err, "failed to restore HostTun adapter during Synchronize", "podUID", uid)
+				}
+			}
+		case apis.AdapterModeExplicitProxy:
+			if ns != "" && !d.tunnel.HasExtraListener(uid) {
+				addr := fmt.Sprintf("127.0.0.1:%d", cfg.Parameters.EffectiveProxyPort())
+				ln, err := d.netns.ListenAt(ns, "tcp", addr)
+				if err != nil {
+					klog.ErrorS(err, "failed to restore socketat loopback proxy listener during Synchronize", "podUID", uid, "addr", addr)
+				} else if err := d.tunnel.AttachListener(uid, ln); err != nil {
+					klog.ErrorS(err, "failed to attach restored loopback listener", "podUID", uid)
+				}
 			}
 		}
 	}
@@ -1093,7 +1210,7 @@ func (d *Driver) reportMissingPlumbing(pod *nriapi.PodSandbox, runningCtrs []*nr
 		}
 		switch mode {
 		case apis.ConfinementModePodNetworkIsolated:
-			allowTunTap := cfg.Parameters.EffectiveAdapterMode() == apis.AdapterModeTunSidecar
+			allowTunTap := usesTunAdapter(cfg.Parameters.EffectiveAdapterMode())
 			if err := d.netns.VerifyLoopbackOnly(ns, allowTunTap); err != nil {
 				missing = append(missing, "loopback-only-netns")
 			}
@@ -1106,7 +1223,7 @@ func (d *Driver) reportMissingPlumbing(pod *nriapi.PodSandbox, runningCtrs []*nr
 				} else if hasRoutes {
 					missing = append(missing, "non-loopback-routes-unflushed")
 				}
-				allowTunTap := cfg.Parameters.EffectiveAdapterMode() == apis.AdapterModeTunSidecar
+				allowTunTap := usesTunAdapter(cfg.Parameters.EffectiveAdapterMode())
 				blocked, err := d.netns.VerifyNonLoopbackNICsBlocked(ns, allowTunTap)
 				if err != nil {
 					klog.ErrorS(err, "failed to inspect Pod tc NIC drop filters during Synchronize",
@@ -1119,11 +1236,16 @@ func (d *Driver) reportMissingPlumbing(pod *nriapi.PodSandbox, runningCtrs []*nr
 	}
 
 	// 2. Verify required NRI container mounts on running containers.
-	adapterMode := cfg.Parameters.AdapterMode
-	if adapterMode == "" {
-		adapterMode = apis.AdapterModeExplicitProxy
-	}
-	switch adapterMode {
+	switch cfg.Parameters.EffectiveAdapterMode() {
+	case apis.AdapterModeHostTun:
+		if cfg.SocketPaths.ResolvConfPath != "" {
+			for _, ctr := range runningCtrs {
+				if !containerHasMountSource(ctr, containerResolvConfPath, cfg.SocketPaths.ResolvConfPath) {
+					missing = append(missing, "host-tun-resolv-conf")
+					break
+				}
+			}
+		}
 	case apis.AdapterModeExplicitProxy:
 		for _, ctr := range runningCtrs {
 			if !containerHasMount(ctr, containerEgressMountDir) {
@@ -1172,8 +1294,12 @@ func (d *Driver) reportMissingPlumbing(pod *nriapi.PodSandbox, runningCtrs []*nr
 }
 
 func containerHasMount(ctr *nriapi.Container, destination string) bool {
+	return containerHasMountSource(ctr, destination, "")
+}
+
+func containerHasMountSource(ctr *nriapi.Container, destination, source string) bool {
 	for _, m := range ctr.GetMounts() {
-		if m.GetDestination() == destination {
+		if m.GetDestination() == destination && (source == "" || m.GetSource() == source) {
 			return true
 		}
 	}
@@ -1221,7 +1347,8 @@ func (d *Driver) RunPodSandbox(_ context.Context, pod *nriapi.PodSandbox) error 
 
 	switch mode {
 	case apis.ConfinementModePodNetworkIsolated:
-		if err := d.netns.VerifyLoopbackOnly(ns, false); err != nil {
+		allowExistingHostTun := cfg.Parameters.EffectiveAdapterMode() == apis.AdapterModeHostTun && cfg.NetNS == ns
+		if err := d.netns.VerifyLoopbackOnly(ns, allowExistingHostTun); err != nil {
 			status = metrics.StatusFailed
 			return fmt.Errorf("PodNetworkIsolated check failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
 		}
@@ -1233,7 +1360,7 @@ func (d *Driver) RunPodSandbox(_ context.Context, pod *nriapi.PodSandbox) error 
 				status = metrics.StatusFailed
 				return fmt.Errorf("NetworkPolicyDenyAll route flush failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
 			}
-			allowTunTap := cfg.Parameters.EffectiveAdapterMode() == apis.AdapterModeTunSidecar
+			allowTunTap := usesTunAdapter(cfg.Parameters.EffectiveAdapterMode())
 			if err := d.netns.BlockNonLoopbackNICs(ns, allowTunTap); err != nil {
 				status = metrics.StatusFailed
 				return fmt.Errorf("NetworkPolicyDenyAll tc NIC blocking failed for pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
@@ -1251,7 +1378,19 @@ func (d *Driver) RunPodSandbox(_ context.Context, pod *nriapi.PodSandbox) error 
 		d.ingress.Allow(podUID)
 	}
 
-	if cfg.Parameters.EffectiveAdapterMode() == apis.AdapterModeExplicitProxy {
+	switch cfg.Parameters.EffectiveAdapterMode() {
+	case apis.AdapterModeHostTun:
+		maxConns := int(params.DefaultMaxConnections)
+		if cfg.Parameters.MaxConnections != nil {
+			maxConns = int(*cfg.Parameters.MaxConnections)
+		}
+		preserveNICReturn := mode == apis.ConfinementModeNetworkPolicyDenyAll &&
+			cfg.Parameters.EffectiveNICBlockMode() == apis.NICBlockModeDisabled
+		if err := d.startHostTun(podUID, ns, cfg.SocketPaths.EgressSocketPath, maxConns, preserveNICReturn); err != nil {
+			status = metrics.StatusFailed
+			return fmt.Errorf("start HostTun in pod %s/%s: %w", pod.GetNamespace(), pod.GetName(), err)
+		}
+	case apis.AdapterModeExplicitProxy:
 		addr := fmt.Sprintf("127.0.0.1:%d", cfg.Parameters.EffectiveProxyPort())
 		ln, err := d.netns.ListenAt(ns, "tcp", addr)
 		if err != nil {
@@ -1301,12 +1440,19 @@ func (d *Driver) CreateContainer(_ context.Context, pod *nriapi.PodSandbox, ctr 
 	desiredEnv := make(map[string]string)
 	var javaToolOpts string
 
-	adapterMode := cfg.Parameters.AdapterMode
-	if adapterMode == "" {
-		adapterMode = apis.AdapterModeExplicitProxy
-	}
+	switch cfg.Parameters.EffectiveAdapterMode() {
+	case apis.AdapterModeHostTun:
+		if cfg.SocketPaths.ResolvConfPath != "" {
+			changed = true
+			adj.RemoveMount(containerResolvConfPath)
+			adj.AddMount(&nriapi.Mount{
+				Destination: containerResolvConfPath,
+				Source:      cfg.SocketPaths.ResolvConfPath,
+				Type:        "bind",
+				Options:     []string{"rbind", "ro"},
+			})
+		}
 
-	switch adapterMode {
 	case apis.AdapterModeTunSidecar:
 		if ctr.GetName() == Tun2ConnectContainerName {
 			changed = true
@@ -1427,16 +1573,18 @@ func (d *Driver) StopPodSandbox(_ context.Context, pod *nriapi.PodSandbox) error
 	if d.ingress != nil {
 		d.ingress.Revoke(podUID)
 	}
+	d.stopHostTun(podUID, false)
 	d.tunnel.Revoke(podUID)
 	d.reportResourceClaimDeviceStatusAsync(cfg, false)
 	status = metrics.StatusSuccess
 	return nil
 }
 
-// RemovePodSandbox detaches sandbox-scoped resources (socketat loopback listeners and NetNS)
-// for the matching PodSandbox ID while keeping DRA-owned state (store checkpoint, egress.sock,
-// and CA bundles) intact until UnprepareResourceClaims runs. Preserving DRA-owned state ensures
-// kubelet PodSandbox retries retain full confinement and plumbing.
+// RemovePodSandbox detaches sandbox-scoped resources (HostTun engines, socketat
+// loopback listeners, and NetNS) for the matching PodSandbox ID while keeping
+// DRA-owned state (store checkpoint, egress.sock, and CA bundles) intact until
+// UnprepareResourceClaims runs. Preserving DRA-owned state ensures kubelet
+// PodSandbox retries retain full confinement and plumbing.
 func (d *Driver) RemovePodSandbox(_ context.Context, pod *nriapi.PodSandbox) error {
 	start := time.Now()
 	status := metrics.StatusNoop
@@ -1455,6 +1603,7 @@ func (d *Driver) RemovePodSandbox(_ context.Context, pod *nriapi.PodSandbox) err
 	if d.ingress != nil {
 		d.ingress.Revoke(podUID)
 	}
+	d.stopHostTun(podUID, true)
 	d.tunnel.Revoke(podUID)
 	d.tunnel.DetachExtraListeners(podUID)
 	if err := d.store.UpdateSandbox(podUID, "", "", time.Time{}); err != nil {
