@@ -87,7 +87,10 @@ The full git history is kept intact so you can follow how earlier experiments le
 | [pkg/auth](pkg/auth), [pkg/catrust](pkg/catrust) | Mandatory mTLS (`MTLS`, `SPIFFE`, KEP-4317 `PodCertificate`), RFC 8941 attested identity headers, and CA bundle materialization |
 | [pkg/ingress](pkg/ingress), [pkg/gateway](pkg/gateway) | Node-side mTLS `CONNECT <podUID>:<port>` ingress bridge and reference ingress gateway |
 | [pkg/socketat](pkg/socketat), [pkg/store](pkg/store), [pkg/metrics](pkg/metrics), [pkg/proxyenv](pkg/proxyenv) | Cross-netns helpers, BoltDB checkpoint store, Prometheus metrics, and explicit-proxy env helpers |
-| [test/smoke.sh](test/smoke.sh) | End-to-end `kind` v1.36 smoke test with full mTLS on both egress PEP and `LoadBalancer` ingress |
+| [test/smoke.sh](test/smoke.sh) | End-to-end `kind` v1.36 smoke test (`runc`, `HostTun` two-container `kube-netstack`, `Synthetic` + `DoH`, `kube-pep`, `kube-inbound` `LoadBalancer`) |
+| [test/envoy/run.sh](test/envoy/run.sh) | Unmodified Envoy Proxy (`v1.36.2`) interop E2E (mTLS HTTP/2 `CONNECT` + `connect-udp` + RFC 8484 `DoH` + RBAC + Envoy inbound mTLS `CONNECT` tunneling) |
+| [test/gvisor/run.sh](test/gvisor/run.sh) | End-to-end `kind` v1.36 `RuntimeClass: gvisor` (`runsc`) E2E (confinement, host-UDS `egress.sock` TCP/UDP/DoH -> `kube-pep`, `kube-inbound` -> host-UDS `ingress.sock`) |
+| [test/microvm/run.sh](test/microvm/run.sh) | End-to-end KVM microVM E2E covering both zero-agent QEMU L2 `virtio-net` (`tapFD` -> `kube-netstack` + `OpDialInbound`) and zero-NIC Firecracker `v1.16.1` (`AF_VSOCK` -> `kube-pep`) |
 
 ---
 
@@ -212,8 +215,17 @@ make test
 # Static analysis and formatting
 make vet
 
-# End-to-end kind v1.36 smoke test (mTLS egress + LoadBalancer ingress)
+# End-to-end kind v1.36 smoke test (runc + kube-netstack + kube-pep + kube-inbound)
 USE_CLOUD_PROVIDER_KIND=true ./test/smoke.sh
+
+# Unmodified Envoy Proxy PEP + Inbound E2E interop suite
+make test-envoy
+
+# End-to-end kind v1.36 gVisor (runsc) E2E suite
+make test-gvisor
+
+# End-to-end KVM microVM E2E suite (QEMU L2 tapFD + Firecracker AF_VSOCK; requires /dev/kvm)
+make test-microvm
 ```
 
 ## License

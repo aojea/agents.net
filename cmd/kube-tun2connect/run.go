@@ -72,6 +72,8 @@ func runLauncher(args []string) {
 	device := fs.String("device", "tun0", "TUN device name to create")
 	mtu := fs.Uint("mtu", 1500, "TUN MTU")
 	udp := fs.Bool("udp", false, "tunnel UDP sessions via connect-udp (DNS is always answered locally)")
+	h2 := fs.Bool("h2", false, "multiplex flows over one HTTP/2 (prior-knowledge) session to the boundary")
+	doh := fs.Bool("doh", false, "forward DNS queries via RFC 8484 DoH over the boundary channel (preserves NXDOMAIN)")
 	dnsTTL := fs.Duration("dns-ttl", tun2connect.DefaultTTL, "TTL on synthetic DNS answers, in whole seconds (0 asks clients not to cache)")
 	ingress := fs.String("ingress-socket", "", "serve the ingress channel (HTTP CONNECT 127.0.0.1:<port> or [::1]:<port>) on this Unix socket path or vsock://PORT; requires -ingress-port")
 	ingressPorts := fs.String("ingress-port", "", "comma-separated ports or ranges ingress streams may be joined to, e.g. 8081 or 443,8000-9000 (1-65535); nothing else is reachable")
@@ -134,12 +136,29 @@ func runLauncher(args []string) {
 	if err != nil {
 		log.Fatalf("link endpoint: %v", err)
 	}
-	client := &tun2connect.BoundaryClient{DialBoundary: dial}
+	var (
+		dialer     tun2connect.Dialer
+		dnsHandler tun2connect.DNSHandler = dns
+	)
+	if *h2 {
+		c := &tun2connect.BoundaryClientH2{DialBoundary: dial}
+		dialer = c
+		if *doh {
+			dnsHandler = tun2connect.NewDoHVirtualDNS(dns, c.QueryDoH)
+		}
+	} else {
+		c := &tun2connect.BoundaryClient{DialBoundary: dial}
+		dialer = c
+		if *doh {
+			dnsHandler = tun2connect.NewDoHVirtualDNS(dns, c.QueryDoH)
+		}
+	}
 	eng, err := tun2connect.New(tun2connect.Config{
-		Device:    dev,
-		Dialer:    client,
-		DNS:       dns,
-		EnableUDP: *udp,
+		Device:     dev,
+		Dialer:     dialer,
+		DNS:        dns,
+		DNSHandler: dnsHandler,
+		EnableUDP:  *udp,
 	})
 	if err != nil {
 		log.Fatal(err)

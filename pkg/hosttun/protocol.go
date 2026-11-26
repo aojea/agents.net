@@ -44,10 +44,19 @@ const (
 	// DaemonSet deployment.
 	DefaultWorkerSocket = "/run/hosttun/worker.sock"
 
-	// OpAdd attaches a sandbox's TUN and dial-broker file descriptors to the worker.
+	// OpAdd attaches a sandbox's TUN or L2 TAP and dial-broker file descriptors to the worker.
 	OpAdd = "add"
-	// OpRemove detaches a sandbox and closes its TUN and dial-broker descriptors.
+	// OpRemove detaches a sandbox and closes its TUN/TAP and dial-broker descriptors.
 	OpRemove = "remove"
+	// OpDialInbound asks the worker to open an inbound TCP connection into the
+	// guest (for example an L2 microVM over virtio-net/TAP) and bridge it to the
+	// parent-supplied AF_UNIX SOCK_STREAM descriptor sent via SCM_RIGHTS.
+	OpDialInbound = "dial_inbound"
+
+	// LinkModeTUN wraps raw L3 IP packets (no Ethernet header, default for container tun0).
+	LinkModeTUN = "tun"
+	// LinkModeTAP wraps L2 Ethernet frames with ARP (for microVM virtio-net / TAP / QEMU dgram).
+	LinkModeTAP = "tap"
 
 	// DNSModeSynthetic answers guest DNS queries locally with synthetic IPs.
 	DNSModeSynthetic = "synthetic"
@@ -94,14 +103,19 @@ func ParseIsolationMode(raw string) (IsolationMode, error) {
 
 // ControlRequest is one JSON datagram sent from the plumbing parent to a worker
 // on the control SOCK_SEQPACKET socket (FD 3). OpAdd accompanies 2 SCM_RIGHTS
-// file descriptors: [tunFD, brokerFD].
+// file descriptors: [tunFD, brokerFD]. OpDialInbound accompanies 1 SCM_RIGHTS
+// file descriptor: [streamFD].
 type ControlRequest struct {
-	Op             string `json:"op"`
-	PodID          string `json:"pod_id"`
-	MTU            int    `json:"mtu,omitempty"`
-	MaxConnections int    `json:"max_connections,omitempty"`
-	EnableUDP      bool   `json:"enable_udp,omitempty"`
-	DNSMode        string `json:"dns_mode,omitempty"`
+	Op             string   `json:"op"`
+	PodID          string   `json:"pod_id"`
+	MTU            int      `json:"mtu,omitempty"`
+	MaxConnections int      `json:"max_connections,omitempty"`
+	EnableUDP      bool     `json:"enable_udp,omitempty"`
+	DNSMode        string   `json:"dns_mode,omitempty"`
+	LinkMode       string   `json:"link_mode,omitempty"`
+	Addresses      []string `json:"addresses,omitempty"`
+	Addr           string   `json:"addr,omitempty"`
+	Port           uint16   `json:"port,omitempty"`
 }
 
 // ControlResponse is the worker's JSON reply datagram for one ControlRequest.
@@ -129,7 +143,7 @@ type ManagerConfig struct {
 	WorkerArgs []string
 }
 
-// AttachConfig supplies one sandbox's TUN file descriptor and egress callback
+// AttachConfig supplies one sandbox's TUN/TAP file descriptor and egress callback
 // for attachment to an unprivileged worker. Manager takes ownership of TunFD
 // and closes it in the parent immediately after SCM_RIGHTS handoff.
 type AttachConfig struct {
@@ -139,6 +153,8 @@ type AttachConfig struct {
 	MaxConnections int
 	EnableUDP      bool
 	DNSMode        string
+	LinkMode       string
+	Addresses      []string
 
 	// ServeEgress admits a parent-side kernel socketpair directly into the Pod's
 	// tunnel listener so the worker needs zero filesystem access.

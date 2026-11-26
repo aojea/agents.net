@@ -1,0 +1,45 @@
+name: MicroVM KVM E2E
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  microvm-kvm:
+    name: KVM MicroVM E2E (QEMU L2 tapFD -> kube-netstack + Firecracker AF_VSOCK -> kube-pep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Enable KVM for runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --settle --name-match=kvm
+          ls -l /dev/kvm
+          test -r /dev/kvm -a -w /dev/kvm
+
+      - name: Install QEMU and e2fsprogs
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q qemu-system-x86 e2fsprogs
+
+      - name: Cache kernel and Firecracker binary
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/agents.net
+          key: microvm-assets-6.18.41-fc-v1.16.1
+
+      - name: Run MicroVM KVM E2E suite
+        run: ./test/microvm/run.sh

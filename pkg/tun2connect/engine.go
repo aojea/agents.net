@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/netip"
 	"sync"
 	"time"
@@ -162,6 +163,26 @@ func (e *Engine) Close() {
 		e.stack.Close()
 		e.stack.Wait()
 	})
+}
+
+// DialGuestTCP opens a TCP connection from the userspace stack into the guest
+// (for example, delivering inbound traffic over an L2 virtio-net/TAP link into
+// a microVM without host kernel routes or socketat).
+func (e *Engine) DialGuestTCP(ctx context.Context, addr netip.Addr, port uint16) (net.Conn, error) {
+	addr = addr.Unmap()
+	if !addr.IsValid() || port == 0 {
+		return nil, fmt.Errorf("tun2connect: invalid guest TCP target %v:%d", addr, port)
+	}
+	proto := ipv4.ProtocolNumber
+	if addr.Is6() {
+		proto = ipv6.ProtocolNumber
+	}
+	raddr := tcpip.FullAddress{
+		NIC:  nicID,
+		Addr: tcpip.AddrFromSlice(addr.AsSlice()),
+		Port: port,
+	}
+	return gonet.DialContextTCP(ctx, e.stack, raddr, proto)
 }
 
 func (e *Engine) acquire() bool {

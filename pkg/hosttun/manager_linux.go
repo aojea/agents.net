@@ -17,11 +17,13 @@
 package hosttun
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"strconv"
@@ -139,6 +141,8 @@ func (m *Manager) Attach(cfg AttachConfig) (io.Closer, error) {
 		MaxConnections: cfg.MaxConnections,
 		EnableUDP:      cfg.EnableUDP,
 		DNSMode:        cfg.DNSMode,
+		LinkMode:       cfg.LinkMode,
+		Addresses:      cfg.Addresses,
 	}
 	sendErr := wp.call(req, tunFD, int(brokerWorker.Fd()))
 	_ = brokerWorker.Close()
@@ -172,6 +176,49 @@ func (m *Manager) WorkerPID(podID string) int {
 		return 0
 	}
 	return ap.worker.pid
+}
+
+// DialInbound asks the unprivileged stack worker serving podID to open a TCP
+// connection to addr:port inside the sandbox (for example an L2 microVM over
+// virtio-net/TAP) and returns the parent end of a connected AF_UNIX socketpair.
+func (m *Manager) DialInbound(_ context.Context, podID string, addr netip.Addr, port uint16) (net.Conn, error) {
+	if podID == "" || !addr.IsValid() || port == 0 {
+		return nil, fmt.Errorf("invalid inbound dial target pod=%q addr=%v port=%d", podID, addr, port)
+	}
+	m.mu.Lock()
+	ap := m.pods[podID]
+	var wp *workerProcess
+	if ap != nil {
+		wp = ap.worker
+	}
+	m.mu.Unlock()
+	if wp == nil {
+		return nil, fmt.Errorf("pod %q is not attached to host-tun worker", podID)
+	}
+
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return nil, fmt.Errorf("socketpair for inbound stream: %w", err)
+	}
+	callErr := wp.call(ControlRequest{
+		Op:    OpDialInbound,
+		PodID: podID,
+		Addr:  addr.Unmap().String(),
+		Port:  port,
+	}, fds[1])
+	_ = unix.Close(fds[1])
+	if callErr != nil {
+		_ = unix.Close(fds[0])
+		return nil, fmt.Errorf("dial inbound %s (%s:%d): %w", podID, addr, port, callErr)
+	}
+
+	hostFile := os.NewFile(uintptr(fds[0]), "hosttun-inbound-host-"+podID)
+	conn, err := net.FileConn(hostFile)
+	_ = hostFile.Close()
+	if err != nil {
+		return nil, fmt.Errorf("wrap host inbound socketpair: %w", err)
+	}
+	return conn, nil
 }
 
 // Close detaches all sandboxes and terminates all supervised worker processes.
@@ -466,6 +513,8 @@ func (m *Manager) recoverPod(ap *attachedPod, crashed *workerProcess) error {
 		MaxConnections: ap.cfg.MaxConnections,
 		EnableUDP:      ap.cfg.EnableUDP,
 		DNSMode:        ap.cfg.DNSMode,
+		LinkMode:       ap.cfg.LinkMode,
+		Addresses:      ap.cfg.Addresses,
 	}
 	sendErr := newWP.call(req, tunFD, int(brokerWorker.Fd()))
 	_ = brokerWorker.Close()

@@ -41,6 +41,15 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
+	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 
 	"github.com/aojea/agents.net/internal/testutils"
 	"github.com/aojea/agents.net/pkg/socketat"
@@ -831,4 +840,146 @@ func TestWorkerSocketTwoContainerReconnect(t *testing.T) {
 			t.Fatalf("pod-sock-2 post-reconnect response = %q", got)
 		}
 	}, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func TestHostTunTAPModeAndDialInbound(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatalf("socketpair(AF_UNIX, SOCK_DGRAM): %v", err)
+	}
+	guestFD, tapFD := fds[0], fds[1]
+	defer func() { _ = unix.Close(guestFD) }()
+
+	// Emulate a microVM guest Ethernet NIC on guestFD.
+	guestEP, err := fdbased.New(&fdbased.Options{
+		FDs:            []int{guestFD},
+		MTU:            1500,
+		Address:        tcpip.LinkAddress("\x02\x61\x67\x6e\x74\x09"),
+		EthernetHeader: true,
+	})
+	if err != nil {
+		_ = unix.Close(tapFD)
+		t.Fatalf("guest fdbased.New: %v", err)
+	}
+	guest := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{arp.NewProtocol, ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
+	})
+	defer func() {
+		guest.Close()
+		guest.Wait()
+	}()
+	if err := guest.CreateNIC(1, guestEP); err != nil {
+		_ = unix.Close(tapFD)
+		t.Fatalf("guest CreateNIC: %v", err)
+	}
+	guestIP := netip.MustParseAddr(tun2connect.DefaultGuestAddr4)
+	gwIP := netip.MustParseAddr(tun2connect.DefaultResolverAddr)
+	if err := guest.AddProtocolAddress(1, tcpip.ProtocolAddress{
+		Protocol: ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddressWithPrefix{
+			Address:   tcpip.AddrFrom4(guestIP.As4()),
+			PrefixLen: tun2connect.DefaultPool4Bits,
+		},
+	}, stack.AddressProperties{}); err != nil {
+		_ = unix.Close(tapFD)
+		t.Fatalf("guest AddProtocolAddress: %v", err)
+	}
+	guest.SetRouteTable([]tcpip.Route{{
+		Destination: header.IPv4EmptySubnet,
+		Gateway:     tcpip.AddrFrom4(gwIP.As4()),
+		NIC:         1,
+	}})
+
+	guestLn, err := gonet.ListenTCP(guest, tcpip.FullAddress{NIC: 1, Port: 8080}, ipv4.ProtocolNumber)
+	if err != nil {
+		_ = unix.Close(tapFD)
+		t.Fatalf("guest ListenTCP: %v", err)
+	}
+	defer func() { _ = guestLn.Close() }()
+	go func() {
+		for {
+			c, err := guestLn.Accept()
+			if err != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer func() { _ = conn.Close() }()
+				_, _ = io.WriteString(conn, "tap-inbound-worker-ok")
+			}(c)
+		}
+	}()
+
+	exe, err := os.Executable()
+	if err != nil {
+		_ = unix.Close(tapFD)
+		t.Fatalf("os.Executable: %v", err)
+	}
+	sockPath := filepath.Join(t.TempDir(), "worker.sock")
+	srvCmd := exec.Command(exe, serveSocketTestArg, sockPath)
+	srvCmd.Stdout = os.Stderr
+	srvCmd.Stderr = os.Stderr
+	if err := srvCmd.Start(); err != nil {
+		_ = unix.Close(tapFD)
+		t.Fatalf("start ServeSocket subprocess: %v", err)
+	}
+	defer func() {
+		if srvCmd.Process != nil {
+			_ = srvCmd.Process.Kill()
+			_ = srvCmd.Wait()
+		}
+	}()
+
+	mgr := NewManager(ManagerConfig{WorkerSocket: sockPath})
+	defer func() { _ = mgr.Close() }()
+
+	h, err := mgr.Attach(AttachConfig{
+		PodID:       "vm-tap-1",
+		TunFD:       tapFD,
+		MTU:         1500,
+		EnableUDP:   true,
+		LinkMode:    LinkModeTAP,
+		ServeEgress: serveMockCONNECT("tap-egress"),
+	})
+	if err != nil {
+		t.Fatalf("Attach(LinkModeTAP): %v", err)
+	}
+	defer func() { _ = h.Close() }()
+
+	// 1. Outbound TCP from L2 guest through hardened worker -> mock egress server.
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	outConn, err := gonet.DialContextTCP(ctx, guest, tcpip.FullAddress{
+		Addr: tcpip.AddrFrom4([4]byte{10, 99, 0, 1}),
+		Port: 8080,
+	}, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("guest outbound TCP over L2 TAP worker: %v", err)
+	}
+	_, _ = fmt.Fprintf(outConn, "GET /tap-out HTTP/1.1\r\nHost: 10.99.0.1\r\nConnection: close\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(outConn), nil)
+	if err != nil {
+		_ = outConn.Close()
+		t.Fatalf("read outbound response: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	_ = outConn.Close()
+	if string(body) != "tap-egress:10.99.0.1:8080:/tap-out" {
+		t.Fatalf("outbound body = %q, want tap-egress:10.99.0.1:8080:/tap-out", string(body))
+	}
+
+	// 2. Inbound TCP from parent Manager.DialInbound -> hardened worker -> L2 guest :8080.
+	inConn, err := mgr.DialInbound(ctx, "vm-tap-1", guestIP, 8080)
+	if err != nil {
+		t.Fatalf("Manager.DialInbound: %v", err)
+	}
+	defer func() { _ = inConn.Close() }()
+	inBody, err := io.ReadAll(inConn)
+	if err != nil {
+		t.Fatalf("read inbound body: %v", err)
+	}
+	if string(inBody) != "tap-inbound-worker-ok" {
+		t.Fatalf("inbound body = %q, want tap-inbound-worker-ok", string(inBody))
+	}
 }

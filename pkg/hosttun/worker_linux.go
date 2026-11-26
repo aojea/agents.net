@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -32,6 +33,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"k8s.io/klog/v2"
 
 	"github.com/aojea/agents.net/pkg/tun2connect"
@@ -341,6 +343,20 @@ func (w *builtinWorker) handleRequest(payload []byte, fds []int) ControlResponse
 		w.removePod(req.PodID)
 		return ControlResponse{OK: true, Stack: builtinStackName}
 
+	case OpDialInbound:
+		if req.PodID == "" || req.Addr == "" || req.Port == 0 {
+			closeFDs(fds)
+			return ControlResponse{OK: false, Error: "pod_id, addr, and port are required"}
+		}
+		if len(fds) != 1 {
+			closeFDs(fds)
+			return ControlResponse{OK: false, Error: fmt.Sprintf("expected 1 FD [streamFD], got %d", len(fds))}
+		}
+		if err := w.dialInbound(req, fds[0]); err != nil {
+			return ControlResponse{OK: false, Error: err.Error()}
+		}
+		return ControlResponse{OK: true, Stack: builtinStackName}
+
 	default:
 		closeFDs(fds)
 		return ControlResponse{OK: false, Error: fmt.Sprintf("unsupported op %q", req.Op)}
@@ -366,9 +382,38 @@ func (w *builtinWorker) addPod(req ControlRequest, tunFD, brokerFD int) error {
 	if mtu <= 0 {
 		mtu = 1500
 	}
-	dev, err := tun2connect.NewTUNDevice(tunFD, uint32(mtu))
-	if err != nil {
-		return fmt.Errorf("create gvisor tun endpoint: %w", err)
+
+	var (
+		dev       stack.LinkEndpoint
+		err       error
+		addresses []netip.Prefix
+	)
+	switch req.LinkMode {
+	case "", LinkModeTUN:
+		dev, err = tun2connect.NewTUNDevice(tunFD, uint32(mtu))
+		if err != nil {
+			return fmt.Errorf("create gvisor tun endpoint: %w", err)
+		}
+	case LinkModeTAP:
+		dev, err = tun2connect.NewTAPDevice(tunFD, uint32(mtu), "")
+		if err != nil {
+			return fmt.Errorf("create gvisor tap endpoint: %w", err)
+		}
+		if len(req.Addresses) == 0 {
+			addresses = []netip.Prefix{
+				netip.MustParsePrefix(fmt.Sprintf("%s/%d", tun2connect.DefaultResolverAddr, tun2connect.DefaultPool4Bits)),
+				netip.MustParsePrefix("100::ffff:ffff:ffff:fffd/64"),
+			}
+		}
+	default:
+		return fmt.Errorf("unsupported link_mode %q", req.LinkMode)
+	}
+	for _, raw := range req.Addresses {
+		p, perr := netip.ParsePrefix(raw)
+		if perr != nil {
+			return fmt.Errorf("invalid interface address %q: %w", raw, perr)
+		}
+		addresses = append(addresses, p)
 	}
 
 	broker := &brokerDialClient{
@@ -384,6 +429,7 @@ func (w *builtinWorker) addPod(req ControlRequest, tunFD, brokerFD int) error {
 	}
 	eng, err := tun2connect.New(tun2connect.Config{
 		Device:         dev,
+		Addresses:      addresses,
 		Dialer:         client,
 		DNS:            vdns,
 		DNSHandler:     dnsHandler,
@@ -411,6 +457,64 @@ func (w *builtinWorker) addPod(req ControlRequest, tunFD, brokerFD int) error {
 		prev.close()
 	}
 	return nil
+}
+
+func (w *builtinWorker) dialInbound(req ControlRequest, streamFD int) error {
+	closeStream := true
+	defer func() {
+		if closeStream {
+			_ = unix.Close(streamFD)
+		}
+	}()
+
+	addr, err := netip.ParseAddr(req.Addr)
+	if err != nil {
+		return fmt.Errorf("invalid inbound addr %q: %w", req.Addr, err)
+	}
+	w.mu.Lock()
+	pod := w.pods[req.PodID]
+	w.mu.Unlock()
+	if pod == nil || pod.eng == nil {
+		return fmt.Errorf("unknown pod %q", req.PodID)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	guestConn, err := pod.eng.DialGuestTCP(ctx, addr, req.Port)
+	if err != nil {
+		return fmt.Errorf("dial guest %s:%d: %w", addr, req.Port, err)
+	}
+
+	streamFile := os.NewFile(uintptr(streamFD), "hosttun-inbound-"+req.PodID)
+	streamConn, err := net.FileConn(streamFile)
+	_ = streamFile.Close()
+	closeStream = false
+	if err != nil {
+		_ = guestConn.Close()
+		return fmt.Errorf("wrap inbound stream fd: %w", err)
+	}
+
+	go relayPair(streamConn, guestConn)
+	return nil
+}
+
+func relayPair(a, b net.Conn) {
+	var wg sync.WaitGroup
+	wg.Add(2)
+	cp := func(dst, src net.Conn) {
+		defer wg.Done()
+		_, _ = io.Copy(dst, src)
+		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		} else {
+			_ = dst.Close()
+		}
+	}
+	go cp(a, b)
+	go cp(b, a)
+	wg.Wait()
+	_ = a.Close()
+	_ = b.Close()
 }
 
 func (w *builtinWorker) removePod(podID string) {

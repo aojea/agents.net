@@ -20,6 +20,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
+	"net/netip"
 )
 
 // IsWorkerEnv always reports false on non-Linux hosts.
@@ -48,6 +50,11 @@ func (*Manager) Attach(AttachConfig) (io.Closer, error) {
 
 // WorkerPID always returns 0 on non-Linux hosts.
 func (*Manager) WorkerPID(string) int { return 0 }
+
+// DialInbound returns an error on non-Linux hosts.
+func (*Manager) DialInbound(context.Context, string, netip.Addr, uint16) (net.Conn, error) {
+	return nil, errors.New("host-tun worker requires Linux")
+}
 
 // Close is a no-op on non-Linux hosts.
 func (*Manager) Close() error { return nil }
