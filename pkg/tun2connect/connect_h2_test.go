@@ -70,6 +70,38 @@ func (b *h2TestBoundary) handler(w http.ResponseWriter, r *http.Request) {
 	b.mu.Lock()
 	b.sandboxID = r.Header.Get("Sandbox-Id")
 	b.mu.Unlock()
+	if r.Method == http.MethodPost && r.URL.Path == "/dns-query" {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var p dnsmessage.Parser
+		hdr, err := p.Start(body)
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		q, err := p.Question()
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var resp []byte
+		if q.Name.String() == "api.example.test." {
+			resp, err = buildDNSResponse(hdr, q, dnsmessage.RCodeSuccess, netip.MustParseAddr("93.184.216.34"), true, time.Minute)
+		} else {
+			resp, err = buildDNSResponse(hdr, q, dnsmessage.RCodeNameError, netip.Addr{}, false, time.Minute)
+		}
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", dohMediaType)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(resp)
+		return
+	}
 	if proto := r.Header.Get(":protocol"); proto == "connect-udp" {
 		b.mu.Lock()
 		b.udpPaths = append(b.udpPaths, r.URL.Path)
@@ -283,5 +315,61 @@ func TestEngineOverH2Boundary(t *testing.T) {
 	}
 	if b.dialCount != 1 {
 		t.Fatalf("boundary dialed %d times, want 1 multiplexed session", b.dialCount)
+	}
+}
+
+func TestH2QueryDoHMultiplexed(t *testing.T) {
+	b := &h2TestBoundary{}
+	c := &BoundaryClientH2{DialBoundary: b.dial, Header: http.Header{"Sandbox-Id": []string{"agent-h2-doh"}}}
+	vdns := NewVirtualDNS()
+	doh := NewDoHVirtualDNS(vdns, c.QueryDoH)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Allowed name returns a rewritten synthetic IP.
+	raw, err := doh.HandleQueryContext(ctx, buildQuery(t, "api.example.test.", dnsmessage.TypeA))
+	if err != nil {
+		t.Fatalf("DoH allowed query: %v", err)
+	}
+	var p dnsmessage.Parser
+	hdr, err := p.Start(raw)
+	if err != nil || hdr.RCode != dnsmessage.RCodeSuccess {
+		t.Fatalf("allowed reply rcode=%v err=%v", hdr.RCode, err)
+	}
+	if err := p.SkipAllQuestions(); err != nil {
+		t.Fatal(err)
+	}
+	answers, err := p.AllAnswers()
+	if err != nil || len(answers) != 1 {
+		t.Fatalf("answers=%v err=%v", answers, err)
+	}
+	gotIP := netip.AddrFrom4(answers[0].Body.(*dnsmessage.AResource).A)
+	if !vdns.InSyntheticPool(gotIP) {
+		t.Fatalf("expected synthetic IP, got %s", gotIP)
+	}
+
+	// Disallowed name returns NXDOMAIN over the same H2 session.
+	rawNX, err := doh.HandleQueryContext(ctx, buildQuery(t, "missing.example.", dnsmessage.TypeA))
+	if err != nil {
+		t.Fatalf("DoH NXDOMAIN query: %v", err)
+	}
+	var p2 dnsmessage.Parser
+	hdr2, err := p2.Start(rawNX)
+	if err != nil || hdr2.RCode != dnsmessage.RCodeNameError {
+		t.Fatalf("want NXDOMAIN, got rcode=%v err=%v", hdr2.RCode, err)
+	}
+
+	// Subsequent TCP CONNECT shares the exact same HTTP/2 session.
+	conn, err := c.DialTCP(ctx, "api.example.test", 443)
+	if err != nil {
+		t.Fatalf("DialTCP after DoH: %v", err)
+	}
+	_ = conn.Close()
+
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.dialCount != 1 {
+		t.Fatalf("boundary dialed %d times, want 1 shared HTTP/2 session across DoH and CONNECT", b.dialCount)
 	}
 }

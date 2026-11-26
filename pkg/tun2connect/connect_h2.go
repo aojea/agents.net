@@ -1,6 +1,7 @@
 package tun2connect
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -162,6 +163,54 @@ func (c *BoundaryClientH2) DialUDP(ctx context.Context, name string, port uint16
 	}
 	stream := &h2Stream{r: resp.Body, w: pw, cancel: cancel}
 	return &capsuleConn{CapsuleStream: NewCapsuleStream(stream), conn: stream}, nil
+}
+
+// QueryDoH sends one RFC 8484 DNS-over-HTTPS POST /dns-query request over the
+// shared HTTP/2 boundary session and returns the raw DNS wire response.
+func (c *BoundaryClientH2) QueryDoH(ctx context.Context, query []byte) ([]byte, error) {
+	if len(query) == 0 || len(query) > maxDoHBytes {
+		return nil, fmt.Errorf("tun2connect: invalid DoH query size %d", len(query))
+	}
+	cc, err := c.session(ctx)
+	if err != nil {
+		return nil, err
+	}
+	scheme := "http"
+	if c.TLS != nil {
+		scheme = "https"
+	}
+	req := (&http.Request{
+		Method:        http.MethodPost,
+		URL:           &url.URL{Scheme: scheme, Host: c.authority(), Path: "/dns-query"},
+		Host:          c.authority(),
+		Header:        make(http.Header),
+		ContentLength: int64(len(query)),
+		Body:          io.NopCloser(bytes.NewReader(query)),
+	}).WithContext(ctx)
+	for k, vs := range c.Header {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	req.Header.Set("Content-Type", dohMediaType)
+	req.Header.Set("Accept", dohMediaType)
+
+	resp, err := cc.RoundTrip(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, refusal(resp)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxDoHBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > maxDoHBytes {
+		return nil, fmt.Errorf("tun2connect: DoH response exceeds %d bytes", maxDoHBytes)
+	}
+	return body, nil
 }
 
 // h2Stream adapts one CONNECT stream to net.Conn: reads come from the
