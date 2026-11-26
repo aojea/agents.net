@@ -1,4 +1,5 @@
 IMAGE ?= ghcr.io/aojea/agents.net/dra-agents-net:latest
+STACK_IMAGE ?= ghcr.io/aojea/agents.net/agents-net-stack:latest
 
 .PHONY: build test vet fmt image smoke
 
@@ -16,6 +17,7 @@ fmt:
 
 image:
 	docker build -t $(IMAGE) .
+	docker build -t $(STACK_IMAGE) -f Dockerfile.stack .
 
 smoke:
 	./test/smoke.sh

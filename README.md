@@ -45,11 +45,15 @@ The full git history is kept intact so you can follow how earlier experiments le
                     (off host kernel TCP/IP)
                                  v
 +-------------------------------------------------------------------+
-| 2. Standalone Node Driver (dra-agents-net: DRA + NRI, No CNI)     |
-|    - Userspace Network Stack + Virtual DNS & Forwarding hooks     |
-|      (gVisor netstack built-in; pluggable BYOS worker model)      |
-|    - Strips untrusted headers, attaches node-attested identity,   |
-|      and forwards over mandatory mTLS (SPIFFE / PodCert / X.509)  |
+| 2. Two-Container Node DaemonSet (No CNI)                          |
+|    - Container 2: agents-net-stack (unprivileged, uid 65534,      |
+|      0 caps, AF_UNIX-only seccomp, zero K8s SA token or mTLS keys)|
+|      Runs userspace stack + Virtual DNS over passed tunFD         |
+|                          ^  SCM_RIGHTS (emptyDir Unix socket)     |
+|                          v                                        |
+|    - Container 1: dra-agents-net (DRA + NRI plumbing + tunnel)    |
+|      Opens persistent tun0, closes tunFD, strips untrusted        |
+|      headers, attaches node-attested identity, dials PEP over mTLS|
 +-------------------------------------------------------------------+
                                  |
       Mandatory mTLS + HTTP CONNECT / RFC 9298 connect-udp
@@ -70,12 +74,13 @@ The full git history is kept intact so you can follow how earlier experiments le
 | --- | --- |
 | [docs/architecture.md](docs/architecture.md) | SIG Network architecture vision: building blocks, hooks, privilege separation, BYOS, tenancy, and GAIA / ecosystem integration |
 | [install.yaml](install.yaml) | Standalone Kubernetes manifest (`ServiceAccount`, minimal RBAC with zero `secrets` access, `DeviceClass`, `DaemonSet` in `kube-system`) |
-| [cmd/dra-agents-net](cmd/dra-agents-net) | Per-node Kubernetes Network Driver (DRA + NRI DaemonSet, `dra.agents.net`), mandatory mTLS egress forwarding, and opt-in mTLS ingress bridge |
+| [cmd/dra-agents-net](cmd/dra-agents-net) | Per-node Kubernetes Network Driver (Container 1: DRA + NRI plumbing, mandatory mTLS egress forwarding, opt-in mTLS ingress bridge) |
+| [cmd/agents-net-stack](cmd/agents-net-stack) | Unprivileged userspace network stack container (Container 2: `distroless:nonroot`, UID `65534`, `AF_UNIX`-only seccomp-BPF, receives `tunFD` over `emptyDir` `SCM_RIGHTS`) |
 | [cmd/agents-net-ingress-gateway](cmd/agents-net-ingress-gateway) | Stateless mTLS inbound gateway routing external HTTP traffic to IP-less sandboxes |
 | [cmd/connect-proxy](cmd/connect-proxy) | Reference mTLS HTTP `CONNECT` / `connect-udp` Policy Enforcement Point (used by tests and demos) |
 | [cmd/tun2connect](cmd/tun2connect) | Optional standalone TUN adapter binary (for `TunSidecar` or microVM `vsock` runtimes) |
 | [pkg/driver](pkg/driver) | DRA plugin (`DRAConsumableCapacity`), NRI hooks, `HostTun` / `ExplicitProxy` / `TunSidecar`, netlink confinement, and Pod informer |
-| [pkg/hosttun](pkg/hosttun) | Unprivileged `HostTun` userspace worker supervisor and built-in worker over `SCM_RIGHTS` (`--host-tun-isolation=shared\|per-pod`, pluggable `--host-tun-worker-bin`, automatic crash recovery) |
+| [pkg/hosttun](pkg/hosttun) | `AF_UNIX SOCK_SEQPACKET` + `SCM_RIGHTS` host-tun transport (`--host-tun-socket` two-container mode + optional child-process `shared`/`per-pod` fallback), `AF_UNIX`-only seccomp-BPF, and automatic crash recovery |
 | [pkg/tun2connect](pkg/tun2connect) | Built-in Go userspace TCP/IP stack (gVisor `netstack`), Virtual DNS (`198.18.0.0/15`, `100::/64`), and `CONNECT` / `connect-udp` forwarding hooks |
 | [pkg/tunnel](pkg/tunnel) | Per-Pod UDS / `socketat` listener manager and mandatory mTLS HTTP/2 + HTTP/1.1 `CONNECT` / `connect-udp` dialer |
 | [pkg/apis](pkg/apis), [pkg/params](pkg/params) | `dra.agents.net/v1alpha1` `DriverConfig` & `DeviceStatus` and strict `FromClass` / `FromClaim` decoding |
@@ -175,7 +180,7 @@ spec:
 
 ### Adapters (`adapterMode`, configured in `DeviceClass`)
 
-- **`HostTun` (default):** Creates a persistent `tun0` inside the Pod netns during NRI `RunPodSandbox`, hands `tunFD` and a per-Pod dial-broker FD over `SCM_RIGHTS` to an unprivileged host worker process (UID/GID `65534`, zero Linux capabilities, `NoNewPrivs=1`, isolated empty netns) that terminates TCP/UDP/DNS (`198.18.0.0/15`, `100::/64`), and replaces `/etc/resolv.conf` with a read-only bind mount to `198.19.255.253`. Supports `--host-tun-isolation=shared` (default, one multi-tenant worker per node) or `--host-tun-isolation=per-pod` (one dedicated worker per Pod), custom bring-your-own userspace stacks via `--host-tun-worker-bin`, and automatic crash recovery over persistent `tun0`. Zero sidecar, zero Pod capabilities, zero `egress.sock` exposed inside containers.
+- **`HostTun` (default):** Creates a persistent `tun0` inside the Pod netns during NRI `RunPodSandbox`, hands `tunFD` and a per-Pod dial-broker FD over an `emptyDir` `SCM_RIGHTS` socket (`--host-tun-socket=/run/hosttun/worker.sock`) to the unprivileged `agents-net-stack` container (UID/GID `65534`, zero Linux capabilities, `readOnlyRootFilesystem`, `NoNewPrivs=1`, `AF_UNIX`-only seccomp-BPF, zero K8s ServiceAccount token, zero mTLS keys), and replaces `/etc/resolv.conf` with a read-only bind mount to `198.19.255.253`. Supports automatic reconnect and recovery over persistent `tun0` when the stack container restarts or is upgraded in place, swappable stack images via `containers[1].image`, and optional child-process `--host-tun-isolation=shared|per-pod` / `--host-tun-worker-bin` fallback when `--host-tun-socket` is unset. Zero sidecar, zero Pod capabilities, zero `egress.sock` exposed inside workload containers.
 - **`ExplicitProxy`:** Binds `127.0.0.1:15001` inside the Pod netns via `socketat` and injects `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` without creating a TUN device or synthetic IPs.
 - **`TunSidecar`:** Attaches `/dev/net/tun` and UDS sockets to an `agents-net-tun2connect` native sidecar when in-guest conversion is needed.
 

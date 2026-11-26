@@ -103,16 +103,18 @@ Tier 1 deploys as a standalone Kubernetes Network Driver using DRA (`DRAConsumab
 
 ### Privilege Separation Across File Descriptors
 
-Moving packet processing out of the host Linux kernel only reduces the attack surface if the userspace network stack itself runs unprivileged and isolated from host secrets and setup capabilities, mirroring OpenSSH's split between a small privileged monitor and an unprivileged network parser:
+Moving packet processing out of the host Linux kernel only reduces the attack surface if the userspace network stack itself runs unprivileged and isolated from host secrets and setup capabilities, mirroring OpenSSH's split between a small privileged monitor and an unprivileged network parser — and Kubernetes's own two-component node pattern (similar to Istio Ambient's split between privileged node plumbing and unprivileged `ztunnel`, while keeping mTLS private keys strictly out of the packet-parsing container):
+
+In Kubernetes, this maps cleanly onto a **two-container DaemonSet Pod** sharing only an in-memory `emptyDir` Unix socket (`AF_UNIX SOCK_SEQPACKET` + `SCM_RIGHTS`), with Pod-level `automountServiceAccountToken: false` and an explicit projected ServiceAccount token mounted exclusively on the plumbing container:
 
 | Component | Privileges & Isolation | Network Visibility | Access to Secrets / Host State | Parses Raw Sandbox Packets? |
 | --- | --- | --- | --- | --- |
 | **Sandbox Pod** | Non-root, `capabilities.drop: ["ALL"]`, no sidecar | `lo` + `tun0` only (no direct route out) | None (optional public CA cert only) | Generates them |
-| **Userspace Stack Worker** | Non-root (`65534:65534`), **0 capabilities**, `PR_SET_NO_NEW_PRIVS`, **`CLONE_NEWNET`** (empty netns), isolated filesystem/cgroup | None — only the passed `tunFD` and `egressFD` | **None** (no mTLS keys, no NRI/kubelet/API access) | **Yes** (isolated here) |
-| **Node Plumbing Parent** | Setup-time plumbing caps (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN` for `setns`/isolation; zero cluster `Secret` RBAC) | Host network to PEP / API / optional ingress bridge | Workload mTLS identity (SPIFFE, KEP-4317 `PodCertificate`, X.509) | **No** (closes `tunFD` right after `SCM_RIGHTS`) |
+| **Userspace Stack Container (`agents-net-stack`)** | Separate container (`65534:65534`), **0 capabilities**, `readOnlyRootFilesystem`, own cgroup/memory limit, `PR_SET_NO_NEW_PRIVS`, `AF_UNIX`-only seccomp-BPF (`TSYNC`, denies `AF_INET`/`AF_INET6`/`AF_NETLINK`/`AF_PACKET`) | None — only the passed `tunFD` and `brokerFD` over `emptyDir` socket | **None** (zero K8s SA token, zero mTLS keys, zero `/var/run/netns` or `/var/run/nri` mounts) | **Yes** (isolated here) |
+| **Node Plumbing Container (`dra-agents-net`)** | Setup-time plumbing caps (DRA, NRI, `tun0` creation; zero cluster `Secret` RBAC) | Host network to PEP / API / optional ingress bridge | Workload mTLS identity (SPIFFE, KEP-4317 `PodCertificate`, X.509) | **No** (closes `tunFD` right after `SCM_RIGHTS`) |
 | **Tier 2 PEP / GAIA** | Dedicated off-host gateway | Egress VPC / Internet / Ingress edge | Upstream API credentials, optional inspection CA key | Only authenticated HTTP `CONNECT` / L7 streams |
 
-Setup privileges remain strictly on the plumbing parent and are never exposed to the sandboxed agent or reachable by the packet parser. Because `tun0` is created with `TUNSETPERSIST`, upgrading or restarting the userspace stack worker re-attaches live sandboxes without tearing down Pods or rebooting host kernels. Longer term, delegating virtual interface creation to the container runtime (for example via OCI `linux.netDevices` or a future CRI/NRI descriptor handoff) can narrow parent privileges further while staying independent of CNI.
+Setup privileges remain strictly on the plumbing container and are never exposed to the sandboxed agent or reachable by the packet parser. Because `tun0` is created with `TUNSETPERSIST`, crashing, OOM-killing, or upgrading the userspace stack container lets the plumbing container reconnect and re-attach live sandboxes automatically without tearing down Pods or rebooting host kernels. Longer term, delegating virtual interface creation to the container runtime (for example via OCI `linux.netDevices` or a future CRI/NRI descriptor handoff) can narrow plumbing privileges further while staying independent of CNI.
 
 ### Pod Networking Hooks: Virtual DNS, PEP Forwarding, and Inbound Delivery
 
@@ -122,12 +124,15 @@ Because an isolated sandbox has no direct external IP route, Tier 1 provides thr
 - **PEP forwarding / redirection hook:** When the userspace stack terminates a TCP connection or UDP flow from `tun0`, the forwarding hook recovers the target hostname from the Virtual DNS hook (or preserves a literal IP) and frames the flow as [RFC 9110](https://www.rfc-editor.org/info/rfc9110) `CONNECT host:port` or [RFC 9298](https://www.rfc-editor.org/info/rfc9298) `connect-udp` (carrying [RFC 9297](https://www.rfc-editor.org/info/rfc9297) capsules over [RFC 8441](https://www.rfc-editor.org/info/rfc8441) extended CONNECT) over the sandbox's egress file descriptor. The node identity layer strips any guest-supplied identity headers, attaches platform-attested workload identity (mTLS client cert SAN / SPIFFE ID and structured attributes), and forwards over mandatory mTLS to Tier 2. Non-2xx policy refusals carrying [RFC 9209](https://www.rfc-editor.org/info/rfc9209) `Proxy-Status` fail the guest socket closed immediately.
 - **Inbound traffic delivery without Pod IPs:** For sandboxes exposing authorized ports without a Pod IP, Tier 1 publishes non-IP inbound metadata (node bridge endpoint, mTLS server identity, immutable sandbox ID + generation, and pinned ports) and accepts mandatory mTLS `CONNECT <sandbox-id>:<port>` reverse tunnels from Tier 2 gateways, delivering streams locally into the sandbox (`socketat` for containers, `vsock` for microVMs). Stopping a sandbox revokes both active tunnels and published endpoints immediately.
 
-### Bring Your Own Userspace Stack (BYOS) and Tenancy Models
+### Bring Your Own Userspace Stack (BYOS), Tenancy Models, and KEP-5972
 
-Because the plumbing parent communicates with the dataplane worker through a minimal file-descriptor handoff over a Unix control socket (`ADD` with `[tunFD, egressFD]`, `REMOVE`), Tier 1 is not tied to one TCP/IP stack or one tenancy model:
+Because the plumbing container communicates with the dataplane stack through a minimal file-descriptor handoff over a Unix `SOCK_SEQPACKET` control socket (`add` with `[tunFD, brokerFD]`, `remove`), Tier 1 keeps the default lean while leaving room for multiple stacks and isolation models:
 
-- **Pluggable stacks:** Go (`gVisor netstack`) ships as the memory-safe built-in default inside a single static binary, while Rust stacks (`smoltcp`, Fuchsia `Netstack3`), C stacks (`lwIP`), or microVM transports (`virtio-net`, `vhost-user`, `vsock`) can plug behind the same FD boundary and Virtual DNS / Forwarding hooks without changing DRA, NRI, or Pod manifests.
-- **Multi-tenant (`shared`) vs. multi-single-tenant (`per-tenant` / `per-pod`):** The same FD handoff supports running one shared unprivileged worker per node (lowest memory overhead and sub-millisecond attach via `SCM_RIGHTS` for high-density clusters) or dedicated unprivileged workers with per-tenant / per-Pod Linux cgroups (strict process, CPU, and memory containment so even a packet-parser bug in a C stack cannot see sibling sandboxes).
+- **Shared per-node stack as the clean default:** Following the proven single-stack-per-host model of **Snap** ([SOSP 2019](https://dl.acm.org/doi/10.1145/3341301.3359657)) and Istio Ambient `ztunnel`, running one shared, memory-safe unprivileged stack container (`agents-net-stack`, built on Go `gVisor netstack`) per node gives strong isolation from the host kernel and node privileges at the lowest memory overhead and sub-millisecond attach latency.
+- **Room for multi-single-tenant stacks and KEP-5972 Dynamic Containers:** Environments that require hard per-tenant or per-sandbox stack isolation can build on the exact same `emptyDir` Unix socket contract without changing DRA, NRI, or Pod manifests — either via dedicated per-tenant/per-class stack containers, child-process `per-pod` workers (`CLONE_NEWNET`), or **[KEP-5972 (Dynamic Containers)](https://github.com/kubernetes/enhancements/blob/master/keps/sig-node/5972-dynamic-containers/README.md)**. KEP-5972 converges on both sides of the design:
+  - *DaemonSet side:* Dynamically add per-tenant stack containers (each with its own cgroup, UID, image, and socket subpath) or run zero-downtime blue-green in-place stack upgrades by handing persistent `tun0` descriptors to the new stack container before removing the old one.
+  - *Workload side:* In pre-warmed agentic Pods that dynamically add and remove ephemeral tool containers via `/dynamic`, `HostTun` + NRI `CreateContainer` attaches confined networking automatically to every new container with zero Pod-creation webhook or sidecar mutation.
+- **Pluggable stacks:** Go (`gVisor netstack`) ships as the memory-safe built-in default container image, while Rust stacks (`smoltcp`, Fuchsia `Netstack3`), C stacks (`lwIP`), or microVM transports (`virtio-net`, `vhost-user`, `vsock`) can drop into the stack container slot behind the same Unix socket + `SCM_RIGHTS` boundary.
 
 ---
 
@@ -144,9 +149,9 @@ Delegating Tier 2 to **GAIA** while grounding the Tier 1 <-> Tier 2 interface on
 
 ## 5. Reference Implementation (`aojea/agents.net`) and Open Sync Points
 
-[`aojea/agents.net`](https://github.com/aojea/agents.net) serves as the lean, standalone SIG Network reference implementation for Tier 1. It already implements the DRA (`DRAConsumableCapacity`) + NRI node driver, default `HostTun` mode (zero sidecar, zero Pod privileges, Virtual DNS over `198.18.0.0/15` and `100::/64`), mandatory mTLS egress forwarding (`MTLS`, `SPIFFE`, `PodCertificate`), opt-in mTLS IP-less ingress, and an end-to-end integration demo with `agent-sandbox`.
+[`aojea/agents.net`](https://github.com/aojea/agents.net) serves as the lean, standalone SIG Network reference implementation for Tier 1. It implements the DRA (`DRAConsumableCapacity`) + NRI node driver (`dra-agents-net`), default `HostTun` mode with two-container privilege separation (`dra-agents-net` + unprivileged `agents-net-stack` over an `emptyDir` `SCM_RIGHTS` socket with `AF_UNIX`-only seccomp-BPF and automatic crash recovery over persistent `tun0`, plus optional child-process `per-pod` isolation), Virtual DNS (`198.18.0.0/15` and `100::/64`), mandatory mTLS egress forwarding (`MTLS`, `SPIFFE`, `PodCertificate`), opt-in mTLS IP-less ingress, and an end-to-end integration demo with `agent-sandbox`.
 
-Next milestones focus on splitting packet processing into the unprivileged `SCM_RIGHTS` worker (enabling pluggable BYOS stacks and both `shared` and `per-pod` tenancy), validating end-to-end compatibility with **GAIA** and existing meshes, and testing alternative userspace stacks such as Rust `smoltcp` behind the same boundary.
+Next milestones focus on refining the Virtual DNS and PEP forwarding hook interfaces, validating end-to-end compatibility with **GAIA** and existing meshes, and testing alternative userspace stack container images such as Rust `smoltcp` behind the same Unix socket boundary.
 
 ### Open Sync Points Between SIG Network Core and GAIA
 
@@ -184,6 +189,7 @@ Next milestones focus on splitting packet processing into the unprivileged `SCM_
 ### Kubernetes, Service Mesh, and Agentic Ecosystem Projects
 - **CNCF Maintainer Summit #126** — *Evolving Kubernetes for Agentic Workloads: Rethinking the Pod and Node Boundary*. https://github.com/cncf/maintainer-summit/discussions/126
 - **KEP-6313** — *Network-Isolated Pod Sandboxes (`spec.podNetwork: Isolated`)*. https://github.com/kubernetes/enhancements/issues/6313
+- **KEP-5972** — *Dynamic Containers*. https://github.com/kubernetes/enhancements/blob/master/keps/sig-node/5972-dynamic-containers/README.md
 - **KEP-4817** — *Resource Claim Status for Network Devices*. https://github.com/kubernetes/enhancements/issues/4817
 - **KEP-4317** — *Pod Certificates*. https://github.com/kubernetes/enhancements/issues/4317
 - **DRANET & Kubernetes Network Drivers** — https://github.com/kubernetes-sigs/dranet, https://github.com/kubernetes-sigs/kubernetes-network-drivers

@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"syscall"
@@ -31,6 +32,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/unix"
+	"k8s.io/klog/v2"
 
 	"github.com/aojea/agents.net/pkg/tun2connect"
 )
@@ -64,6 +66,142 @@ func RunWorker() error {
 	ctrlFile := os.NewFile(uintptr(ctrlFD), "hosttun-ctrl")
 	defer func() { _ = ctrlFile.Close() }()
 
+	return serveControlFile(ctrlFile)
+}
+
+// ServeSocket hardens the process (zero capabilities, NoNewPrivs, and an
+// AF_UNIX-only socket seccomp filter across all threads), listens on an AF_UNIX
+// SOCK_SEQPACKET socket at socketPath, and serves HostTun control connections
+// until ctx is cancelled.
+//
+// This entrypoint powers the unprivileged Container 2 (cmd/agents-net-stack) in
+// the two-container DaemonSet deployment.
+func ServeSocket(ctx context.Context, socketPath string) error {
+	if socketPath == "" {
+		return errors.New("socket path is required")
+	}
+	if err := hardenWorkerProcess(); err != nil {
+		return fmt.Errorf("harden host-tun stack server: %w", err)
+	}
+
+	if dir := filepath.Dir(socketPath); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create socket dir %q: %w", dir, err)
+		}
+	}
+	if err := os.Remove(socketPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove stale socket %q: %w", socketPath, err)
+	}
+
+	lnFD, err := unix.Socket(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("socket(AF_UNIX, SOCK_SEQPACKET): %w", err)
+	}
+	cleanupSocket := true
+	defer func() {
+		if cleanupSocket {
+			_ = unix.Close(lnFD)
+		}
+	}()
+
+	if err := unix.Bind(lnFD, &unix.SockaddrUnix{Name: socketPath}); err != nil {
+		return fmt.Errorf("bind %q: %w", socketPath, err)
+	}
+	if err := os.Chmod(socketPath, 0o600); err != nil {
+		return fmt.Errorf("chmod %q: %w", socketPath, err)
+	}
+	if err := unix.Listen(lnFD, 16); err != nil {
+		return fmt.Errorf("listen %q: %w", socketPath, err)
+	}
+
+	lnFile := os.NewFile(uintptr(lnFD), "hosttun-listen")
+	cleanupSocket = false
+	defer func() {
+		_ = lnFile.Close()
+		_ = os.Remove(socketPath)
+	}()
+
+	var (
+		activeMu    sync.Mutex
+		activeConns = make(map[*os.File]struct{})
+		connWG      sync.WaitGroup
+	)
+	stopWatcher := context.AfterFunc(ctx, func() {
+		_ = lnFile.Close()
+		activeMu.Lock()
+		for f := range activeConns {
+			_ = f.Close()
+		}
+		activeMu.Unlock()
+	})
+	defer stopWatcher()
+
+	klog.InfoS("host-tun userspace stack listening", "socket", socketPath, "stack", builtinStackName)
+
+	for {
+		connFD, err := acceptSeqPacket(lnFile)
+		if err != nil {
+			if ctx.Err() != nil || errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed) {
+				connWG.Wait()
+				return nil
+			}
+			connWG.Wait()
+			return fmt.Errorf("accept on %q: %w", socketPath, err)
+		}
+		connFile := os.NewFile(uintptr(connFD), "hosttun-ctrl-conn")
+		activeMu.Lock()
+		if ctx.Err() != nil {
+			activeMu.Unlock()
+			_ = connFile.Close()
+			continue
+		}
+		activeConns[connFile] = struct{}{}
+		activeMu.Unlock()
+
+		connWG.Add(1)
+		go func(f *os.File) {
+			defer connWG.Done()
+			defer func() {
+				activeMu.Lock()
+				delete(activeConns, f)
+				activeMu.Unlock()
+				_ = f.Close()
+			}()
+			if err := serveControlFile(f); err != nil && ctx.Err() == nil {
+				klog.ErrorS(err, "host-tun control connection closed with error", "socket", socketPath)
+			}
+		}(connFile)
+	}
+}
+
+func acceptSeqPacket(lnFile *os.File) (int, error) {
+	raw, err := lnFile.SyscallConn()
+	if err != nil {
+		return -1, err
+	}
+	var (
+		nfd       int
+		acceptErr error
+	)
+	ctrlErr := raw.Read(func(fd uintptr) bool {
+		var err error
+		nfd, _, err = unix.Accept4(int(fd), unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC)
+		if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
+			return false
+		}
+		acceptErr = err
+		return true
+	})
+	if ctrlErr != nil {
+		return -1, ctrlErr
+	}
+	if acceptErr != nil {
+		return -1, acceptErr
+	}
+	return nfd, nil
+}
+
+func serveControlFile(ctrlFile *os.File) error {
 	w := &builtinWorker{
 		pods: make(map[string]*workerPod),
 	}
@@ -72,7 +210,7 @@ func RunWorker() error {
 	for {
 		payload, fds, err := recvMsgWithFDs(ctrlFile, maxControlMsgBytes, 4)
 		if err != nil {
-			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) {
+			if errors.Is(err, io.EOF) || errors.Is(err, os.ErrClosed) || errors.Is(err, net.ErrClosed) {
 				return nil
 			}
 			return fmt.Errorf("read control request: %w", err)
@@ -127,6 +265,13 @@ func hardenWorkerProcess() error {
 	// Irreversibly prevent privilege acquisition via execve or file capabilities.
 	if err := allThreadsOrCurrentSyscall6(unix.SYS_PRCTL, unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0, 0); err != nil {
 		return fmt.Errorf("PR_SET_NO_NEW_PRIVS: %w", err)
+	}
+
+	// Block all non-AF_UNIX socket creation across every OS thread so the
+	// userspace stack cannot open host IP/netlink/packet sockets even when
+	// sharing a hostNetwork: true DaemonSet Pod.
+	if err := installUnixOnlySocketSeccomp(); err != nil {
+		return err
 	}
 	return nil
 }

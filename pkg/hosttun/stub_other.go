@@ -17,6 +17,7 @@
 package hosttun
 
 import (
+	"context"
 	"errors"
 	"io"
 )
@@ -27,6 +28,11 @@ func IsWorkerEnv() bool { return false }
 // RunWorker returns an error on non-Linux hosts.
 func RunWorker() error {
 	return errors.New("host-tun worker requires Linux")
+}
+
+// ServeSocket returns an error on non-Linux hosts.
+func ServeSocket(context.Context, string) error {
+	return errors.New("host-tun stack server requires Linux")
 }
 
 // Manager is a non-Linux stub.

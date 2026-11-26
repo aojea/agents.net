@@ -39,6 +39,11 @@ const (
 	// DefaultCtrlFD is the standard inherited descriptor index (first ExtraFile).
 	DefaultCtrlFD = 3
 
+	// DefaultWorkerSocket is the default emptyDir AF_UNIX SOCK_SEQPACKET socket
+	// path shared between dra-agents-net and agents-net-stack in the two-container
+	// DaemonSet deployment.
+	DefaultWorkerSocket = "/run/hosttun/worker.sock"
+
 	// OpAdd attaches a sandbox's TUN and dial-broker file descriptors to the worker.
 	OpAdd = "add"
 	// OpRemove detaches a sandbox and closes its TUN and dial-broker descriptors.
@@ -101,10 +106,17 @@ type ControlResponse struct {
 
 // ManagerConfig configures the host-side unprivileged worker Manager.
 type ManagerConfig struct {
-	// Isolation selects shared (multi-tenant) or per-pod (multi-single-tenant) workers.
+	// WorkerSocket connects Manager to an external unprivileged userspace stack
+	// container (such as cmd/agents-net-stack) listening on an AF_UNIX
+	// SOCK_SEQPACKET socket (for example over a shared emptyDir volume).
+	// When set, Manager dials WorkerSocket instead of spawning child processes.
+	WorkerSocket string
+	// Isolation selects shared (multi-tenant) or per-pod (multi-single-tenant)
+	// child workers when WorkerSocket is empty.
 	Isolation IsolationMode
-	// WorkerBin optionally overrides the worker executable path (BYOS).
-	// When empty, Manager self-reexecs os.Executable() with --host-tun-worker.
+	// WorkerBin optionally overrides the child worker executable path when
+	// WorkerSocket is empty. When empty, Manager self-reexecs os.Executable()
+	// with --host-tun-worker.
 	WorkerBin string
 	// WorkerArgs optionally specifies arguments for WorkerBin.
 	WorkerArgs []string

@@ -23,6 +23,8 @@ jobs:
         include:
           - name: dra-agents-net
             dockerfile: Dockerfile
+          - name: agents-net-stack
+            dockerfile: Dockerfile.stack
           - name: agents-net-ingress-gateway
             dockerfile: Dockerfile.ingress-gateway
     steps:

@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -46,7 +47,11 @@ import (
 	"github.com/aojea/agents.net/pkg/tun2connect"
 )
 
-const externalBYOSArg = "--external-byos-test-worker"
+const (
+	externalBYOSArg       = "--external-byos-test-worker"
+	serveSocketTestArg    = "--serve-socket-test-worker"
+	seccompProbeHelperArg = "--seccomp-probe-test-worker"
+)
 
 func TestMain(m *testing.M) {
 	if IsWorkerEnv() {
@@ -63,7 +68,66 @@ func TestMain(m *testing.M) {
 		}
 		os.Exit(0)
 	}
+	if idx := slices.Index(os.Args[1:], serveSocketTestArg); idx >= 0 {
+		sockPath := ""
+		if idx+2 < len(os.Args) {
+			sockPath = os.Args[idx+2]
+		}
+		if err := ServeSocket(context.Background(), sockPath); err != nil {
+			fmt.Fprintf(os.Stderr, "serve-socket test worker exited with error: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
+	if slices.Contains(os.Args[1:], seccompProbeHelperArg) {
+		if err := runSeccompProbeHelper(); err != nil {
+			fmt.Fprintf(os.Stderr, "seccomp probe helper failed: %v\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	os.Exit(m.Run())
+}
+
+func runSeccompProbeHelper() error {
+	if err := hardenWorkerProcess(); err != nil {
+		return fmt.Errorf("hardenWorkerProcess: %w", err)
+	}
+	// AF_UNIX sockets and socketpairs MUST remain allowed.
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("expected AF_UNIX socket to succeed, got: %w", err)
+	}
+	_ = unix.Close(fd)
+	sp, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return fmt.Errorf("expected AF_UNIX socketpair to succeed, got: %w", err)
+	}
+	_ = unix.Close(sp[0])
+	_ = unix.Close(sp[1])
+
+	// Non-AF_UNIX address families MUST fail with EPERM.
+	blocked := []struct {
+		name   string
+		domain int
+		typ    int
+	}{
+		{"AF_INET", unix.AF_INET, unix.SOCK_STREAM},
+		{"AF_INET6", unix.AF_INET6, unix.SOCK_STREAM},
+		{"AF_NETLINK", unix.AF_NETLINK, unix.SOCK_RAW},
+		{"AF_PACKET", unix.AF_PACKET, unix.SOCK_RAW},
+	}
+	for _, tc := range blocked {
+		sfd, err := unix.Socket(tc.domain, tc.typ|unix.SOCK_CLOEXEC, 0)
+		if err == nil {
+			_ = unix.Close(sfd)
+			return fmt.Errorf("socket(%s) unexpectedly succeeded under seccomp filter", tc.name)
+		}
+		if !errors.Is(err, unix.EPERM) {
+			return fmt.Errorf("socket(%s) err = %v, want EPERM", tc.name, err)
+		}
+	}
+	return nil
 }
 
 // runExternalBYOSTestWorker implements a minimal external worker binary speaking
@@ -383,6 +447,11 @@ func assertWorkerHardened(t *testing.T, workerPID int) string {
 	if got := fields["NoNewPrivs"]; got != "1" {
 		t.Errorf("worker PID %d NoNewPrivs = %q, want 1", workerPID, got)
 	}
+	if runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64" {
+		if got := fields["Seccomp"]; got != "2" {
+			t.Errorf("worker PID %d Seccomp = %q, want 2 (filter mode)", workerPID, got)
+		}
+	}
 
 	parentNS, err := os.Readlink("/proc/self/ns/net")
 	if err != nil {
@@ -617,6 +686,149 @@ func TestExternalBYOSWorkerBin(t *testing.T) {
 
 		if got := probePodHTTP(t, ns, "custom.stack.example", "/byos-ok"); got != "byos:custom.stack.example:8080:/byos-ok" {
 			t.Fatalf("external BYOS worker response = %q, want byos:custom.stack.example:8080:/byos-ok", got)
+		}
+	}, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
+}
+
+func TestSeccompBlocksNonUnixSockets(t *testing.T) {
+	if runtime.GOARCH != "amd64" && runtime.GOARCH != "arm64" {
+		t.Skipf("seccomp BPF filter not configured for %s", runtime.GOARCH)
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	cmd := exec.Command(exe, seccompProbeHelperArg)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("seccomp probe helper failed: %v\n%s", err, out)
+	}
+}
+
+func TestWorkerSocketTwoContainerReconnect(t *testing.T) {
+	testutils.Run(t, func(t *testing.T) {
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatalf("os.Executable: %v", err)
+		}
+		sockPath := filepath.Join(t.TempDir(), "worker.sock")
+
+		startStackServer := func() *exec.Cmd {
+			cmd := exec.Command(exe, serveSocketTestArg, sockPath)
+			cmd.Stdout = os.Stderr
+			cmd.Stderr = os.Stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("start ServeSocket subprocess: %v", err)
+			}
+			return cmd
+		}
+
+		// Start companion stack process #1 (simulating Container 2 agents-net-stack).
+		srv1 := startStackServer()
+		defer func() {
+			if srv1.Process != nil {
+				_ = srv1.Process.Kill()
+				_ = srv1.Wait()
+			}
+		}()
+
+		ns1 := createNamedPodNetNS(t, "ht-sock-1")
+		ns2 := createNamedPodNetNS(t, "ht-sock-2")
+
+		mgr := NewManager(ManagerConfig{WorkerSocket: sockPath})
+		defer func() { _ = mgr.Close() }()
+
+		fd1, err := openPersistentTunInNS(ns1)
+		if err != nil {
+			t.Fatalf("openPersistentTunInNS(ns1): %v", err)
+		}
+		c1, err := mgr.Attach(AttachConfig{
+			PodID:       "pod-sock-1",
+			TunFD:       fd1,
+			MTU:         1500,
+			ServeEgress: serveMockCONNECT("sock1"),
+			ReopenTun:   func() (int, error) { return openPersistentTunInNS(ns1) },
+		})
+		if err != nil {
+			t.Fatalf("Attach pod-sock-1: %v", err)
+		}
+		defer func() { _ = c1.Close() }()
+
+		fd2, err := openPersistentTunInNS(ns2)
+		if err != nil {
+			t.Fatalf("openPersistentTunInNS(ns2): %v", err)
+		}
+		c2, err := mgr.Attach(AttachConfig{
+			PodID:       "pod-sock-2",
+			TunFD:       fd2,
+			MTU:         1500,
+			ServeEgress: serveMockCONNECT("sock2"),
+			ReopenTun:   func() (int, error) { return openPersistentTunInNS(ns2) },
+		})
+		if err != nil {
+			t.Fatalf("Attach pod-sock-2: %v", err)
+		}
+		defer func() { _ = c2.Close() }()
+
+		pid1 := mgr.WorkerPID("pod-sock-1")
+		if pid1 != srv1.Process.Pid || mgr.WorkerPID("pod-sock-2") != pid1 {
+			t.Fatalf("SO_PEERCRED worker PID mismatch: pod1=%d pod2=%d server=%d", pid1, mgr.WorkerPID("pod-sock-2"), srv1.Process.Pid)
+		}
+		assertParentHoldsNoTunFD(t)
+
+		// Verify companion stack process has zero caps, NoNewPrivs=1, and Seccomp=2.
+		statusRaw, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid1))
+		if err != nil {
+			t.Fatalf("read /proc/%d/status: %v", pid1, err)
+		}
+		statusText := string(statusRaw)
+		if !strings.Contains(statusText, "CapEff:\t0000000000000000") ||
+			!strings.Contains(statusText, "NoNewPrivs:\t1") ||
+			((runtime.GOARCH == "amd64" || runtime.GOARCH == "arm64") && !strings.Contains(statusText, "Seccomp:\t2")) {
+			t.Fatalf("companion stack process PID %d not hardened:\n%s", pid1, statusText)
+		}
+
+		if got := probePodHTTP(t, ns1, "svc1.example", "/initial"); got != "sock1:svc1.example:8080:/initial" {
+			t.Fatalf("pod-sock-1 initial response = %q", got)
+		}
+		if got := probePodHTTP(t, ns2, "svc2.example", "/initial"); got != "sock2:svc2.example:8080:/initial" {
+			t.Fatalf("pod-sock-2 initial response = %q", got)
+		}
+
+		// Simulate abrupt Container 2 crash (SIGKILL), then restart a fresh server
+		// at the same socket path after a short delay (simulating kubelet restart).
+		if err := srv1.Process.Kill(); err != nil {
+			t.Fatalf("SIGKILL stack server 1: %v", err)
+		}
+		_ = srv1.Wait()
+		time.Sleep(150 * time.Millisecond)
+
+		srv2 := startStackServer()
+		defer func() {
+			if srv2.Process != nil {
+				_ = srv2.Process.Kill()
+				_ = srv2.Wait()
+			}
+		}()
+
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if mgr.WorkerPID("pod-sock-1") == srv2.Process.Pid && mgr.WorkerPID("pod-sock-2") == srv2.Process.Pid {
+				break
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if mgr.WorkerPID("pod-sock-1") != srv2.Process.Pid || mgr.WorkerPID("pod-sock-2") != srv2.Process.Pid {
+			t.Fatalf("Manager did not reconnect both Pods to restarted stack server: got (%d, %d) want %d",
+				mgr.WorkerPID("pod-sock-1"), mgr.WorkerPID("pod-sock-2"), srv2.Process.Pid)
+		}
+		assertParentHoldsNoTunFD(t)
+
+		if got := probePodHTTP(t, ns1, "svc1.example", "/reconnected"); got != "sock1:svc1.example:8080:/reconnected" {
+			t.Fatalf("pod-sock-1 post-reconnect response = %q", got)
+		}
+		if got := probePodHTTP(t, ns2, "svc2.example", "/reconnected"); got != "sock2:svc2.example:8080:/reconnected" {
+			t.Fatalf("pod-sock-2 post-reconnect response = %q", got)
 		}
 	}, syscall.CLONE_NEWNET, syscall.CLONE_NEWNS)
 }

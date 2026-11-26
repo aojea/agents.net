@@ -74,6 +74,7 @@ func main() {
 		ingressAllowedClientSAN string
 		ingressServerName       string
 		maxSandboxes            int64
+		hostTunSocket           string
 		hostTunWorker           bool
 		hostTunWorkerBin        string
 		hostTunIsolation        string
@@ -100,9 +101,10 @@ func main() {
 	flag.StringVar(&ingressAllowedClientSAN, "ingress-allowed-client-san", "", "Optional comma-separated allowed client certificate DNS or URI/SPIFFE SANs for --ingress-addr")
 	flag.StringVar(&ingressServerName, "ingress-server-name", "", "Optional TLS server name advertised in ResourceClaim.status.devices[].data.ingress.serverName")
 	flag.Int64Var(&maxSandboxes, "max-sandboxes", 0, "Per-node DRA slot count (0 auto-detects from node status.allocatable.pods, fallback 110)")
+	flag.StringVar(&hostTunSocket, "host-tun-socket", "", "AF_UNIX SOCK_SEQPACKET socket path for the companion unprivileged userspace stack container (e.g. /run/hosttun/worker.sock); when empty, spawns an unprivileged child worker")
 	flag.BoolVar(&hostTunWorker, "host-tun-worker", false, "Internal mode: run as an unprivileged HostTun userspace network stack worker on FD 3")
-	flag.StringVar(&hostTunWorkerBin, "host-tun-worker-bin", "", "Optional external userspace network stack worker binary speaking the HostTun FD-handoff protocol")
-	flag.StringVar(&hostTunIsolation, "host-tun-isolation", string(hosttun.IsolationShared), "HostTun worker tenancy mode: 'shared' (one unprivileged worker per node) or 'per-pod' (one per sandbox Pod)")
+	flag.StringVar(&hostTunWorkerBin, "host-tun-worker-bin", "", "Optional external userspace network stack child binary when --host-tun-socket is empty")
+	flag.StringVar(&hostTunIsolation, "host-tun-isolation", string(hosttun.IsolationShared), "HostTun child-worker tenancy mode when --host-tun-socket is empty: 'shared' or 'per-pod'")
 	flag.Parse()
 
 	if hostTunWorker || hosttun.IsWorkerEnv() {
@@ -204,8 +206,9 @@ func main() {
 	}
 
 	hostTunMgr := hosttun.NewManager(hosttun.ManagerConfig{
-		Isolation: isolationMode,
-		WorkerBin: hostTunWorkerBin,
+		WorkerSocket: hostTunSocket,
+		Isolation:    isolationMode,
+		WorkerBin:    hostTunWorkerBin,
 	})
 	defer func() { _ = hostTunMgr.Close() }()
 

@@ -35,31 +35,37 @@ import (
 )
 
 const (
-	workerControlTimeout = 10 * time.Second
-	workerStopTimeout    = 3 * time.Second
+	workerControlTimeout       = 10 * time.Second
+	workerStopTimeout          = 3 * time.Second
+	workerSocketConnectTimeout = 30 * time.Second
 )
 
 // Manager supervises one or more unprivileged userspace stack worker processes
-// (shared or per-pod), hands off sandbox TUN and dial-broker descriptors over
-// SCM_RIGHTS, and recovers live sandboxes automatically if a worker crashes.
+// (or connects to a companion unprivileged stack container over WorkerSocket),
+// hands off sandbox TUN and dial-broker descriptors over SCM_RIGHTS, and
+// recovers live sandboxes automatically if the stack restarts or crashes.
 type Manager struct {
 	cfg ManagerConfig
 
+	connectMu    sync.Mutex
 	mu           sync.Mutex
 	closed       bool
+	closeCh      chan struct{}
 	sharedWorker *workerProcess
 	pods         map[string]*attachedPod
 	recoverWG    sync.WaitGroup
 }
 
-// NewManager creates a Manager using cfg (defaults to shared self-reexec worker).
+// NewManager creates a Manager using cfg (defaults to shared self-reexec worker
+// when WorkerSocket is empty).
 func NewManager(cfg ManagerConfig) *Manager {
 	if cfg.Isolation == "" {
 		cfg.Isolation = IsolationShared
 	}
 	return &Manager{
-		cfg:  cfg,
-		pods: make(map[string]*attachedPod),
+		cfg:     cfg,
+		closeCh: make(chan struct{}),
+		pods:    make(map[string]*attachedPod),
 	}
 }
 
@@ -92,15 +98,16 @@ func (m *Manager) Attach(cfg AttachConfig) (io.Closer, error) {
 		}
 	}()
 
+	wp, err := m.ensureWorker(cfg.PodID)
+	if err != nil {
+		return nil, err
+	}
+
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
+		m.cleanupUnusedPerPodWorker(wp)
 		return nil, errors.New("host-tun worker manager is closed")
-	}
-	wp, err := m.ensureWorkerLocked(cfg.PodID)
-	if err != nil {
-		m.mu.Unlock()
-		return nil, err
 	}
 	prev := m.pods[cfg.PodID]
 	delete(m.pods, cfg.PodID)
@@ -174,6 +181,7 @@ func (m *Manager) Close() error {
 		return nil
 	}
 	m.closed = true
+	close(m.closeCh)
 	type podStop struct {
 		ap *attachedPod
 		wp *workerProcess
@@ -197,25 +205,139 @@ func (m *Manager) Close() error {
 	return nil
 }
 
-func (m *Manager) ensureWorkerLocked(podID string) (*workerProcess, error) {
-	if m.cfg.Isolation == IsolationPerPod {
+func (m *Manager) isPerPodChildMode() bool {
+	return m.cfg.WorkerSocket == "" && m.cfg.Isolation == IsolationPerPod
+}
+
+func (m *Manager) ensureWorker(podID string) (*workerProcess, error) {
+	if m.isPerPodChildMode() {
+		m.mu.Lock()
+		closed := m.closed
+		m.mu.Unlock()
+		if closed {
+			return nil, errors.New("host-tun worker manager is closed")
+		}
 		return m.spawnWorker("pod-" + podID)
 	}
-	if m.sharedWorker != nil && !m.sharedWorker.isDead() {
-		return m.sharedWorker, nil
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, errors.New("host-tun worker manager is closed")
 	}
-	wp, err := m.spawnWorker("shared")
+	if m.sharedWorker != nil && !m.sharedWorker.isDead() {
+		wp := m.sharedWorker
+		m.mu.Unlock()
+		return wp, nil
+	}
+	m.mu.Unlock()
+
+	m.connectMu.Lock()
+	defer m.connectMu.Unlock()
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, errors.New("host-tun worker manager is closed")
+	}
+	if m.sharedWorker != nil && !m.sharedWorker.isDead() {
+		wp := m.sharedWorker
+		m.mu.Unlock()
+		return wp, nil
+	}
+	m.mu.Unlock()
+
+	var (
+		wp  *workerProcess
+		err error
+	)
+	if m.cfg.WorkerSocket != "" {
+		wp, err = m.connectWorkerSocket()
+	} else {
+		wp, err = m.spawnWorker("shared")
+	}
 	if err != nil {
 		return nil, err
 	}
+
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		wp.stop()
+		return nil, errors.New("host-tun worker manager is closed")
+	}
 	m.sharedWorker = wp
+	m.mu.Unlock()
 	return wp, nil
 }
 
 func (m *Manager) cleanupUnusedPerPodWorker(wp *workerProcess) {
-	if m.cfg.Isolation == IsolationPerPod && wp != nil {
+	if m.isPerPodChildMode() && wp != nil {
 		wp.stop()
 	}
+}
+
+func (m *Manager) connectWorkerSocket() (*workerProcess, error) {
+	deadline := time.Now().Add(workerSocketConnectTimeout)
+	backoff := 50 * time.Millisecond
+	var lastErr error
+
+	for {
+		fd, err := dialSeqPacket(m.cfg.WorkerSocket)
+		if err == nil {
+			stopR, stopW, pipeErr := os.Pipe()
+			if pipeErr != nil {
+				_ = unix.Close(fd)
+				return nil, fmt.Errorf("create socket watcher pipe: %w", pipeErr)
+			}
+			pid := 0
+			if ucred, credErr := unix.GetsockoptUcred(fd, unix.SOL_SOCKET, unix.SO_PEERCRED); credErr == nil {
+				pid = int(ucred.Pid)
+			}
+			wp := &workerProcess{
+				mgr:        m,
+				scope:      "socket",
+				pid:        pid,
+				ctrlParent: os.NewFile(uintptr(fd), "hosttun-ctrl-socket"),
+				stopR:      stopR,
+				stopW:      stopW,
+				done:       make(chan struct{}),
+			}
+			go wp.watchSocket()
+			klog.InfoS("connected to unprivileged host-tun stack socket",
+				"socket", m.cfg.WorkerSocket, "peerPID", wp.pid)
+			return wp, nil
+		}
+		lastErr = err
+		if !time.Now().Before(deadline) {
+			return nil, fmt.Errorf("connect to host-tun stack socket %q: %w", m.cfg.WorkerSocket, lastErr)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-m.closeCh:
+			timer.Stop()
+			return nil, errors.New("host-tun worker manager closed while connecting to stack socket")
+		case <-timer.C:
+		}
+		if backoff < 250*time.Millisecond {
+			backoff *= 2
+			if backoff > 250*time.Millisecond {
+				backoff = 250 * time.Millisecond
+			}
+		}
+	}
+}
+
+func dialSeqPacket(socketPath string) (int, error) {
+	fd, err := unix.Socket(unix.AF_UNIX, unix.SOCK_SEQPACKET|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		return -1, err
+	}
+	if err := unix.Connect(fd, &unix.SockaddrUnix{Name: socketPath}); err != nil {
+		_ = unix.Close(fd)
+		return -1, err
+	}
+	return fd, nil
 }
 
 func (m *Manager) spawnWorker(scope string) (*workerProcess, error) {
@@ -314,8 +436,9 @@ func (m *Manager) recoverPod(ap *attachedPod, crashed *workerProcess) error {
 		m.mu.Unlock()
 		return nil
 	}
-	newWP, err := m.ensureWorkerLocked(ap.cfg.PodID)
 	m.mu.Unlock()
+
+	newWP, err := m.ensureWorker(ap.cfg.PodID)
 	if err != nil {
 		return fmt.Errorf("respawn host-tun worker: %w", err)
 	}
@@ -371,6 +494,9 @@ type workerProcess struct {
 	cmd        *exec.Cmd
 	pid        int
 	ctrlParent *os.File
+	stopR      *os.File
+	stopW      *os.File
+	stopWOnce  sync.Once
 
 	callMu   sync.Mutex
 	stateMu  sync.Mutex
@@ -391,6 +517,14 @@ func (w *workerProcess) isStopping() bool {
 	return w.stopping
 }
 
+func (w *workerProcess) signalStopPipe() {
+	w.stopWOnce.Do(func() {
+		if w.stopW != nil {
+			_ = w.stopW.Close()
+		}
+	})
+}
+
 func (w *workerProcess) watch() {
 	err := w.cmd.Wait()
 	w.stateMu.Lock()
@@ -399,6 +533,37 @@ func (w *workerProcess) watch() {
 	_ = w.ctrlParent.Close()
 	close(w.done)
 	w.mgr.onWorkerExit(w, err)
+}
+
+func (w *workerProcess) watchSocket() {
+	pfds := []unix.PollFd{
+		{Fd: int32(w.ctrlParent.Fd()), Events: unix.POLLRDHUP},
+		{Fd: int32(w.stopR.Fd()), Events: unix.POLLIN},
+	}
+	for {
+		_, err := unix.Poll(pfds, -1)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		break
+	}
+
+	w.stateMu.Lock()
+	w.dead = true
+	stopping := w.stopping
+	w.stateMu.Unlock()
+
+	_ = w.ctrlParent.SetDeadline(time.Now())
+	w.callMu.Lock()
+	_ = w.ctrlParent.Close()
+	w.callMu.Unlock()
+	w.signalStopPipe()
+	_ = w.stopR.Close()
+	close(w.done)
+
+	if !stopping {
+		w.mgr.onWorkerExit(w, errors.New("host-tun stack socket closed"))
+	}
 }
 
 func (w *workerProcess) call(req ControlRequest, fds ...int) error {
@@ -439,6 +604,13 @@ func (w *workerProcess) stop() {
 	}
 	w.stopping = true
 	w.stateMu.Unlock()
+
+	if w.cmd == nil {
+		_ = w.ctrlParent.SetDeadline(time.Now())
+		w.signalStopPipe()
+		<-w.done
+		return
+	}
 
 	_ = w.ctrlParent.Close()
 	select {
@@ -608,7 +780,7 @@ func (a *attachedPod) closeLocal(managerClosing bool, snapshotWP *workerProcess)
 
 		a.stopBroker()
 		if wp != nil {
-			if a.mgr.cfg.Isolation == IsolationPerPod {
+			if a.mgr.isPerPodChildMode() {
 				wp.stop()
 			} else if !wp.isDead() {
 				_ = wp.call(ControlRequest{Op: OpRemove, PodID: a.cfg.PodID})

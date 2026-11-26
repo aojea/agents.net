@@ -118,6 +118,7 @@ spec:
         app.kubernetes.io/name: dra-agents-net
     spec:
       serviceAccountName: dra-agents-net
+      automountServiceAccountToken: false
       hostNetwork: true
       hostPID: true
       dnsPolicy: ClusterFirstWithHostNet
@@ -134,6 +135,7 @@ spec:
             - --checkpoint-path=/run/dra-agents-net/state.db
             - --kubelet-root-dir=/var/lib/kubelet
             - --metrics-addr=:9102
+            - --host-tun-socket=/run/hosttun/worker.sock
             # To enable the node ingress bridge (mandatory mTLS), mount server cert/key
             # and client CA and pass:
             # - --ingress-addr=:15080
@@ -174,6 +176,9 @@ spec:
           securityContext:
             privileged: true
           volumeMounts:
+            - name: kube-api-access
+              mountPath: /var/run/secrets/kubernetes.io/serviceaccount
+              readOnly: true
             - name: kubelet-plugins
               mountPath: /var/lib/kubelet/plugins
             - name: kubelet-plugins-registry
@@ -190,7 +195,53 @@ spec:
               mountPath: /var/run/nri
             - name: dra-agents-net-run
               mountPath: /run/dra-agents-net
+            - name: hosttun-run
+              mountPath: /run/hosttun
+        - name: agents-net-stack
+          image: ghcr.io/aojea/agents.net/agents-net-stack:latest
+          args:
+            - --socket=/run/hosttun/worker.sock
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            runAsGroup: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          volumeMounts:
+            - name: hosttun-run
+              mountPath: /run/hosttun
       volumes:
+        - name: kube-api-access
+          projected:
+            defaultMode: 420
+            sources:
+              - serviceAccountToken:
+                  expirationSeconds: 3607
+                  path: token
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt
+              - downwardAPI:
+                  items:
+                    - path: namespace
+                      fieldRef:
+                        apiVersion: v1
+                        fieldPath: metadata.namespace
+        - name: hosttun-run
+          emptyDir:
+            medium: Memory
         - name: kubelet-plugins
           hostPath:
             path: /var/lib/kubelet/plugins
